@@ -1,9 +1,9 @@
 # QJams
 
 **QJams.  Practice.  Watch.  Loop.  Perfect.**
-The video-synced jamming and practice tool with 6-track looper and  real time gain staging. Built  for musicians on Linux. It started as a humble Quad Cortex practice tool. It Evolved. Connect anything!
+The video-synced jamming and practice tool with 6-track recorder and  real time gain staging. Built  for musicians on Linux. It started as a humble Quad Cortex practice tool. It Evolved. Connect anything!
 
-Plug in your audio interface and start jamming. Combine a live 6-track looper with perfectly synced video capture so you can look back at exactly how you nailed that take. Built natively in C for Linux for maximum performance and zero latency.
+Plug in your audio interface and start jamming. Combine a live 6-track recorder with perfectly synced video capture so you can look back at exactly how you nailed that take. Built natively in C for Linux for maximum performance and zero latency.
 
 Visit https://sites.google.com/view/qjams/home for more info.
 
