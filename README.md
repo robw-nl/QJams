@@ -1,5 +1,5 @@
 # QJams
-QJams is a jamming tool with live video recording and a 6 track looper.
+QJams is a jamming tool for musicians (with guitarists as reference) with live video recording while playing, a 6 track looper and real time gain staging.
 Visit https://sites.google.com/view/qjams/home for more info.
 
 
