@@ -1,5 +1,6 @@
 # QJams
-QJams is a jamming tool with live video recording and a 6 track looper
+QJams is a jamming tool with live video recording and a 6 track looper.
+Visit https://sites.google.com/view/qjams/home for more info.
 
 
 **License & Copyright**
