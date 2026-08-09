@@ -1,0 +1,527 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <object class="GtkWindow" id="main_window">
+        <property name="title">QJams Audio Workspace</property>
+        <property name="default-width">1400</property>
+        <property name="default-height">800</property>
+
+        <child>
+            <!-- MASTER HORIZONTAL SPLIT -->
+            <object class="GtkBox">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">15</property>
+                <property name="margin-start">10</property>
+                <property name="margin-end">10</property>
+                <property name="margin-top">10</property>
+                <property name="margin-bottom">10</property>
+
+                <!-- ============================================== -->
+                <!-- LEFT COLUMN: Video, Looper Stack, Playlist & Cmds -->
+                <!-- ============================================== -->
+                <child>
+                    <object class="GtkBox" id="left_column_box">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">10</property>
+                        <!-- Rigid Width Anchor: Prevents the left column from collapsing -->
+                        <property name="width-request">854</property>
+                        <!-- Left column must NOT expand horizontally, but MUST expand vertically to push playlist to floor -->
+                        <property name="hexpand">false</property>
+                        <property name="vexpand">true</property>
+                        <property name="halign">start</property>
+                        <property name="valign">fill</property>
+                        <!-- TOP LEFT: Mode Stack (Video vs Looper Base) -->
+                        <child>
+                            <object class="GtkStack" id="mode_stack">
+                                <!-- Lock the stack so it never absorbs extra window space -->
+                                <property name="vexpand">false</property>
+                                <property name="hexpand">false</property>
+                                <property name="halign">fill</property>
+                                <property name="valign">start</property>
+                                <!-- FIX: Stop the stack from forcing the 480px video height onto the Looper page -->
+                                <property name="vhomogeneous">false</property>
+
+                                <!-- Video Page -->
+                                <child>
+                                    <object class="GtkStackPage">
+                                        <property name="name">video_page</property>
+                                        <property name="child">
+                                            <object class="GtkPicture" id="video_preview">
+                                                <property name="content-fit">contain</property>
+                                                <!-- Hardcode exact 480p fallback dimensions -->
+                                                <property name="width-request">854</property>
+                                                <property name="height-request">480</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+
+                                <!-- Looper Page -->
+                                <child>
+                                    <object class="GtkStackPage">
+                                        <property name="name">looper_page</property>
+                                        <property name="child">
+                                            <object class="GtkBox">
+                                                <property name="orientation">vertical</property>
+                                                <property name="spacing">10</property>
+                                                <property name="margin-top">10</property>
+                                                <property name="margin-bottom">10</property>
+
+                                                <child>
+                                                    <object class="GtkLabel" id="lbl_looper_status">
+                                                        <property name="label">Looper Ready</property>
+                                                        <style><class name="title"/></style>
+                                                    </object>
+                                                </child>
+
+                                                <!-- The Looper Command Buttons -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">10</property>
+                                                        <property name="halign">center</property>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_looper_undo">
+                                                                <property name="label">Undo Last Layer</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_looper_next">
+                                                                <property name="label">Add Next Layer</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">10</property>
+                                                        <property name="halign">center</property>
+                                                        <child>
+                                                            <object class="GtkLabel">
+                                                                <property name="label">Track Mode</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkSwitch" id="sw_blank_canvas"/>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkLabel">
+                                                                <property name="label">Blank Canvas Mode</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <child>
+                                                    <object class="GtkFrame">
+                                                        <property name="vexpand">false</property>
+                                                        <property name="hexpand">false</property>
+                                                        <child>
+                                                            <object class="GtkScrolledWindow" id="looper_layers_scroll">
+                                                                <property name="min-content-height">250</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child> <!-- End Mode Stack -->
+
+                        <!-- BOTTOM LEFT: Playlist (Expands) & Command Post -->
+                        <child>
+                            <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">10</property>
+                                <!-- Take all remaining vertical space in Left Column -->
+                                <property name="vexpand">true</property>
+                                <property name="halign">fill</property>
+                                <property name="valign">fill</property>
+                                <!-- CRITICAL: The 'homogeneous' property has been deleted here so asymmetric splitting works -->
+
+                                <!-- Playlist Container -->
+                                <child>
+                                    <object class="GtkBox" id="right_vbox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="width-request">554</property>
+                                        <property name="hexpand">false</property>
+                                        <!-- Playlist expands vertically to floor -->
+                                        <property name="vexpand">true</property>
+                                        <property name="valign">fill</property>
+                                    </object>
+                                </child>
+
+                                <!-- Command Post (Buttons & Status) -->
+                                <child>
+                                    <object class="GtkBox" id="command_post_box">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">15</property>
+                                        <property name="width-request">290</property>
+                                        <!-- Buttons NEVER expand -->
+                                        <property name="hexpand">false</property>
+                                        <property name="vexpand">false</property>
+                                        <!-- CRITICAL: Anchor buttons to the top so they never drift down -->
+                                        <property name="valign">start</property>
+
+                                        <!-- General Buttons -->
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">vertical</property>
+                                                <property name="spacing">10</property>
+
+                                                <!-- Row 1: Load Media | Export / Mux -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <property name="homogeneous">true</property>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_load">
+                                                                <property name="label">Load Media</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_save_mux">
+                                                                <property name="label">Export / Mux</property>
+                                                                <style><class name="btn-export"/></style>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <!-- Row 2: Load Session | Save Session -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <property name="homogeneous">true</property>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_load_session">
+                                                                <property name="label">Load Session</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_save_session">
+                                                                <property name="label">Save Session</property>
+                                                                <style><class name="btn-export"/></style>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <!-- Row 3: Load Playlist | Save Playlist -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <property name="homogeneous">true</property>
+                                                        <property name="margin-top">15</property>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_load_playlist">
+                                                                <property name="label">Load Playlist</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_save_playlist">
+                                                                <property name="label">Save Playlist</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <!-- Row 4: Looper Mode | Settings -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <property name="homogeneous">true</property>
+                                                        <property name="margin-top">15</property>
+                                                        <child>
+                                                            <object class="GtkToggleButton" id="btn_looper_mode">
+                                                                <property name="label">Looper Mode</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkButton" id="btn_settings">
+                                                                <property name="label">Settings</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+
+                                        <!-- Status Display -->
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">10</property>
+                                                <child>
+                                                    <object class="GtkSpinner" id="main_spinner">
+                                                        <property name="spinning">false</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkLabel" id="lbl_status">
+                                                        <property name="label">Status: Booting...</property>
+                                                        <property name="wrap">true</property>
+                                                        <property name="max-width-chars">40</property>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+
+                                        <!-- Footer / Roadmap Disclaimer -->
+                                        <child>
+                                            <object class="GtkLabel" id="lbl_roadmap">
+                                                <property name="wrap">true</property>
+                                                <property name="justify">center</property>
+                                                <property name="margin-top">10</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child> <!-- End Bottom Left -->
+                    </object>
+                </child> <!-- END LEFT COLUMN -->
+
+                <!-- ============================================== -->
+                <!-- RIGHT COLUMN: Dashboard & Waveforms (Bulldozer) -->
+                <!-- ============================================== -->
+                <child>
+                    <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">10</property>
+                        <!-- Right Column takes ALL extra horizontal and vertical space -->
+                        <property name="hexpand">true</property>
+                        <property name="vexpand">true</property>
+                        <property name="valign">fill</property>
+
+                        <!-- TOP RIGHT: Audio Dashboard -->
+                        <child>
+                            <object class="GtkFrame">
+                                <!-- Lifted Anchors: Lock dashboard to the top -->
+                                <property name="vexpand">false</property>
+                                <property name="valign">start</property>
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">8</property>
+                                        <property name="margin-start">8</property>
+                                        <property name="margin-end">8</property>
+                                        <property name="margin-top">8</property>
+                                        <property name="margin-bottom">8</property>
+
+                                        <!-- Row 1: Gain Spinners -->
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">30</property>
+                                                <property name="halign">start</property>
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <child>
+                                                            <object class="GtkLabel" id="lbl_input_device">
+                                                                <property name="label">Input Gain:</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkSpinButton" id="input_gain_spinner"/>
+                                                        </child>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">horizontal</property>
+                                                        <property name="spacing">5</property>
+                                                        <child>
+                                                            <object class="GtkLabel">
+                                                                <property name="label">Track Gain (dB):</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkSpinButton" id="bt_gain_spinner"/>
+                                                        </child>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+
+                                        <!-- Row 2: VU Meters -->
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">30</property>
+                                                <property name="halign">start</property>
+
+                                                <!-- Input VU -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="spacing">2</property>
+                                                        <property name="width-request">400</property>
+                                                        <child>
+                                                            <object class="GtkDrawingArea" id="vu_input_l">
+                                                                <property name="height-request">12</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkDrawingArea" id="vu_input_r">
+                                                                <property name="height-request">12</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+
+                                                <!-- Backing Track VU -->
+                                                <child>
+                                                    <object class="GtkBox">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="spacing">2</property>
+                                                        <property name="width-request">400</property>
+                                                        <child>
+                                                            <object class="GtkDrawingArea" id="vu_bt_l">
+                                                                <property name="height-request">12</property>
+                                                            </object>
+                                                        </child>
+                                                        <child>
+                                                            <object class="GtkDrawingArea" id="vu_bt_r">
+                                                                <property name="height-request">12</property>
+                                                            </object>
+                                                        </child>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+
+                                        <!-- Row 3: Transport Bar -->
+                                        <child>
+                                            <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">10</property>
+
+                                                <!-- NEW: Reset Button at Far Left -->
+                                                <child>
+                                                    <object class="GtkButton" id="btn_reset">
+                                                        <property name="icon-name">edit-delete-symbolic</property>
+                                                        <property name="tooltip-text">Reset Recording Canvas</property>
+                                                        <style><class name="btn-reset"/></style>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_prev">
+                                                        <property name="icon-name">media-skip-backward-symbolic</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_play">
+                                                        <property name="icon-name">media-playback-start-symbolic</property>
+                                                        <style><class name="btn-play"/></style>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_record">
+                                                        <property name="icon-name">media-record-symbolic</property>
+                                                        <style><class name="btn-record"/></style>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_stop">
+                                                        <property name="icon-name">media-playback-stop-symbolic</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_next">
+                                                        <property name="icon-name">media-skip-forward-symbolic</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_speed">
+                                                        <property name="label">Speed: 1.0x</property>
+                                                    </object>
+                                                </child>
+                                                <child>
+                                                    <object class="GtkButton" id="btn_zoom">
+                                                        <property name="label">Length 0:00</property>
+                                                    </object>
+                                                </child>
+
+                                                <child>
+                                                    <object class="GtkButton" id="btn_playlist_toggle">
+                                                        <property name="label">+</property>
+                                                        <property name="valign">center</property>
+                                                    </object>
+                                                </child>
+
+                                                <child>
+                                                    <object class="GtkLabel" id="lbl_track">
+                                                        <property name="label">Track: None Selected</property>
+                                                        <property name="ellipsize">end</property>
+                                                        <property name="max-width-chars">35</property>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child> <!-- End Audio Dashboard Frame -->
+
+                        <!-- BOTTOM RIGHT: Expanding Waveforms -->
+                        <child>
+                            <object class="GtkFrame">
+                                <!-- Lifted Anchors: Allow waveforms to crush into the remaining screen space -->
+                                <property name="hexpand">true</property>
+                                <property name="vexpand">true</property>
+                                <property name="valign">fill</property>
+                                <child>
+                                    <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">0</property>
+
+                                        <child>
+                                            <object class="GtkDrawingArea" id="waveform_area_bt">
+                                                <property name="vexpand">true</property>
+                                                <property name="hexpand">true</property>
+                                                <property name="valign">fill</property>
+                                            </object>
+                                        </child>
+
+                                        <!-- NEW: Physical divider between top and bottom canvases -->
+                                        <child>
+                                            <object class="GtkSeparator">
+                                                <property name="orientation">horizontal</property>
+                                            </object>
+                                        </child>
+
+                                        <child>
+                                            <object class="GtkDrawingArea" id="waveform_area_input">
+                                                <property name="vexpand">true</property>
+                                                <property name="hexpand">true</property>
+                                                <property name="valign">fill</property>
+                                            </object>
+                                        </child>
+
+                                        <child>
+                                            <object class="GtkScrollbar" id="waveform_scrollbar">
+                                                <property name="orientation">horizontal</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child> <!-- End Waveforms Frame -->
+
+                    </object>
+                </child> <!-- END RIGHT COLUMN -->
+
+            </object>
+        </child>
+    </object> <!-- End of main_window -->
+</interface>

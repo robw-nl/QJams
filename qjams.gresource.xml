@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+    <gresource prefix="/com/rob/qjams">
+        <file preprocess="xml-stripblanks">qjams.ui</file>
+    </gresource>
+</gresources>
