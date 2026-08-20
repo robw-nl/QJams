@@ -20,12 +20,10 @@ static volatile int keep_running = 0;
 static int thread_is_active = 0;
 
 static AVFormatContext *fmt_ctx = NULL;
-static AVCodecContext *codec_ctx_input = NULL;
-static AVCodecContext *codec_ctx_bt = NULL;
+static AVCodecContext *codec_ctx_mix = NULL;
 static SPSC_Video_Queue* video_queue_ptr = NULL;
 
-static AVStream *audio_stream_input = NULL;
-static AVStream *audio_stream_bt = NULL;
+static AVStream *audio_stream_mix = NULL;
 static AVStream *video_stream = NULL;
 
 static pthread_mutex_t enc_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -34,6 +32,7 @@ static pthread_cond_t enc_cond = PTHREAD_COND_INITIALIZER;
 // Unifying the video context to match encoder.h
 AVCodecContext *video_enc_ctx = NULL;
 static AVBufferRef *hw_device_ctx = NULL; // VAAPI Hardware Context
+_Atomic bool encoder_disk_error = false;
 
 /**
  * @brief Background thread loop for encoding audio and video frames.
@@ -158,25 +157,15 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     // PCM is extremely CPU efficient for raw capture and natively guarantees S16 interleaved support
     const AVCodec *a_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
 
-    // STREAM 0: Backing Track (RAW 1)
-    codec_ctx_bt = avcodec_alloc_context3(a_codec);
-    codec_ctx_bt->sample_rate = sample_rate;
-    av_channel_layout_default(&codec_ctx_bt->ch_layout, 2);
-    codec_ctx_bt->sample_fmt = AV_SAMPLE_FMT_S16;
-    codec_ctx_bt->time_base = (AVRational){1, sample_rate};
-    avcodec_open2(codec_ctx_bt, a_codec, NULL);
-    audio_stream_bt = avformat_new_stream(fmt_ctx, a_codec);
-    avcodec_parameters_from_context(audio_stream_bt->codecpar, codec_ctx_bt);
-
-    // STREAM 1: Quad Cortex Input (RAW 2)
-    codec_ctx_input = avcodec_alloc_context3(a_codec);
-    codec_ctx_input->sample_rate = sample_rate;
-    av_channel_layout_default(&codec_ctx_input->ch_layout, 2);
-    codec_ctx_input->sample_fmt = AV_SAMPLE_FMT_S16;
-    codec_ctx_input->time_base = (AVRational){1, sample_rate};
-    avcodec_open2(codec_ctx_input, a_codec, NULL);
-    audio_stream_input = avformat_new_stream(fmt_ctx, a_codec);
-    avcodec_parameters_from_context(audio_stream_input->codecpar, codec_ctx_input);
+    // STREAM 0: Master Mix (Hardware Input + Looper Matrix)
+    codec_ctx_mix = avcodec_alloc_context3(a_codec);
+    codec_ctx_mix->sample_rate = sample_rate;
+    av_channel_layout_default(&codec_ctx_mix->ch_layout, 2);
+    codec_ctx_mix->sample_fmt = AV_SAMPLE_FMT_S16;
+    codec_ctx_mix->time_base = (AVRational){1, sample_rate};
+    avcodec_open2(codec_ctx_mix, a_codec, NULL);
+    audio_stream_mix = avformat_new_stream(fmt_ctx, a_codec);
+    avcodec_parameters_from_context(audio_stream_mix->codecpar, codec_ctx_mix);
 
     // --- 4. OPEN FILE & START THREAD ---
     if (avio_open(&fmt_ctx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
@@ -189,6 +178,8 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
         goto encoder_cleanup;
     }
 
+    atomic_store_explicit(&encoder_disk_error, false, memory_order_release);
+
     keep_running = 1;
     thread_is_active = 1;
     pthread_create(&encoder_thread, NULL, encoder_loop, NULL);
@@ -199,61 +190,61 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     encoder_cleanup:
     if (fmt_ctx && fmt_ctx->pb) avio_closep(&fmt_ctx->pb);
     if (fmt_ctx) { avformat_free_context(fmt_ctx); fmt_ctx = NULL; }
-    if (codec_ctx_input) { avcodec_free_context(&codec_ctx_input); codec_ctx_input = NULL; }
-    if (codec_ctx_bt) { avcodec_free_context(&codec_ctx_bt); codec_ctx_bt = NULL; }
+    if (codec_ctx_mix) { avcodec_free_context(&codec_ctx_mix); codec_ctx_mix = NULL; }
     if (video_enc_ctx) { avcodec_free_context(&video_enc_ctx); video_enc_ctx = NULL; }
     if (hw_device_ctx) { av_buffer_unref(&hw_device_ctx); hw_device_ctx = NULL; }
     return -1;
 }
 
 /**
+ * @brief Safe wrapper for writing frames that intercepts physical disk capacity errors.
+ */
+static void safe_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt) {
+    if (av_interleaved_write_frame(s, pkt) < 0) {
+        atomic_store_explicit(&encoder_disk_error, true, memory_order_release);
+    }
+}
+
+/**
  * @brief Drains available audio frames from the lock-free queue and encodes them to the MKV container.
- * @param a_frame_input The reusable AVFrame for the input stream.
- * @param a_frame_bt The reusable AVFrame for the backing track stream.
+ * Utilizes the hardware PTS injected by the JACK thread to prevent audio/video desynchronization.
+ * @param a_frame_mix The reusable AVFrame for the master mix stream.
  * @param pkt The reusable AVPacket used for writing.
- * @param a_pts Pointer to the running presentation timestamp.
+ * @param first_a_pts Pointer to the baseline presentation timestamp.
  * @return 1 if frames were encoded, 0 if the queue lacked sufficient frames.
  */
-static int process_audio_batch(AVFrame *a_frame_input, AVFrame *a_frame_bt, AVPacket *pkt, int64_t *a_pts) {
+static int process_audio_batch(AVFrame *a_frame_mix, AVPacket *pkt, int64_t *first_a_pts) {
     size_t a_write = atomic_load_explicit(&audio_queue.write_index, memory_order_acquire);
     size_t a_read = atomic_load_explicit(&audio_queue.read_index, memory_order_relaxed);
 
-    if ((a_write - a_read) < (size_t)a_frame_input->nb_samples) return 0;
+    if ((a_write - a_read) < (size_t)a_frame_mix->nb_samples) return 0;
 
-    av_frame_make_writable(a_frame_input);
-    av_frame_make_writable(a_frame_bt);
+    av_frame_make_writable(a_frame_mix);
+    int16_t *out_mix = (int16_t*)a_frame_mix->data[0];
 
-    int16_t *out_input = (int16_t*)a_frame_input->data[0];
-    int16_t *out_bt = (int16_t*)a_frame_bt->data[0];
+    int64_t block_pts = 0;
 
-    for (int i = 0; i < a_frame_input->nb_samples; i++) {
+    for (int i = 0; i < a_frame_mix->nb_samples; i++) {
         AudioFrame f = {0};
         pop_audio_frame(&audio_queue, &f);
 
-        out_input[i * 2]     = (int16_t)(f.input_l * 32767.0f);
-        out_input[i * 2 + 1] = (int16_t)(f.input_r * 32767.0f);
-        out_bt[i * 2]        = (int16_t)(f.bt_l * 32767.0f);
-        out_bt[i * 2 + 1]    = (int16_t)(f.bt_r * 32767.0f);
-    }
-
-    a_frame_input->pts = *a_pts;
-    a_frame_bt->pts = *a_pts;
-    *a_pts += a_frame_input->nb_samples;
-
-    if (avcodec_send_frame(codec_ctx_input, a_frame_input) == 0) {
-        while (avcodec_receive_packet(codec_ctx_input, pkt) == 0) {
-            av_packet_rescale_ts(pkt, codec_ctx_input->time_base, audio_stream_input->time_base);
-            pkt->stream_index = audio_stream_input->index;
-            av_interleaved_write_frame(fmt_ctx, pkt);
-            av_packet_unref(pkt);
+        // Anchor the MKV audio timebase perfectly to the first received hardware cycle
+        if (i == 0) {
+            if (*first_a_pts == -1) *first_a_pts = f.pts;
+            block_pts = f.pts - *first_a_pts;
         }
+
+        out_mix[i * 2]     = (int16_t)(f.mix_l * 32767.0f);
+        out_mix[i * 2 + 1] = (int16_t)(f.mix_r * 32767.0f);
     }
 
-    if (avcodec_send_frame(codec_ctx_bt, a_frame_bt) == 0) {
-        while (avcodec_receive_packet(codec_ctx_bt, pkt) == 0) {
-            av_packet_rescale_ts(pkt, codec_ctx_bt->time_base, audio_stream_bt->time_base);
-            pkt->stream_index = audio_stream_bt->index;
-            av_interleaved_write_frame(fmt_ctx, pkt);
+    a_frame_mix->pts = block_pts;
+
+    if (avcodec_send_frame(codec_ctx_mix, a_frame_mix) == 0) {
+        while (avcodec_receive_packet(codec_ctx_mix, pkt) == 0) {
+            av_packet_rescale_ts(pkt, codec_ctx_mix->time_base, audio_stream_mix->time_base);
+            pkt->stream_index = audio_stream_mix->index;
+            safe_interleaved_write_frame(fmt_ctx, pkt);
             av_packet_unref(pkt);
         }
     }
@@ -261,13 +252,13 @@ static int process_audio_batch(AVFrame *a_frame_input, AVFrame *a_frame_bt, AVPa
 }
 
 /**
-* @brief Pulls a single video frame from the queue, maps memory to the hardware context, and encodes it.
-* @param v_frame_enc The reusable hardware encoding frame.
-* @param sw_frame The reusable software frame mapping payload memory.
-* @param pkt The reusable AVPacket.
-* @param first_v_pts Pointer to the baseline presentation timestamp.
-* @return 1 if a frame was processed, 0 if the queue was empty.
-*/
+ * @brief Pulls a single video frame from the queue, maps memory to the hardware context, and encodes it.
+ * @param v_frame_enc The reusable hardware encoding frame.
+ * @param sw_frame The reusable software frame mapping payload memory.
+ * @param pkt The reusable AVPacket.
+ * @param first_v_pts Pointer to the baseline presentation timestamp.
+ * @return 1 if a frame was processed, 0 if the queue was empty.
+ */
 static int process_video_frame(AVFrame *v_frame_enc, AVFrame *sw_frame, AVPacket *pkt, int64_t *first_v_pts) {
     VideoPayload v_payload;
     if (!pop_video_frame(video_queue_ptr, &v_payload)) return 0;
@@ -287,7 +278,7 @@ static int process_video_frame(AVFrame *v_frame_enc, AVFrame *sw_frame, AVPacket
                     while (avcodec_receive_packet(video_enc_ctx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, video_enc_ctx->time_base, video_stream->time_base);
                         pkt->stream_index = video_stream->index;
-                        av_interleaved_write_frame(fmt_ctx, pkt);
+                        safe_interleaved_write_frame(fmt_ctx, pkt);
                         av_packet_unref(pkt);
                     }
                 }
@@ -299,7 +290,7 @@ static int process_video_frame(AVFrame *v_frame_enc, AVFrame *sw_frame, AVPacket
             while (avcodec_receive_packet(video_enc_ctx, pkt) == 0) {
                 av_packet_rescale_ts(pkt, video_enc_ctx->time_base, video_stream->time_base);
                 pkt->stream_index = video_stream->index;
-                av_interleaved_write_frame(fmt_ctx, pkt);
+                safe_interleaved_write_frame(fmt_ctx, pkt);
                 av_packet_unref(pkt);
             }
         }
@@ -320,7 +311,7 @@ static void flush_encoder_context(AVCodecContext *ctx, AVStream *stream, AVPacke
     while (avcodec_receive_packet(ctx, pkt) == 0) {
         av_packet_rescale_ts(pkt, ctx->time_base, stream->time_base);
         pkt->stream_index = stream->index;
-        av_interleaved_write_frame(fmt_ctx, pkt);
+        safe_interleaved_write_frame(fmt_ctx, pkt);
         av_packet_unref(pkt);
     }
 }
@@ -333,17 +324,11 @@ static void flush_encoder_context(AVCodecContext *ctx, AVStream *stream, AVPacke
 static void* encoder_loop(void* arg) {
     (void)arg;
 
-    AVFrame *a_frame_input = av_frame_alloc();
-    a_frame_input->nb_samples = codec_ctx_input->frame_size == 0 ? 1024 : codec_ctx_input->frame_size;
-    a_frame_input->format = codec_ctx_input->sample_fmt;
-    av_channel_layout_copy(&a_frame_input->ch_layout, &codec_ctx_input->ch_layout);
-    av_frame_get_buffer(a_frame_input, 0);
-
-    AVFrame *a_frame_bt = av_frame_alloc();
-    a_frame_bt->nb_samples = codec_ctx_bt->frame_size == 0 ? 1024 : codec_ctx_bt->frame_size;
-    a_frame_bt->format = codec_ctx_bt->sample_fmt;
-    av_channel_layout_copy(&a_frame_bt->ch_layout, &codec_ctx_bt->ch_layout);
-    av_frame_get_buffer(a_frame_bt, 0);
+    AVFrame *a_frame_mix = av_frame_alloc();
+    a_frame_mix->nb_samples = codec_ctx_mix->frame_size == 0 ? 1024 : codec_ctx_mix->frame_size;
+    a_frame_mix->format = codec_ctx_mix->sample_fmt;
+    av_channel_layout_copy(&a_frame_mix->ch_layout, &codec_ctx_mix->ch_layout);
+    av_frame_get_buffer(a_frame_mix, 0);
 
     AVFrame *v_frame_enc = av_frame_alloc();
     AVFrame *sw_frame = av_frame_alloc();
@@ -351,15 +336,15 @@ static void* encoder_loop(void* arg) {
     sw_frame->width = video_enc_ctx->width;
     sw_frame->height = video_enc_ctx->height;
 
-    AVPacket *shared_pkt = av_packet_alloc(); // Reused uniformly for all packet submissions
+    AVPacket *shared_pkt = av_packet_alloc();
 
-    int64_t a_pts = 0;
+    int64_t first_a_pts = -1;
     int64_t first_v_pts = -1;
 
     while (keep_running) {
         int activity = 0;
 
-        while (process_audio_batch(a_frame_input, a_frame_bt, shared_pkt, &a_pts)) {
+        while (process_audio_batch(a_frame_mix, shared_pkt, &first_a_pts)) {
             activity = 1;
         }
 
@@ -378,9 +363,7 @@ static void* encoder_loop(void* arg) {
         }
     }
 
-    // Flush remaining internal codec states cleanly
-    flush_encoder_context(codec_ctx_input, audio_stream_input, shared_pkt);
-    flush_encoder_context(codec_ctx_bt, audio_stream_bt, shared_pkt);
+    flush_encoder_context(codec_ctx_mix, audio_stream_mix, shared_pkt);
 
     if (first_v_pts != -1) {
         flush_encoder_context(video_enc_ctx, video_stream, shared_pkt);
@@ -388,8 +371,7 @@ static void* encoder_loop(void* arg) {
 
     av_write_trailer(fmt_ctx);
 
-    av_frame_free(&a_frame_input);
-    av_frame_free(&a_frame_bt);
+    av_frame_free(&a_frame_mix);
     av_frame_free(&v_frame_enc);
     av_packet_free(&shared_pkt);
 
@@ -426,8 +408,7 @@ void stop_encoder() {
         fmt_ctx = NULL;
     }
 
-    if (codec_ctx_input) { avcodec_free_context(&codec_ctx_input); codec_ctx_input = NULL; }
-    if (codec_ctx_bt) { avcodec_free_context(&codec_ctx_bt); codec_ctx_bt = NULL; }
+    if (codec_ctx_mix) { avcodec_free_context(&codec_ctx_mix); codec_ctx_mix = NULL; }
     if (video_enc_ctx) { avcodec_free_context(&video_enc_ctx); video_enc_ctx = NULL; }
     if (hw_device_ctx) { av_buffer_unref(&hw_device_ctx); hw_device_ctx = NULL; }
 }

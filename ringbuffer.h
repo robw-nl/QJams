@@ -12,10 +12,9 @@
 #define CACHE_LINE_SIZE 64
 
 typedef struct {
-    float input_l;
-    float input_r;
-    float bt_l;
-    float bt_r;
+    float mix_l;
+    float mix_r;
+    int64_t pts;
 } AudioFrame;
 
 typedef struct {
@@ -25,6 +24,15 @@ typedef struct {
     alignas(CACHE_LINE_SIZE) atomic_size_t write_index;
     alignas(CACHE_LINE_SIZE) atomic_size_t read_index;
 } SPSC_Audio_Queue;
+
+/**
+ * @brief Opcodes for lock-free commands dispatched from the GTK UI thread to the JACK RT thread.
+ * Legacy O(N) array mutation commands have been purged to enforce strict RT safety.
+ */
+typedef enum {
+    CMD_NONE = 0,
+    CMD_NEXT_TRACK
+} EngineCommandType;
 
 // Initialize the queue (called once during setup, before RT thread starts)
 /**
@@ -149,22 +157,11 @@ static inline int pop_stereo_frame(SPSC_Stereo_Queue* q, StereoFrame* frame) {
 }
 
 /**
- * @brief Opcodes for lock-free commands dispatched from the GTK UI thread to the JACK RT thread.
- */
-typedef enum {
-    CMD_NONE = 0,
-    CMD_NEXT_LAYER,
-    CMD_UNDO_LAYER,
-    CMD_CLEAR_LAYER,
-    CMD_RESET_SESSION
-} EngineCommandType;
-
-/**
  * @brief Lightweight command payload safely passed to the RT thread.
  */
 typedef struct {
     EngineCommandType type;
-    int target_layer; ///< Optional index for commands targeting specific layers
+    int target_track; ///< Optional index for commands targeting specific layers
 } EngineCommand;
 
 /**

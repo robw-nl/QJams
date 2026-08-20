@@ -2,9 +2,12 @@
 #define QJAMS_ENCODER_H
 
 #include <libavcodec/avcodec.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include "video_ringbuffer.h"
 
 extern AVCodecContext *video_enc_ctx;
+extern _Atomic bool encoder_disk_error;
 
 // Public API
 /**

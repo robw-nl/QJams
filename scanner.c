@@ -9,6 +9,7 @@
 
 /**
  * @brief Scans the system for available V4L2 video capture devices.
+ * Implements strict null-termination to prevent driver strings from overrunning boundaries.
  * @param devices Array to store the discovered video devices.
  * @param max_devices Maximum number of devices to scan.
  * @return The number of discovered video devices.
@@ -30,7 +31,10 @@ int scan_video_devices(VideoDevice *devices, int max_devices) {
 
             if (caps & V4L2_CAP_VIDEO_CAPTURE) {
                 strncpy(devices[count].device_path, path, sizeof(devices[count].device_path) - 1);
+                devices[count].device_path[sizeof(devices[count].device_path) - 1] = '\0';
+
                 strncpy(devices[count].device_name, (char *)cap.card, sizeof(devices[count].device_name) - 1);
+                devices[count].device_name[sizeof(devices[count].device_name) - 1] = '\0';
 
                 printf("Discovered Camera: %s at %s\n", devices[count].device_name, devices[count].device_path);
                 count++;
@@ -44,7 +48,7 @@ int scan_video_devices(VideoDevice *devices, int max_devices) {
 
 /**
  * @brief Internal helper to scan the JACK server for physical audio ports matching specific flags.
- * Centralizes the port string tokenization and deduplication logic.
+ * Centralizes the port string tokenization and implements boundary protections.
  * @param client Pointer to the active JACK client.
  * @param devices Array to store the discovered audio devices.
  * @param max_devices Maximum number of devices to scan.
@@ -59,6 +63,8 @@ static int scan_jack_ports(jack_client_t *client, AudioDevice *devices, int max_
 
     if (ports) {
         for (int i = 0; ports[i] != NULL && count < max_devices; i++) {
+            if (strstr(ports[i], "QJams_Engine") != NULL) continue;
+
             char prefix[128] = {0};
 
             const char *colon = strchr(ports[i], ':');
@@ -66,8 +72,10 @@ static int scan_jack_ports(jack_client_t *client, AudioDevice *devices, int max_
                 int len = colon - ports[i];
                 if (len >= (int)sizeof(prefix)) len = sizeof(prefix) - 1;
                 strncpy(prefix, ports[i], len);
+                prefix[len] = '\0';
             } else {
                 strncpy(prefix, ports[i], sizeof(prefix) - 1);
+                prefix[sizeof(prefix) - 1] = '\0';
             }
 
             int found = 0;
@@ -81,7 +89,11 @@ static int scan_jack_ports(jack_client_t *client, AudioDevice *devices, int max_
 
             if (!found) {
                 strncpy(devices[count].device_id, prefix, sizeof(devices[count].device_id) - 1);
+                devices[count].device_id[sizeof(devices[count].device_id) - 1] = '\0';
+
                 strncpy(devices[count].display_name, prefix, sizeof(devices[count].display_name) - 1);
+                devices[count].display_name[sizeof(devices[count].display_name) - 1] = '\0';
+
                 devices[count].channel_count = 1;
                 count++;
             }

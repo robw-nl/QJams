@@ -22,6 +22,11 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
  * @param user_data Optional user data.
  * @return void
  */
+
+void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+
+gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data);
+
 void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 /**
  * @brief Cairo draw callback for a generic horizontal VU meter.
@@ -42,7 +47,7 @@ void on_draw_vu_meter(GtkDrawingArea *area, cairo_t *cr, int width, int height, 
  * @param user_data The layer index cast to a gpointer.
  * @return void
  */
-void on_draw_layer_color_dot(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+void on_draw_track_color_dot(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
 /**
  * @brief UI tick callback to schedule redraws for dynamic waveform and meter widgets.
  * @param widget The widget to queue for redraw.
@@ -63,6 +68,16 @@ GtkWidget* make_meter(gpointer peak_var_ptr);
  * @return void
  */
 void invalidate_waveform_caches(void);
+
+/**
+ * @brief Clears the active selection anchor if one is pending.
+ */
+void clear_waveform_anchor(void);
+
+/**
+ * @brief Click gesture callback for the waveform area to handle anchor-and-extend selections.
+ */
+void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 
 /**
  * @brief Gesture callback triggered when a looper drag starts.

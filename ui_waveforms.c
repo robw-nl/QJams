@@ -8,18 +8,18 @@ static double current_drag_fraction = -1.0;
 static bool is_dragging = false;
 static bool is_panning = false;
 static double drag_start_scroll_x = 0.0;
-static gint64 last_seek_time = 0; // NEW: Timestamp cache to debounce rapid seek commands
+static gint64 last_seek_time = 0; // Timestamp cache to debounce rapid seek commands
 
 #define MAX_UI_WIDTH 8192
 
 static int cached_bt_width = 0;
 static int cached_bt_height = 0;
-static int cached_active_layers = 1; // NEW
+static int cached_active_tracks = 1; // NEW
 float *cached_bt_ptr = NULL;
 static float bt_min_l[MAX_UI_WIDTH], bt_max_l[MAX_UI_WIDTH];
 static float bt_min_r[MAX_UI_WIDTH], bt_max_r[MAX_UI_WIDTH];
 
-// NEW: Dynamic BT Sweep caches
+// Dynamic BT Sweep caches
 static float sweep_min_l[MAX_UI_WIDTH], sweep_max_l[MAX_UI_WIDTH];
 static float sweep_min_r[MAX_UI_WIDTH], sweep_max_r[MAX_UI_WIDTH];
 
@@ -28,7 +28,7 @@ static int cached_input_height = 0;
 static float input_min_l[MAX_UI_WIDTH], input_max_l[MAX_UI_WIDTH];
 static float input_min_r[MAX_UI_WIDTH], input_max_r[MAX_UI_WIDTH];
 
-// NEW: Off-screen Cairo cache surfaces
+// Off-screen Cairo cache surfaces
 static cairo_surface_t *surface_bt = NULL;
 static cairo_surface_t *surface_input_grid = NULL;
 
@@ -41,17 +41,22 @@ static void draw_playhead(cairo_t *cr, int width, int height, size_t current_pos
 void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames);
 
 /**
- / **                                                                                              *
  * @brief Assigns a highly visible neon color for each looper layer.
  */
-static void set_layer_color(cairo_t *cr, int layer_idx, double alpha) {
-    switch (layer_idx) {
-        case 0: cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, alpha); break; // Base: Brighter Silver/Gray
+static void set_track_color(cairo_t *cr, int track_idx, double alpha) {
+    switch (track_idx) {
+        case 0: cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, alpha); break; // Base: Brighter Silver/Gray
         case 1: cairo_set_source_rgba(cr, 0.0, 0.8, 1.0, alpha); break; // Overdub 1: Cyan/Electric Blue
         case 2: cairo_set_source_rgba(cr, 1.0, 0.2, 0.8, alpha); break; // Overdub 2: Neon Magenta
         case 3: cairo_set_source_rgba(cr, 0.4, 1.0, 0.2, alpha); break; // Overdub 3: Lime Green
         case 4: cairo_set_source_rgba(cr, 1.0, 0.8, 0.0, alpha); break; // Overdub 4: Bright Yellow
         case 5: cairo_set_source_rgba(cr, 0.7, 0.3, 1.0, alpha); break; // Overdub 5: Electric Purple
+        case 6: cairo_set_source_rgba(cr, 1.0, 0.5, 0.0, alpha); break; // Overdub 6: Neon Orange
+        case 7: cairo_set_source_rgba(cr, 0.0, 1.0, 0.5, alpha); break; // Overdub 7: Spring Green
+        case 8: cairo_set_source_rgba(cr, 0.8, 0.6, 1.0, alpha); break; // Overdub 8: Lavender
+        case 9: cairo_set_source_rgba(cr, 1.0, 0.3, 0.3, alpha); break; // Overdub 9: Coral Red
+        case 10: cairo_set_source_rgba(cr, 0.2, 0.6, 1.0, alpha); break; // Overdub 10: Sky Blue
+        case 11: cairo_set_source_rgba(cr, 0.9, 0.9, 0.2, alpha); break; // Overdub 11: Lemon
         default: cairo_set_source_rgba(cr, 0.8, 0.8, 0.8, alpha); break;
     }
 }
@@ -65,14 +70,29 @@ static void set_layer_color(cairo_t *cr, int layer_idx, double alpha) {
  * @param user_data The layer index cast to a gpointer.
  * @return void
  */
-void on_draw_layer_color_dot(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+void on_draw_track_color_dot(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area;
-    int layer_idx = GPOINTER_TO_INT(user_data);
-    set_layer_color(cr, layer_idx, 1.0);
+    int track_idx = GPOINTER_TO_INT(user_data);
+    set_track_color(cr, track_idx, 1.0);
+
+    extern _Atomic bool track_has_audio[MAX_TRACKS];
+    bool has_audio = atomic_load_explicit(&track_has_audio[track_idx], memory_order_acquire);
 
     double radius = (width < height ? width : height) / 2.0 - 1.0;
-    cairo_arc(cr, width / 2.0, height / 2.0, radius, 0, 2 * M_PI);
-    cairo_fill(cr);
+    double cx = width / 2.0;
+    double cy = height / 2.0;
+
+    if (has_audio) {
+        cairo_arc(cr, cx, cy, radius, 0, 2 * M_PI);
+        cairo_fill(cr);
+    } else {
+        // Draw an upward pointing triangle for empty allocated tracks
+        cairo_move_to(cr, cx, cy - radius);
+        cairo_line_to(cr, cx + radius, cy + radius);
+        cairo_line_to(cr, cx - radius, cy + radius);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
 }
 
 /**
@@ -124,7 +144,7 @@ void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames)
     cairo_set_source_rgb(cr, 0.15, 0.15, 0.18);
     cairo_paint(cr);
 
-    // NEW: Draw center horizontal divider for Left/Right audio channels
+    // Draw center horizontal divider for Left/Right audio channels
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 0, height / 2.0);
@@ -147,7 +167,8 @@ void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames)
     else if (total_seconds > 15.0) { text_step = 5; tick_step = 1; }
     else { text_step = 2; tick_step = 1; }
 
-    double virtual_width = width * zoom_multiplier;
+    int bt_width = gtk_widget_get_width(waveform_area_bt);
+    double virtual_width = bt_width * zoom_multiplier;
     double pixels_per_sec = virtual_width / total_seconds;
     double scroll_x = gtk_adjustment_get_value(waveform_adj);
 
@@ -200,21 +221,55 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
         return;
     }
 
-    double virtual_width = width * zoom_multiplier;
+    int bt_width = gtk_widget_get_width(waveform_area_bt);
+    double virtual_width = bt_width * zoom_multiplier;
     double scroll_x = gtk_adjustment_get_value(waveform_adj);
 
     double frames_per_pixel = (double)pristine_frames / virtual_width;
     if (frames_per_pixel == 0) frames_per_pixel = 1.0;
 
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-    int active_layers = atomic_load_explicit(&active_layer_count, memory_order_relaxed);
-    int rec_layer = atomic_load_explicit(&current_recording_layer, memory_order_relaxed);
+    int active_tracks = atomic_load_explicit(&active_track_count, memory_order_relaxed);
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
 
     static double cached_bt_scroll_x = -1.0;
     static double cached_bt_zoom = -1.0;
+    // FILE: ui_waveforms.c
+    static float *cached_track_ptrs[MAX_TRACKS] = {NULL};
+    static bool cached_audible[MAX_TRACKS] = {false};
+
+    bool any_solo_active = false;
+    bool track_audible[MAX_TRACKS] = {false};
+    extern _Atomic bool track_has_audio[MAX_TRACKS];
+
+    // Pass 1: Determine if any solo is engaged
+    for (int l = 0; l < MAX_TRACKS; l++) {
+        if (atomic_load_explicit(&track_is_soloed[l], memory_order_relaxed)) {
+            any_solo_active = true;
+            break;
+        }
+    }
+
+    // FILE: ui_waveforms.c
+    bool pointers_changed = false;
+    // Pass 2: Map audibility and check for state invalidation
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        // STRICT: A layer is only audible if it is unmuted/soloed AND explicitly contains recorded audio
+        track_audible[i] = (!any_solo_active || atomic_load_explicit(&track_is_soloed[i], memory_order_relaxed)) &&
+        atomic_load_explicit(&track_has_audio[i], memory_order_acquire);
+
+        if (multitrack_tracks[i] != cached_track_ptrs[i]) {
+            pointers_changed = true;
+            cached_track_ptrs[i] = multitrack_tracks[i];
+        }
+        if (track_audible[i] != cached_audible[i]) {
+            pointers_changed = true;
+            cached_audible[i] = track_audible[i];
+        }
+    }
 
     if (width != cached_bt_width || height != cached_bt_height || pristine_bt_buf != cached_bt_ptr ||
-        active_layers != cached_active_layers || scroll_x != cached_bt_scroll_x || zoom_multiplier != cached_bt_zoom) {
+        active_tracks != cached_active_tracks || scroll_x != cached_bt_scroll_x || zoom_multiplier != cached_bt_zoom || pointers_changed) {
 
         if (surface_bt) {
             cairo_surface_destroy(surface_bt);
@@ -226,13 +281,12 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
     draw_waveform_grid(surface_cr, width, height, backing_track_frames);
 
-    int max_render_layer = atomic_load_explicit(&is_looper_mode, memory_order_relaxed) ? active_layers : 1;
+    int max_render_track = active_tracks;
 
-    for (int l = 0; l < max_render_layer; l++) {
-        if (!loop_layers[l] || atomic_load_explicit(&layer_is_muted[l], memory_order_relaxed)) continue;
+    for (int l = 0; l < max_render_track; l++) {
+        if (!multitrack_tracks[l] || !track_audible[l]) continue;
 
         if (frames_per_pixel >= 1.0) {
-            // ENVELOPE MODE
             memset(bt_min_l, 0, sizeof(bt_min_l));
             memset(bt_max_l, 0, sizeof(bt_max_l));
             memset(bt_min_r, 0, sizeof(bt_min_r));
@@ -244,39 +298,33 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
                 if (end_frame <= start_frame) end_frame = start_frame + 1;
                 if (start_frame >= pristine_frames) continue;
+                // FILE: ui_waveforms.c
                 if (end_frame > pristine_frames) end_frame = pristine_frames;
 
-                scan_waveform_extents(loop_layers[l], start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
+                scan_waveform_extents(multitrack_tracks[l], start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
             }
 
-            // ENVELOPE MODE (Around line 286)
-            float layer_gain = (l == 0) ? ui_state.config.bt_gain_multiplier : 1.0f;
+            float layer_gain = atomic_load_explicit(&multitrack_track_gains[l], memory_order_relaxed);
 
-            if (l == 0) {
-                set_layer_color(surface_cr, l, 1.0); // FIX: Increased alpha from 0.8 to 1.0
-                cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
-            } else {
-                set_layer_color(surface_cr, l, 0.6);
-                cairo_set_operator(surface_cr, CAIRO_OPERATOR_ADD);
-            }
+            // Restore OVER operator to prevent additive color clipping when tracks stack
+            cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
+            double alpha = 0.65; // Boost alpha slightly to retain vibrancy under standard overlap
+            set_track_color(surface_cr, l, alpha);
 
             cairo_set_line_width(surface_cr, 1.0);
             draw_envelope_waveform(surface_cr, width, height, bt_min_l, bt_max_l, layer_gain, height / 4.0);
             draw_envelope_waveform(surface_cr, width, height, bt_min_r, bt_max_r, layer_gain, 3.0 * height / 4.0);
         } else {
-            // SAMPLE MODE
-            float layer_gain = (l == 0) ? ui_state.config.bt_gain_multiplier : 1.0f;
+            float layer_gain = atomic_load_explicit(&multitrack_track_gains[l], memory_order_relaxed);
+            double alpha = 0.65;
 
-            if (l == 0) {
-                set_layer_color(surface_cr, l, 1.0); // FIX: Increased alpha from 0.8 to 1.0
-                cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
-            } else {
-                set_layer_color(surface_cr, l, 0.6);
-                cairo_set_operator(surface_cr, CAIRO_OPERATOR_ADD);
-            }
+            // Restore OVER operator here as well for deep zoom views
+            cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
+            set_track_color(surface_cr, l, alpha);
+
             cairo_set_line_width(surface_cr, 1.5);
-            draw_sample_waveform(surface_cr, width, height, loop_layers[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, height / 4.0, 0);
-            draw_sample_waveform(surface_cr, width, height, loop_layers[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, 3.0 * height / 4.0, 1);
+            draw_sample_waveform(surface_cr, width, height, multitrack_tracks[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, height / 4.0, 0);
+            draw_sample_waveform(surface_cr, width, height, multitrack_tracks[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, 3.0 * height / 4.0, 1);
         }
     }
 
@@ -284,7 +332,7 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
     cached_bt_width = width;
     cached_bt_height = height;
     cached_bt_ptr = pristine_bt_buf;
-    cached_active_layers = active_layers;
+    cached_active_tracks = active_tracks;
     cached_bt_scroll_x = scroll_x;
     cached_bt_zoom = zoom_multiplier;
         }
@@ -294,7 +342,7 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
             cairo_paint(cr);
         }
 
-        if (active_layers > 1 && atomic_load_explicit(&engine_is_recording, memory_order_relaxed)) {
+        if (active_tracks > 1 && atomic_load_explicit(&engine_is_recording, memory_order_relaxed)) {
             if (frames_per_pixel >= 1.0) {
                 memset(sweep_min_l, 0, sizeof(sweep_min_l));
                 memset(sweep_max_l, 0, sizeof(sweep_max_l));
@@ -308,43 +356,43 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
                     if (start_frame >= current_pos) break;
                     if (end_frame > current_pos) end_frame = current_pos;
 
-                    if (loop_layers[rec_layer]) {
-                        scan_waveform_extents(loop_layers[rec_layer], start_frame, end_frame,
+                    if (multitrack_tracks[rec_track]) {
+                        scan_waveform_extents(multitrack_tracks[rec_track], start_frame, end_frame,
                                               &sweep_min_l[x], &sweep_max_l[x], &sweep_min_r[x], &sweep_max_r[x]);
                     }
                 }
 
                 cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
-                set_layer_color(cr, rec_layer, 0.6);
+                set_track_color(cr, rec_track, 0.5);
                 cairo_set_line_width(cr, 1.0);
                 draw_envelope_waveform(cr, width, height, sweep_min_l, sweep_max_l, 1.0f, height / 4.0);
                 draw_envelope_waveform(cr, width, height, sweep_min_r, sweep_max_r, 1.0f, 3.0 * height / 4.0);
-                cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
             } else {
                 cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
-                set_layer_color(cr, rec_layer, 0.6);
+                set_track_color(cr, rec_track, 0.5);
                 cairo_set_line_width(cr, 1.5);
-                draw_sample_waveform(cr, width, height, loop_layers[rec_layer], current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
-                draw_sample_waveform(cr, width, height, loop_layers[rec_layer], current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
-                cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+                draw_sample_waveform(cr, width, height, multitrack_tracks[rec_track], current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
+                draw_sample_waveform(cr, width, height, multitrack_tracks[rec_track], current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
             }
         }
 
         if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
             size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
             size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
-            double start_px = (((double)l_start / (double)backing_track_frames) * virtual_width) - scroll_x;
-            double end_px = (((double)l_end / (double)backing_track_frames) * virtual_width) - scroll_x;
+
+            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            double start_px = (((double)l_start / (double)t_frames) * virtual_width) - scroll_x;
+            double end_px = (((double)l_end / (double)t_frames) * virtual_width) - scroll_x;
 
             cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
             cairo_fill(cr);
         } else if (is_dragging && drag_start_fraction >= 0.0) {
             double start_px = (drag_start_fraction * virtual_width) - scroll_x;
             double end_px = (current_drag_fraction * virtual_width) - scroll_x;
             if (start_px > end_px) { double tmp = start_px; start_px = end_px; end_px = tmp; }
             cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
             cairo_fill(cr);
         }
 
@@ -469,7 +517,8 @@ static void draw_sample_waveform(cairo_t *cr, int width, int height, const float
  */
 static void draw_playhead(cairo_t *cr, int width, int height, size_t current_pos, size_t total_frames) {
     if (current_pos > 0 && total_frames > 0) {
-        double virtual_width = width * zoom_multiplier;
+        int bt_width = gtk_widget_get_width(waveform_area_bt);
+        double virtual_width = bt_width * zoom_multiplier;
         double scroll_x = gtk_adjustment_get_value(waveform_adj);
         double playhead_x = (((double)current_pos / (double)total_frames) * virtual_width) - scroll_x;
 
@@ -534,15 +583,33 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
         return G_SOURCE_CONTINUE;
     }
 
+    // NEW: Check for silent background encoder failure
+    extern _Atomic bool encoder_disk_error;
+    if (atomic_exchange_explicit(&encoder_disk_error, false, memory_order_acquire)) {
+        if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+            g_signal_emit_by_name(btn_stop, "clicked");
+            gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: RECORDING ABORTED (Disk Full / I/O Error)</b></span>");
+        }
+    }
+
     // 2. Track state changes for the massive waveform canvases independently
     static size_t last_pos_bt = SIZE_MAX;
     static size_t last_pos_input = SIZE_MAX;
     static void* last_buf_bt = NULL;
     static void* last_buf_input = NULL;
+    static void* last_tick_layers[MAX_TRACKS] = {NULL};
 
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
     bool is_active = atomic_load_explicit(&engine_is_playing, memory_order_acquire) ||
     atomic_load_explicit(&engine_is_recording, memory_order_acquire);
+
+    bool layers_swapped = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (multitrack_tracks[i] != last_tick_layers[i]) {
+            layers_swapped = true;
+            last_tick_layers[i] = multitrack_tracks[i];
+        }
+    }
 
     // PAGE TURN LOGIC (Only execute once per tick on the top canvas)
     if (backing_track_frames > 0 && widget == waveform_area_bt) {
@@ -574,7 +641,7 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
 
     // Gate redraws: Only paint if playing, dragging, seeking (pos change), or loading a new track
     if (widget == waveform_area_bt) {
-        if (is_active || is_dragging || current_pos != last_pos_bt || pristine_bt_buf != last_buf_bt) {
+        if (is_active || is_dragging || current_pos != last_pos_bt || pristine_bt_buf != last_buf_bt || layers_swapped) {
             gtk_widget_queue_draw(widget);
             last_pos_bt = current_pos;
             last_buf_bt = pristine_bt_buf;
@@ -585,7 +652,7 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
             }
         }
     } else if (widget == waveform_area_input) {
-        if (is_active || is_dragging || current_pos != last_pos_input || pristine_bt_buf != last_buf_input) {
+        if (is_active || is_dragging || current_pos != last_pos_input || pristine_bt_buf != last_buf_input || layers_swapped) {
             gtk_widget_queue_draw(widget);
             last_pos_input = current_pos;
             last_buf_input = pristine_bt_buf;
@@ -615,7 +682,7 @@ GtkWidget* make_meter(gpointer peak_var_ptr) {
 void invalidate_waveform_caches(void) {
     cached_input_width = 0;
     cached_bt_width = 0;
-    cached_bt_ptr = NULL;    // FIX: Force surface rebuild even if memory address is reused
+    cached_bt_ptr = NULL;    // Force surface rebuild even if memory address is reused
 }
 
 /**
@@ -627,32 +694,31 @@ void invalidate_waveform_caches(void) {
 * @param user_data Optional user data.
 * @return void
 */
+// FILE: ui_waveforms.c
 void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area; (void)user_data;
 
-    bool looper_active = atomic_load_explicit(&is_looper_mode, memory_order_acquire);
     bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
-    int rec_layer = atomic_load_explicit(&current_recording_layer, memory_order_relaxed);
-    float *active_input_buf = looper_active ? loop_layers[rec_layer] : recorded_input_buf;
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
+    float *active_input_buf = multitrack_tracks[rec_track];
 
     if (ui_state.is_loading_track || !active_input_buf || backing_track_frames == 0) {
         draw_waveform_grid(cr, width, height, 0);
         return;
     }
 
-    double virtual_width = width * zoom_multiplier;
+    int bt_width = gtk_widget_get_width(waveform_area_bt);
+    double virtual_width = bt_width * zoom_multiplier;
     double scroll_x = gtk_adjustment_get_value(waveform_adj);
     double frames_per_pixel = (double)backing_track_frames / virtual_width;
     if (frames_per_pixel == 0) frames_per_pixel = 1.0;
 
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-    // Draw the full pre-allocated buffer (including future unrecorded zeros)
     size_t target_scan = backing_track_frames;
 
     static double cached_input_scroll_x = -1.0;
     static double cached_input_zoom = -1.0;
 
-    // 1. GRID CACHING ONLY
     if (width != cached_input_width || height != cached_input_height ||
         scroll_x != cached_input_scroll_x || zoom_multiplier != cached_input_zoom) {
 
@@ -671,90 +737,120 @@ void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int he
     cached_input_zoom = zoom_multiplier;
         }
 
-        // 2. PAINT CACHED GRID
         if (surface_input_grid) {
             cairo_set_source_surface(cr, surface_input_grid, 0, 0);
             cairo_paint(cr);
         }
 
-        // NEW: Draw loop highlights BEFORE the early return so it always mirrors the top canvas
-        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
-            size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
-            size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
-            double start_px = (((double)l_start / (double)backing_track_frames) * virtual_width) - scroll_x;
-            double end_px = (((double)l_end / (double)backing_track_frames) * virtual_width) - scroll_x;
+        if (is_recording) {
+            if (frames_per_pixel >= 1.0) {
+                memset(input_min_l, 0, sizeof(input_min_l));
+                memset(input_max_l, 0, sizeof(input_max_l));
+                memset(input_min_r, 0, sizeof(input_min_r));
+                memset(input_max_r, 0, sizeof(input_max_r));
 
-            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
-            cairo_fill(cr);
-        } else if (is_dragging && drag_start_fraction >= 0.0) {
-            double start_px = (drag_start_fraction * virtual_width) - scroll_x;
-            double end_px = (current_drag_fraction * virtual_width) - scroll_x;
-            if (start_px > end_px) { double tmp = start_px; start_px = end_px; end_px = tmp; }
-            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
-            cairo_fill(cr);
-        }
+                for (int x = 0; x < width && x < MAX_UI_WIDTH; x++) {
+                    size_t start_frame = (size_t)((scroll_x + x) * frames_per_pixel);
+                    size_t end_frame = (size_t)((scroll_x + x + 1) * frames_per_pixel);
 
-        // 3. WIPE INPUT IF NOT RECORDING IN LOOPER MODE
-        if (looper_active && !is_recording) {
-            draw_playhead(cr, width, height, current_pos, backing_track_frames);
-            return;
-        }
+                    if (end_frame <= start_frame) end_frame = start_frame + 1;
+                    if (start_frame >= target_scan) break;
+                    if (end_frame > target_scan) end_frame = target_scan;
 
-        // 4. DYNAMIC AUDIO TRACE (RENDERED DIRECTLY TO SCREEN EVERY TICK)
-        if (frames_per_pixel >= 1.0) {
-            memset(input_min_l, 0, sizeof(input_min_l));
-            memset(input_max_l, 0, sizeof(input_max_l));
-            memset(input_min_r, 0, sizeof(input_min_r));
-            memset(input_max_r, 0, sizeof(input_max_r));
+                    scan_waveform_extents(active_input_buf, start_frame, end_frame,
+                                          &input_min_l[x], &input_max_l[x], &input_min_r[x], &input_max_r[x]);
+                }
 
-            for (int x = 0; x < width && x < MAX_UI_WIDTH; x++) {
-                size_t start_frame = (size_t)((scroll_x + x) * frames_per_pixel);
-                size_t end_frame = (size_t)((scroll_x + x + 1) * frames_per_pixel);
-
-                if (end_frame <= start_frame) end_frame = start_frame + 1;
-                if (start_frame >= target_scan) break;
-                if (end_frame > target_scan) end_frame = target_scan;
-
-                scan_waveform_extents(active_input_buf, start_frame, end_frame,
-                                      &input_min_l[x], &input_max_l[x], &input_min_r[x], &input_max_r[x]);
+                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+                set_track_color(cr, rec_track, 0.5);
+                cairo_set_line_width(cr, 1.0);
+                draw_envelope_waveform(cr, width, height, input_min_l, input_max_l, 1.0f, height / 4.0);
+                draw_envelope_waveform(cr, width, height, input_min_r, input_max_r, 1.0f, 3.0 * height / 4.0);
+            } else {
+                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+                set_track_color(cr, rec_track, 0.5);
+                cairo_set_line_width(cr, 1.5);
+                draw_sample_waveform(cr, width, height, active_input_buf, target_scan, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
+                draw_sample_waveform(cr, width, height, active_input_buf, target_scan, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
             }
-
-            set_layer_color(cr, rec_layer, 1.0);
-            cairo_set_line_width(cr, 1.0);
-            draw_envelope_waveform(cr, width, height, input_min_l, input_max_l, 1.0f, height / 4.0);
-            draw_envelope_waveform(cr, width, height, input_min_r, input_max_r, 1.0f, 3.0 * height / 4.0);
-        } else {
-            set_layer_color(cr, rec_layer, 1.0);
-            cairo_set_line_width(cr, 1.5);
-            draw_sample_waveform(cr, width, height, active_input_buf, target_scan, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
-            draw_sample_waveform(cr, width, height, active_input_buf, target_scan, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
         }
 
         if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
             size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
             size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
-            double start_px = (((double)l_start / (double)backing_track_frames) * virtual_width) - scroll_x;
-            double end_px = (((double)l_end / (double)backing_track_frames) * virtual_width) - scroll_x;
+
+            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            double start_px = (((double)l_start / (double)t_frames) * virtual_width) - scroll_x;
+            double end_px = (((double)l_end / (double)t_frames) * virtual_width) - scroll_x;
 
             cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
             cairo_fill(cr);
         } else if (is_dragging && drag_start_fraction >= 0.0) {
             double start_px = (drag_start_fraction * virtual_width) - scroll_x;
             double end_px = (current_drag_fraction * virtual_width) - scroll_x;
             if (start_px > end_px) { double tmp = start_px; start_px = end_px; end_px = tmp; }
             cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, start_px, 0, end_px - start_px, height);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
             cairo_fill(cr);
         }
 
-        // 5. DRAW PLAYHEAD
         draw_playhead(cr, width, height, current_pos, backing_track_frames);
 }
 
-// --- LOOPER DRAG GESTURES ---
+// --- LOOPER DRAG GESTURES --
+
+void clear_waveform_anchor(void) {
+    clear_loop_points();
+}
+
+void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
+    (void)n_press; (void)y; (void)user_data;
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) return;
+    if (backing_track_frames == 0) return;
+
+    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+
+    // GUARD: Abort click processing if Ctrl is held, reserving it exclusively for panning
+    if (state & GDK_CONTROL_MASK) {
+        gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
+        return;
+    }
+
+    int width = gtk_widget_get_width(waveform_area_bt);
+    if (width <= 0) return;
+
+    double virtual_width = width * zoom_multiplier;
+    double scroll_x = gtk_adjustment_get_value(waveform_adj);
+    double click_fraction = (x + scroll_x) / virtual_width;
+
+    if (click_fraction < 0.0) click_fraction = 0.0;
+    if (click_fraction > 1.0) click_fraction = 1.0;
+
+    size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+
+    if ((state & GDK_SHIFT_MASK) == 0) {
+        // Normal Click: Clear loop and move playhead
+        clear_loop_points();
+        seek_backing_track(click_fraction);
+    } else {
+        // Shift + Click: Create selection between current playhead and click location
+        size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+        double playhead_fraction = (double)current_pos / (double)total_frames;
+
+        // Failsafe: Prevent mathematically identical start/end loops
+        if (playhead_fraction == click_fraction) click_fraction += 0.000001;
+
+        set_loop_points(playhead_fraction, click_fraction);
+        seek_backing_track(fmin(playhead_fraction, click_fraction));
+    }
+
+    last_seek_time = g_get_monotonic_time();
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+    gtk_widget_queue_draw(waveform_area_bt);
+    gtk_widget_queue_draw(waveform_area_input);
+}
+
 /**
  * @brief Gesture callback triggered when a looper drag starts.
  * @param gesture The drag gesture object.
@@ -772,6 +868,13 @@ void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpoi
     if (width <= 0) return;
 
     GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+
+    // Abort drag if Shift is held to allow click gesture to exclusively handle Anchor & Extend
+    if (state & GDK_SHIFT_MASK) {
+        gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
+        return;
+    }
+
     if (state & GDK_CONTROL_MASK) {
         is_panning = true;
         drag_start_scroll_x = gtk_adjustment_get_value(waveform_adj);
@@ -784,6 +887,12 @@ void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpoi
 
     if (drag_start_fraction < 0.0) drag_start_fraction = 0.0;
     if (drag_start_fraction > 1.0) drag_start_fraction = 1.0;
+
+    size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    if (total_frames > 0) {
+        size_t frame = (size_t)(drag_start_fraction * total_frames);
+        drag_start_fraction = (double)frame / (double)total_frames;
+    }
 
     is_dragging = true;
     current_drag_fraction = drag_start_fraction;
@@ -805,7 +914,6 @@ void on_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, g
     if (backing_track_frames == 0) return;
 
     if (is_panning) {
-        // Multiplier added to make panning feel 1.5x faster/smoother
         double new_scroll = drag_start_scroll_x - (offset_x * 1.5);
         double upper = gtk_adjustment_get_upper(waveform_adj);
         double page = gtk_adjustment_get_page_size(waveform_adj);
@@ -830,8 +938,14 @@ void on_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, g
     if (current_drag_fraction < 0.0) current_drag_fraction = 0.0;
     if (current_drag_fraction > 1.0) current_drag_fraction = 1.0;
 
+    size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    if (total_frames > 0) {
+        size_t frame = (size_t)(current_drag_fraction * total_frames);
+        current_drag_fraction = (double)frame / (double)total_frames;
+    }
+
     gtk_widget_queue_draw(waveform_area_bt);
-    gtk_widget_queue_draw(waveform_area_input); // Synchronize highlight to bottom canvas
+    gtk_widget_queue_draw(waveform_area_input);
 }
 
 /**
@@ -868,13 +982,10 @@ void on_drag_end(GtkGestureDrag *gesture, double offset_x, double offset_y, gpoi
 
     is_dragging = false;
 
-    if (fabs(offset_x) < 5.0) {
-        gint64 current_time = g_get_monotonic_time();
-        if (current_time - last_seek_time > 250000) {
-            seek_backing_track(end_fraction);
-            last_seek_time = current_time;
-        }
-    } else {
+    // Use physical screen pixels to differentiate a click from a drag.
+    // Increasing the threshold to 10.0px prevents accidental micro-loops from sloppy clicks.
+    // Pure clicks are naturally handled by on_waveform_click_pressed on mouse-down.
+    if (fabs(offset_x) >= 10.0) {
         set_loop_points(drag_start_fraction, end_fraction);
         seek_backing_track(fmin(drag_start_fraction, end_fraction));
         last_seek_time = g_get_monotonic_time();
@@ -882,4 +993,92 @@ void on_drag_end(GtkGestureDrag *gesture, double offset_x, double offset_y, gpoi
 
     drag_start_fraction = -1.0;
     gtk_widget_queue_draw(waveform_area_input); // Ensure final boundary snaps to bottom canvas
+}
+
+static guint scroll_debounce_id = 0;
+
+static gboolean reset_scroll_debounce(gpointer data) {
+    (void)data;
+    scroll_debounce_id = 0;
+    return G_SOURCE_REMOVE;
+}
+
+gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data) {
+    (void)user_data;
+    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller));
+
+    if (state & GDK_SHIFT_MASK) {
+        extern _Atomic bool loop_active;
+        if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return FALSE;
+
+        extern _Atomic int current_recording_track;
+        int track_idx = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+
+        if (scroll_debounce_id == 0) {
+            extern void backup_track_for_edit(int);
+            backup_track_for_edit(track_idx);
+        } else {
+            g_source_remove(scroll_debounce_id);
+        }
+        scroll_debounce_id = g_timeout_add(500, reset_scroll_debounce, NULL);
+
+        double delta = (dx != 0.0) ? dx : dy;
+        float db_delta = (delta < 0) ? 0.5f : -0.5f;
+
+        extern void amplify_track_selection(int, float);
+        amplify_track_selection(track_idx, db_delta);
+
+        extern GtkWidget *waveform_area_bt;
+        extern GtkWidget *waveform_area_input;
+        extern void invalidate_waveform_caches(void);
+
+        invalidate_waveform_caches();
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+        return TRUE;
+    }
+
+    if (state & GDK_CONTROL_MASK) {
+        double delta = (dy != 0.0) ? dy : dx;
+
+        if (delta < 0) {
+            zoom_multiplier *= 1.25;
+        } else {
+            zoom_multiplier /= 1.25;
+        }
+
+        if (zoom_multiplier < 1.0) zoom_multiplier = 1.0;
+        if (zoom_multiplier > 5000000.0) zoom_multiplier = 5000000.0;
+
+        size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+        size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+
+        extern GtkWidget *waveform_area_bt;
+        if (total_frames > 0 && waveform_area_bt) {
+            int width = gtk_widget_get_width(waveform_area_bt);
+            double virtual_width = width * zoom_multiplier;
+            double playhead_virtual_x = ((double)current_pos / (double)total_frames) * virtual_width;
+
+            gtk_adjustment_set_upper(waveform_adj, virtual_width);
+            gtk_adjustment_set_page_size(waveform_adj, width);
+
+            double new_scroll = playhead_virtual_x - (width / 2.0);
+            if (new_scroll < 0) new_scroll = 0;
+            if (new_scroll > virtual_width - width) new_scroll = virtual_width - width;
+
+            gtk_adjustment_set_value(waveform_adj, new_scroll);
+        }
+
+        extern void invalidate_waveform_caches(void);
+        extern GtkWidget *waveform_area_input;
+
+        invalidate_waveform_caches();
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+        return TRUE;
+    }
+
+    return FALSE;
 }

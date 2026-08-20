@@ -17,4 +17,8 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
  */
 void stop_video_engine();
 
+/** Global hardware capture dimensions exposed for the FFmpeg encoder pipeline */
+extern int capture_width;
+extern int capture_height;
+
 #endif // QJAMS_VIDEO_ENGINE_H

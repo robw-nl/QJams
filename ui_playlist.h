@@ -4,6 +4,17 @@
 #include <gtk/gtk.h>
 #include <stdbool.h>
 
+// --- EXPOSED TRACK LIST GOBJECT ---
+#define QJ_TYPE_TRACK (qj_track_get_type())
+G_DECLARE_FINAL_TYPE(QjTrack, qj_track, QJ, TRACK, GObject)
+
+struct _QjTrack {
+    GObject parent_instance;
+    char *filepath;
+    char *display_name;
+    bool is_qjams_native;
+};
+
 /**
  * @brief Creates and initializes the main GTK playlist widget structure.
  * @return A pointer to the created GtkWidget (scrolled window containing the list).
@@ -50,5 +61,10 @@ void on_playlist_toggle_clicked(GtkButton *button, gpointer user_data);
  * @return true if a new track was loaded, false otherwise.
  */
 bool cycle_playlist_track(int direction);
+
+void remove_active_track_from_playlist(const char *path);
+
+void activate_playlist_preset(int slot);
+void assign_playlist_preset(int slot); // ADD THIS
 
 #endif // UI_PLAYLIST_H

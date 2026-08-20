@@ -44,8 +44,8 @@ static uint8_t* yuyv_cpu_cache = NULL;
 
 // Active Hardware Format State
 static uint32_t capture_v4l2_fmt = 0;
-static int capture_width = 1280;
-static int capture_height = 720;
+int capture_width = 1280;
+int capture_height = 720;
 
 /**
  * @brief Background thread loop for memory-mapped V4L2 capture and scaling.
@@ -117,18 +117,22 @@ static void* video_capture_loop(void* arg) {
             size_t p_w_idx = atomic_load_explicit(&preview_queue.write_index, memory_order_relaxed);
             size_t p_r_idx = atomic_load_explicit(&preview_queue.read_index, memory_order_acquire);
             if (p_w_idx - p_r_idx < preview_queue.capacity) {
+
+                // Dynamically calculate proper height preserving aspect ratio for a locked 640px width
+                int target_height = (int)(640.0 * ((double)frame->height / (double)frame->width));
+
                 if (!preview_sws_ctx) {
                     preview_sws_ctx = sws_getContext(frame->width, frame->height, frame->format,
-                                                     ui_state.config.video_preview_width, ui_state.config.video_preview_height, AV_PIX_FMT_RGBA,
+                                                     640, target_height, AV_PIX_FMT_RGBA,
                                                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
                 }
 
                 uint8_t *rgba_buf = rgba_pool[p_w_idx & (preview_queue.capacity - 1)];
                 uint8_t *dest_data[4] = { rgba_buf, NULL, NULL, NULL };
-                int dest_linesize[4] = { ui_state.config.video_preview_width * 4, 0, 0, 0 };
+                int dest_linesize[4] = { 640 * 4, 0, 0, 0 };
                 sws_scale(preview_sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
                           0, frame->height, dest_data, dest_linesize);
-                push_preview_frame(&preview_queue, rgba_buf, ui_state.config.video_preview_width, ui_state.config.video_preview_height);
+                push_preview_frame(&preview_queue, rgba_buf, 640, target_height);
             }
         }
 
@@ -154,27 +158,27 @@ static void* video_capture_loop(void* arg) {
 
         int64_t adjusted_pts = pts - total_pause_offset_us;
 
-        // NEW: Bypass sending frames to the encoder if Looper Mode is active
-        if (atomic_load_explicit(&is_looper_mode, memory_order_relaxed)) goto frame_cleanup;
+        // NEW: Bypass sending frames to the encoder if Multi-Track Mode is active
+        if (atomic_load_explicit(&is_multitrack_mode, memory_order_relaxed)) goto frame_cleanup;
 
         size_t e_w_idx = atomic_load_explicit(&target_queue->write_index, memory_order_relaxed);
         size_t e_r_idx = atomic_load_explicit(&target_queue->read_index, memory_order_acquire);
         if (e_w_idx - e_r_idx >= target_queue->capacity) goto frame_cleanup;
 
         // 3. Guarantee output is NV12 for direct VAAPI hardware mapping
-        int nv12_size = av_image_get_buffer_size(AV_PIX_FMT_NV12, 1280, 720, 1);
+        int nv12_size = av_image_get_buffer_size(AV_PIX_FMT_NV12, capture_width, capture_height, 1);
         uint8_t *nv12_payload = nv12_pool[e_w_idx & (target_queue->capacity - 1)];
 
         // Initialize the dedicated encoder scaler safely
         if (!encode_sws_ctx) {
             encode_sws_ctx = sws_getContext(frame->width, frame->height, frame->format,
-                                            1280, 720, AV_PIX_FMT_NV12,
+                                            capture_width, capture_height, AV_PIX_FMT_NV12,
                                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
         }
 
         uint8_t *dst_data[4];
         int dst_linesize[4];
-        av_image_fill_arrays(dst_data, dst_linesize, nv12_payload, AV_PIX_FMT_NV12, 1280, 720, 1);
+        av_image_fill_arrays(dst_data, dst_linesize, nv12_payload, AV_PIX_FMT_NV12, capture_width, capture_height, 1);
 
         // Safely map and convert the camera's colorspace directly into the ringbuffer payload
         sws_scale(encode_sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
@@ -216,23 +220,33 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
     }
 
     if (capture_v4l2_fmt == V4L2_PIX_FMT_MJPEG) {
-        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-        preview_dec_ctx = avcodec_alloc_context3(codec);
-        avcodec_open2(preview_dec_ctx, codec, NULL);
+        if (!preview_dec_ctx) {
+            const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+            preview_dec_ctx = avcodec_alloc_context3(codec);
+            avcodec_open2(preview_dec_ctx, codec, NULL);
+        }
     } else if (capture_v4l2_fmt == V4L2_PIX_FMT_YUYV) {
+        if (yuyv_cpu_cache) free(yuyv_cpu_cache);
         yuyv_cpu_cache = malloc(capture_width * capture_height * 2);
     }
 
-    for (int i = 0; i < 64; i++) nv12_pool[i] = malloc(1280 * 720 * 3 / 2);
-    for (int i = 0; i < 32; i++) rgba_pool[i] = malloc(1280 * 720 * 4); // ALLOCATE FOR MAX RESOLUTION (720p)
-
+    // Ensure allocations are strictly re-entrant for hardware hot-patch retries
+    for (int i = 0; i < 64; i++) {
+        if (nv12_pool[i]) free(nv12_pool[i]);
+        nv12_pool[i] = malloc(capture_width * capture_height * 3 / 2);
+    }
+    for (int i = 0; i < 32; i++) {
+        // We defer exact RGBA sizing to Phase 2, but allocate enough for a 1080p frame max to be safe
+        if (rgba_pool[i]) free(rgba_pool[i]);
+        rgba_pool[i] = malloc(1920 * 1080 * 4);
+    }
     // Spin-wait to allow the kernel V4L2 driver to release the hardware lock
     // after the terminal diagnostic scanner probes and closes it.
     int retries = 5;
     while (retries > 0) {
         fd = open(device_path, O_RDWR | O_NONBLOCK, 0);
         if (fd != -1) break;
-        usleep(100000); // 100ms polling delay
+        usleep(100000);
         retries--;
     }
 
@@ -251,12 +265,9 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
 
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
         perror("VIDIOC_S_FMT failed");
-        close(fd);
-        fd = -1;
-        return -1;
+        goto v4l2_init_fail;
     }
 
-    // Set Framerate to 30 FPS
     struct v4l2_streamparm parm;
     memset(&parm, 0, sizeof(parm));
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -269,7 +280,10 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
     req.count = REQ_BUFFERS;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
-    ioctl(fd, VIDIOC_REQBUFS, &req);
+
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) == -1) {
+        goto v4l2_init_fail;
+    }
 
     buffers = calloc(req.count, sizeof(*buffers));
     for (unsigned int i = 0; i < req.count; i++) {
@@ -278,7 +292,10 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
-        ioctl(fd, VIDIOC_QUERYBUF, &buf);
+
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) {
+            goto v4l2_init_fail;
+        }
 
         buffers[i].length = buf.length;
         buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
@@ -286,18 +303,16 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
         if (buffers[i].start == MAP_FAILED) {
             perror("mmap failed");
             for (unsigned int j = 0; j < i; j++) munmap(buffers[j].start, buffers[j].length);
-            free(buffers);
-            buffers = NULL;
-            close(fd);
-            fd = -1;
-            return -1;
+            goto v4l2_init_fail;
         }
 
         ioctl(fd, VIDIOC_QBUF, &buf);
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(fd, VIDIOC_STREAMON, &type);
+    if (ioctl(fd, VIDIOC_STREAMON, &type) == -1) {
+        goto v4l2_init_fail;
+    }
 
     printf("Video Engine Live: V4L2 Thread capturing %s at %dx%d 30FPS.\n",
            capture_v4l2_fmt == V4L2_PIX_FMT_MJPEG ? "MJPEG" : "YUYV", capture_width, capture_height);
@@ -305,6 +320,17 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
     keep_running = 1;
     pthread_create(&video_thread, NULL, video_capture_loop, NULL);
     return 0;
+
+    v4l2_init_fail:
+    if (buffers) {
+        free(buffers);
+        buffers = NULL;
+    }
+    if (fd != -1) {
+        close(fd);
+        fd = -1;
+    }
+    return -1;
 }
 
 /**

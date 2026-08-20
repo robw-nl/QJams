@@ -1,7 +1,7 @@
 #include "ui_command_post.h"
 #include "ui_globals.h"
 #include "audio_engine.h"
-#include "ui_looper.h"
+#include "ui_multitrack.h"
 #include "ui_dashboard.h"
 #include "ui_settings.h"
 #include "ui_playlist.h"
@@ -12,6 +12,9 @@
 
 GPid active_muxer_pid = 0;
 
+static void on_multitrack_mode_toggled(GtkToggleButton *button, gpointer user_data);
+static GtkWidget *btn_load_session = NULL;
+
 static void on_file_chosen(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     (void)user_data;
     GtkFileDialog *dialog = GTK_FILE_DIALOG(source_object);
@@ -20,13 +23,25 @@ static void on_file_chosen(GObject *source_object, GAsyncResult *res, gpointer u
 
     if (file) {
         char *path = g_file_get_path(file);
-        char *dir = g_file_get_parent(file) ? g_file_get_path(g_file_get_parent(file)) : NULL;
+        char *dir = NULL;
+
+        GFile *parent = g_file_get_parent(file);
+        if (parent) {
+            dir = g_file_get_path(parent);
+            g_object_unref(parent);
+        }
 
         if (g_str_has_suffix(path, ".m3u")) {
             load_playlist_from_file(path);
         } else {
-            strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
-            trigger_track_load();
+            if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+                multitrack_import_file_async(path, rec_track);
+            } else {
+                strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
+                ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
+                trigger_track_load();
+            }
         }
 
         if (dir) {
@@ -43,16 +58,9 @@ static void on_file_chosen(GObject *source_object, GAsyncResult *res, gpointer u
 void on_select_track_clicked(GtkButton *button, gpointer window) {
     (void)button;
     GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "Export Mix");
+    gtk_file_dialog_set_title(dialog, "Select Media Track");
 
-    // FIX: Set the exact final file name so GTK handles the file overwrite prompt natively
-    if (atomic_load_explicit(&is_looper_mode, memory_order_acquire)) {
-        gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.flac");
-    } else {
-        gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.mkv");
-    }
-
-    if (strlen(ui_state.config.recordings_dir) > 0) {
+    if (strlen(ui_state.config.last_track_dir) > 0) {
         GFile *initial_folder = g_file_new_for_path(ui_state.config.last_track_dir);
         gtk_file_dialog_set_initial_folder(dialog, initial_folder);
         g_object_unref(initial_folder);
@@ -79,7 +87,7 @@ static void on_muxer_finished(GPid pid, gint status, gpointer user_data) {
     (void)user_data;
     g_spawn_close_pid(pid);
     active_muxer_pid = 0;
-    gtk_spinner_stop(GTK_SPINNER(main_spinner)); // Halt the spinner
+    gtk_spinner_stop(GTK_SPINNER(main_spinner));
 
     if (status == 0) gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Muxing Complete!");
     else gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Muxing Failed (FFmpeg Error)");
@@ -107,9 +115,10 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
     char *dir = g_path_get_dirname(chosen_path);
     char *basename_ext = g_path_get_basename(chosen_path);
 
-    // 1. Safely derive the pure title without extensions or existing "-MIX" suffixes
     char base_no_ext[512];
     strncpy(base_no_ext, basename_ext, sizeof(base_no_ext) - 1);
+    base_no_ext[sizeof(base_no_ext) - 1] = '\0';
+
     char *dot = strrchr(base_no_ext, '.');
     if (dot) *dot = '\0';
 
@@ -118,15 +127,14 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         base_no_ext[len - 4] = '\0';
     }
 
-    // 2. UNCONDITIONALLY enforce the exact file suffixes to guarantee proper naming
-    bool is_looper = atomic_load_explicit(&is_looper_mode, memory_order_acquire);
+    bool is_looper = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
     char raw_path[1024];
     char mix_path[1024];
     snprintf(raw_path, sizeof(raw_path), "%s/%s-RAW.mkv", dir, base_no_ext);
-    snprintf(mix_path, sizeof(mix_path), "%s/%s-MIX.%s", dir, base_no_ext, is_looper ? "flac" : "mkv");
+    snprintf(mix_path, sizeof(mix_path), "%s/%s-MIX.mkv", dir, base_no_ext);
 
-    char temp_flac[1024];
-    snprintf(temp_flac, sizeof(temp_flac), "/tmp/%s-RAW.flac", base_no_ext);
+    char temp_raw[1024];
+    snprintf(temp_raw, sizeof(temp_raw), "/tmp/%s-RAW.wav", base_no_ext);
 
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
@@ -134,7 +142,7 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
     snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
     gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Exporting Audio/Video...");
-    gtk_spinner_start(GTK_SPINNER(main_spinner)); // Start the spinner
+    gtk_spinner_start(GTK_SPINNER(main_spinner));
 
     size_t start_f = 0;
     size_t end_f = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
@@ -148,23 +156,27 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         SF_INFO sfinfo = {0};
         sfinfo.channels = 2;
         sfinfo.samplerate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-        sfinfo.format = SF_FORMAT_FLAC | SF_FORMAT_PCM_16;
+        sfinfo.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
 
-        SNDFILE *outfile = sf_open(temp_flac, SFM_WRITE, &sfinfo);
+        SNDFILE *outfile = sf_open(temp_raw, SFM_WRITE, &sfinfo);
         size_t frames_to_write = end_f - start_f;
 
         if (outfile && frames_to_write > 0) {
-            int active = atomic_load_explicit(&active_layer_count, memory_order_acquire);
+            int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
             float *mix_buf = calloc(frames_to_write * 2, sizeof(float));
             if (mix_buf) {
-                for (int l = 0; l < active && l < MAX_LOOPS; l++) {
-                    if (loop_layers[l] && !atomic_load_explicit(&layer_is_muted[l], memory_order_acquire)) {
-                        for (size_t i = 0; i < frames_to_write; i++) {
-                            mix_buf[i * 2] += loop_layers[l][(start_f + i) * 2];
-                            mix_buf[i * 2 + 1] += loop_layers[l][(start_f + i) * 2 + 1];
+                if (await_rt_thread_detach()) {
+                    for (int l = 0; l < active && l < MAX_TRACKS; l++) {
+                        if (multitrack_tracks[l]) {
+                            for (size_t i = 0; i < frames_to_write; i++) {
+                                mix_buf[i * 2] += multitrack_tracks[l][(start_f + i) * 2];
+                                mix_buf[i * 2 + 1] += multitrack_tracks[l][(start_f + i) * 2 + 1];
+                            }
                         }
                     }
+                    resume_rt_thread();
                 }
+
                 for (size_t i = 0; i < frames_to_write * 2; i++) {
                     if (mix_buf[i] > 1.0f) mix_buf[i] = 1.0f;
                     else if (mix_buf[i] < -1.0f) mix_buf[i] = -1.0f;
@@ -174,26 +186,39 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
             }
             sf_close(outfile);
 
-            char *argv[32];
+            char *argv[64];
             int argc = 0;
             argv[argc++] = "ffmpeg"; argv[argc++] = "-y";
-            argv[argc++] = "-i"; argv[argc++] = temp_flac;
+            argv[argc++] = "-i"; argv[argc++] = temp_raw;
 
             char *meta_title = g_strdup_printf("title=%s", base_no_ext);
             char *meta_date = g_strdup_printf("recordingdate=%s", date_str);
-            char *meta_comment = g_strdup("comment=Recorded with QJams. (c) Rob Wijhenke - https://sites.google.com/view/qjams");
+            char *meta_comment = g_strdup("comment=Recorded with QJams. (c) Rob Wijhenke. https://sites.google.com/view/qjams");
 
             argv[argc++] = "-metadata"; argv[argc++] = meta_title;
             argv[argc++] = "-metadata"; argv[argc++] = meta_date;
             argv[argc++] = "-metadata"; argv[argc++] = meta_comment;
 
-            argv[argc++] = "-c:a"; argv[argc++] = "copy";
-            argv[argc++] = mix_path; argv[argc++] = NULL;
+            char mix_path_flac[1024];
+            char mix_path_wav[1024];
+            snprintf(mix_path_flac, sizeof(mix_path_flac), "%s/%s-MIX.flac", dir, base_no_ext);
+            snprintf(mix_path_wav, sizeof(mix_path_wav), "%s/%s-MIX.wav", dir, base_no_ext);
+
+            int fmt = ui_state.config.export_format;
+            if (fmt == 0 || fmt == 2) {
+                argv[argc++] = "-c:a"; argv[argc++] = "flac";
+                argv[argc++] = mix_path_flac;
+            }
+            if (fmt == 1 || fmt == 2) {
+                argv[argc++] = "-c:a"; argv[argc++] = "pcm_s16le";
+                argv[argc++] = mix_path_wav;
+            }
+            argv[argc++] = NULL;
 
             GError *spawn_err = NULL;
             if (g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &active_muxer_pid, &spawn_err)) {
                 g_child_watch_add(active_muxer_pid, on_muxer_finished, NULL);
-                gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Saved, Tagging FLAC...");
+                gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Saved, Tagging Audio...");
             } else {
                 gtk_label_set_text(GTK_LABEL(lbl_status), "Status: FFmpeg Tagging Failed");
                 gtk_spinner_stop(GTK_SPINNER(main_spinner));
@@ -205,7 +230,7 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
             g_free(meta_date);
             g_free(meta_comment);
         } else {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Failed to open FLAC for writing");
+            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Failed to open raw output for writing");
             gtk_spinner_stop(GTK_SPINNER(main_spinner));
             gtk_widget_set_sensitive(btn_save_mux, TRUE);
         }
@@ -213,53 +238,29 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         return;
     }
 
-    // Standard Mode: Explicitly route RAW cache through FFmpeg for dual-output tagging and mixdown
-    char volume_filter[512];
-    int in_w = (int)ui_state.config.input_gain_multiplier;
-    int in_f = (int)(((ui_state.config.input_gain_multiplier - in_w) * 10000.0f) + 0.5f);
-
-    if (end_f == 0) {
-        snprintf(volume_filter, sizeof(volume_filter),
-                 "[0:a:1]volume=%d.%04d[a]",
-                 in_w, in_f);
-    } else {
-        int bt_w = (int)ui_state.config.bt_gain_multiplier;
-        int bt_f = (int)(((ui_state.config.bt_gain_multiplier - bt_w) * 10000.0f) + 0.5f);
-        snprintf(volume_filter, sizeof(volume_filter),
-                 "[0:a:0]volume=%d.%04d[a0];[0:a:1]volume=%d.%04d[a1];[a0][a1]amerge=inputs=2[am];[am]pan=stereo|c0=c0+c2|c1=c1+c3[ap];[ap]alimiter=limit=0.944:attack=0.1:release=50[a]",
-                 bt_w, bt_f, in_w, in_f);
-    }
-
     char *argv[64];
     int argc = 0;
     argv[argc++] = "ffmpeg"; argv[argc++] = "-y";
 
-    // FIX: The current_raw_path MKV is already exactly the duration of the recording session!
-    // Never apply -ss or -to arguments here, as it will cause an out-of-bounds seek error.
     argv[argc++] = "-i"; argv[argc++] = current_raw_path;
 
     char *meta_title = g_strdup_printf("title=%s", base_no_ext);
     char *meta_date = g_strdup_printf("recordingdate=%s", date_str);
-    char *meta_comment = g_strdup("comment=Recorded with QJams. (c) Rob Wijhenke - https://sites.google.com/view/qjams");
+    char *meta_comment = g_strdup("comment=Recorded with QJams. (c) Rob Wijhenke. https://sites.google.com/view/qjams");
 
-    argv[argc++] = "-filter_complex"; argv[argc++] = volume_filter;
-
-    // OUTPUT 1: The Tagged RAW File
-    if (end_f == 0) {
-        argv[argc++] = "-map"; argv[argc++] = "0:v?";
-        argv[argc++] = "-map"; argv[argc++] = "0:a:1";
-    } else {
-        argv[argc++] = "-map"; argv[argc++] = "0";
-    }
+    // We no longer need to apply volume or merge tracks, as they were mixed perfectly in real-time.
+    // Copy the exact unified recording as the RAW archive
+    argv[argc++] = "-map"; argv[argc++] = "0:v?";
+    argv[argc++] = "-map"; argv[argc++] = "0:a:0?";
     argv[argc++] = "-c"; argv[argc++] = "copy";
     argv[argc++] = "-metadata"; argv[argc++] = meta_title;
     argv[argc++] = "-metadata"; argv[argc++] = meta_date;
     argv[argc++] = "-metadata"; argv[argc++] = meta_comment;
     argv[argc++] = raw_path;
 
-    // OUTPUT 2: The Tagged MIX File
+    // Generate the optimized MIX file with FLAC compression
     argv[argc++] = "-map"; argv[argc++] = "0:v?";
-    argv[argc++] = "-map"; argv[argc++] = "[a]";
+    argv[argc++] = "-map"; argv[argc++] = "0:a:0?";
     argv[argc++] = "-c:v"; argv[argc++] = "copy";
     argv[argc++] = "-c:a"; argv[argc++] = "flac";
     argv[argc++] = "-metadata"; argv[argc++] = meta_title;
@@ -291,16 +292,17 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
 void on_save_mux_clicked(GtkButton *button, gpointer user_data) {
     (void)button; (void)user_data;
 
-    // REMOVED: The 'if (end_f == 0) return;' check has been deleted to allow Freestyle Recording
-
     gtk_widget_set_sensitive(btn_save_mux, FALSE);
 
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "Export Mix");
 
-    // FIX: Set the exact final file name so GTK handles the file overwrite prompt natively
-    if (atomic_load_explicit(&is_looper_mode, memory_order_acquire)) {
-        gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.flac");
+    if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+        if (ui_state.config.export_format == 1) {
+            gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.wav");
+        } else {
+            gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.flac");
+        }
     } else {
         gtk_file_dialog_set_initial_name(dialog, "MySong-MIX.mkv");
     }
@@ -323,6 +325,10 @@ static void on_save_session_file_chosen(GObject *source_object, GAsyncResult *re
         char *path = g_file_get_path(file);
         on_stop_clicked(NULL, NULL);
         if (save_qjams_session(path) == 0) {
+            strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
+            ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
+            update_playlist_toggle_state();
+
             char *basename = g_path_get_basename(path);
             char status[512];
             snprintf(status, sizeof(status), "Status: Session saved to %s", basename);
@@ -341,7 +347,7 @@ static void on_save_session_file_chosen(GObject *source_object, GAsyncResult *re
 static void on_save_session_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "Save Looper Session");
+    gtk_file_dialog_set_title(dialog, "Save Multi-Track Session");
     gtk_file_dialog_set_initial_name(dialog, "New_Session.qjams");
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_set_name(filter, "QJams Session (*.qjams)");
@@ -359,6 +365,133 @@ static void on_save_session_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_dialog_save(dialog, GTK_WINDOW(user_data), NULL, on_save_session_file_chosen, NULL);
 }
 
+static gboolean deferred_session_redraw(gpointer user_data) {
+    (void)user_data;
+    extern void invalidate_waveform_caches(void);
+    extern GtkWidget *waveform_area_bt;
+    extern GtkWidget *waveform_area_input;
+
+    invalidate_waveform_caches();
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+    return G_SOURCE_REMOVE; // Ensures it only fires once
+}
+
+static void load_session_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable;
+    char *path = (char *)task_data;
+    int result = load_qjams_session(path);
+    g_task_return_int(task, result);
+}
+
+static void load_session_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GError *error = NULL;
+    int load_status = g_task_propagate_int(G_TASK(res), &error);
+    char *path = (char *)g_task_get_task_data(G_TASK(res));
+
+    gtk_spinner_stop(GTK_SPINNER(main_spinner));
+
+    if (load_status >= 0) {
+        ui_state.session_is_dirty = true;
+
+        // 1. Force Engine into Multitrack Mode FIRST to ensure cache builder reads correct flags
+        if (!atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+            atomic_store_explicit(&is_multitrack_mode, true, memory_order_release);
+
+            g_signal_handlers_block_by_func(btn_multitrack_mode, G_CALLBACK(on_multitrack_mode_toggled), NULL);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_multitrack_mode), TRUE);
+            g_signal_handlers_unblock_by_func(btn_multitrack_mode, G_CALLBACK(on_multitrack_mode_toggled), NULL);
+
+            extern GtkWidget *mode_stack;
+            gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "multitrack_page");
+        }
+
+        strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
+        ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
+        update_playlist_toggle_state();
+
+        // 2. Refresh UI elements
+        extern void refresh_multitrack_tracks_ui(void);
+        refresh_multitrack_tracks_ui();
+        extern void update_multitrack_status_ui(void);
+        update_multitrack_status_ui();
+
+        char *basename = g_path_get_basename(path);
+        char status[512];
+        if (load_status == 1) {
+            snprintf(status, sizeof(status), "Status: Session '%s' loaded (WARNING: Truncated File)", basename);
+        } else {
+            snprintf(status, sizeof(status), "Status: Session '%s' loaded", basename);
+        }
+        gtk_label_set_text(GTK_LABEL(lbl_status), status);
+
+        int active_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+        size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+        int total_secs = (active_rate > 0) ? (total_frames / active_rate) : 0;
+
+        char ui_text[600];
+        snprintf(ui_text, sizeof(ui_text), "Track: %s [%02d:%02d]", basename, total_secs / 60, total_secs % 60);
+        gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
+
+        extern void update_zoom_button_label_to_length(void);
+        update_zoom_button_label_to_length();
+        g_free(basename);
+
+        gtk_widget_set_sensitive(btn_play, TRUE);
+        gtk_widget_set_sensitive(btn_record, TRUE);
+
+        // 3. Defer the redraw to the GTK idle loop to guarantee all states have settled
+        g_idle_add(deferred_session_redraw, NULL);
+
+    } else {
+        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Failed to load session (Invalid file or RAM exceeded).");
+        gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
+    }
+
+    gtk_widget_set_sensitive(btn_load, TRUE);
+    gtk_widget_set_sensitive(btn_prev, TRUE);
+    gtk_widget_set_sensitive(btn_next, TRUE);
+    gtk_widget_set_sensitive(btn_playlist_toggle, TRUE);
+
+    if (btn_load_session) gtk_widget_set_sensitive(btn_load_session, TRUE);
+}
+
+void command_post_load_session(const char *path) {
+    on_stop_clicked(NULL, NULL);
+
+    // 1. SAFELY DISARM THE AUDIO ENGINE
+    // Drop the active frame count and track flags to 0 immediately.
+    // This stops the JACK real-time thread from reading the memory buffers
+    // while the background thread is busy freeing and reallocating them.
+    extern _Atomic size_t backing_track_frames;
+    atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
+
+    extern _Atomic bool track_has_audio[12];
+    for (int i = 0; i < 12; i++) {
+        atomic_store_explicit(&track_has_audio[i], false, memory_order_release);
+    }
+
+    gtk_spinner_start(GTK_SPINNER(main_spinner));
+    gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Extracting session to RAM...");
+    gtk_label_set_text(GTK_LABEL(lbl_track), "Track: Loading...");
+
+    gtk_widget_set_sensitive(btn_load, FALSE);
+    gtk_widget_set_sensitive(btn_prev, FALSE);
+    gtk_widget_set_sensitive(btn_next, FALSE);
+    gtk_widget_set_sensitive(btn_play, FALSE);
+    gtk_widget_set_sensitive(btn_record, FALSE);
+    gtk_widget_set_sensitive(btn_playlist_toggle, FALSE);
+
+    if (btn_load_session) gtk_widget_set_sensitive(btn_load_session, FALSE);
+
+    GTask *task = g_task_new(NULL, NULL, load_session_ready, NULL);
+    g_task_set_task_data(task, g_strdup(path), g_free);
+    g_task_run_in_thread(task, load_session_thread);
+    g_object_unref(task);
+}
+
 static void on_load_session_file_chosen(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     (void)user_data;
     GtkFileDialog *dialog = GTK_FILE_DIALOG(source_object);
@@ -366,43 +499,16 @@ static void on_load_session_file_chosen(GObject *source_object, GAsyncResult *re
     GFile *file = gtk_file_dialog_open_finish(dialog, res, &error);
     if (file) {
         char *path = g_file_get_path(file);
-        on_stop_clicked(NULL, NULL);
-        if (load_qjams_session(path) == 0) {
-            refresh_looper_layers_ui();
-            update_looper_status_ui();
-            invalidate_waveform_caches();
-            gtk_widget_queue_draw(waveform_area_bt);
-            gtk_widget_queue_draw(waveform_area_input);
-
-            char *basename = g_path_get_basename(path);
-            char status[512];
-            snprintf(status, sizeof(status), "Status: Session '%s' loaded", basename);
-            gtk_label_set_text(GTK_LABEL(lbl_status), status);
-
-            if (!atomic_load_explicit(&is_looper_mode, memory_order_acquire)) {
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_looper_mode), TRUE);
-            }
-
-            int active_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-            size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-            int total_secs = (active_rate > 0) ? (total_frames / active_rate) : 0;
-
-            char ui_text[600];
-            snprintf(ui_text, sizeof(ui_text), "Track: %s [%02d:%02d]", basename, total_secs / 60, total_secs % 60);
-            gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
-            update_zoom_button_label_to_length();
-            g_free(basename);
-        } else {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Failed to load session (Invalid file or RAM exceeded).");
-        }
-        g_free(path); g_object_unref(file);
+        command_post_load_session(path);
+        g_free(path);
+        g_object_unref(file);
     }
 }
 
 static void on_load_session_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "Load Looper Session");
+    gtk_file_dialog_set_title(dialog, "Load Multi-Track Session");
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_set_name(filter, "QJams Session (*.qjams)");
     gtk_file_filter_add_pattern(filter, "*.qjams");
@@ -419,24 +525,22 @@ static void on_load_session_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_dialog_open(dialog, GTK_WINDOW(user_data), NULL, on_load_session_file_chosen, NULL);
 }
 
-static void on_looper_mode_toggled(GtkToggleButton *button, gpointer user_data) {
+static void on_multitrack_mode_toggled(GtkToggleButton *button, gpointer user_data) {
     (void)user_data;
     bool active = gtk_toggle_button_get_active(button);
-    atomic_store_explicit(&is_looper_mode, active, memory_order_release);
-    ui_state.config.looper_mode_active = active ? 1 : 0;
+    atomic_store_explicit(&is_multitrack_mode, active, memory_order_release);
+    ui_state.config.multitrack_mode_active = active ? 1 : 0;
     save_qjams_config(ui_state.config_path, &ui_state.config);
 
-    // FIX: Adjust canvas FIRST so memory state is correct before UI queries it
     adjust_blank_canvas_for_mode(active);
 
     if (active) {
-        gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "looper_page");
-        update_looper_status_ui();
+        gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "multitrack_page");
+        update_multitrack_status_ui();
     } else {
         gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "video_page");
     }
 
-    // FIX: Disable Save Session button in Normal mode (not applicable)
     if (btn_save_session) gtk_widget_set_sensitive(btn_save_session, active);
 }
 
@@ -448,6 +552,8 @@ static void on_load_playlist_file_chosen(GObject *source_object, GAsyncResult *r
     if (file) {
         char *path = g_file_get_path(file);
         strncpy(ui_state.playlist_path, path, sizeof(ui_state.playlist_path) - 1);
+        strncpy(ui_state.config.last_playlist_path, path, sizeof(ui_state.config.last_playlist_path) - 1);
+        save_qjams_config(ui_state.config_path, &ui_state.config);
         load_playlist_from_file(path);
         g_free(path);
         g_object_unref(file);
@@ -466,10 +572,12 @@ static void on_load_playlist_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
     gtk_file_dialog_set_default_filter(dialog, filter);
 
-    if (strlen(ui_state.config.recordings_dir) > 0) {
-        GFile *initial = g_file_new_for_path(ui_state.config.recordings_dir);
+    char *dir = g_path_get_dirname(ui_state.playlist_path);
+    if (dir) {
+        GFile *initial = g_file_new_for_path(dir);
         gtk_file_dialog_set_initial_folder(dialog, initial);
         g_object_unref(initial);
+        g_free(dir);
     }
 
     gtk_file_dialog_open(dialog, GTK_WINDOW(user_data), NULL, on_load_playlist_file_chosen, NULL);
@@ -489,6 +597,8 @@ static void on_save_playlist_file_chosen(GObject *source_object, GAsyncResult *r
             path = tmp;
         }
         strncpy(ui_state.playlist_path, path, sizeof(ui_state.playlist_path) - 1);
+        strncpy(ui_state.config.last_playlist_path, path, sizeof(ui_state.config.last_playlist_path) - 1);
+        save_qjams_config(ui_state.config_path, &ui_state.config);
         save_current_playlist();
         gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Playlist Saved");
         g_free(path);
@@ -500,7 +610,11 @@ static void on_save_playlist_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "Save Playlist");
-    gtk_file_dialog_set_initial_name(dialog, "MySetlist.m3u");
+
+    char *basename = g_path_get_basename(ui_state.playlist_path);
+    gtk_file_dialog_set_initial_name(dialog, basename);
+    g_free(basename);
+
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_set_name(filter, "M3U Playlists (*.m3u)");
     gtk_file_filter_add_pattern(filter, "*.m3u");
@@ -509,51 +623,64 @@ static void on_save_playlist_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
     gtk_file_dialog_set_default_filter(dialog, filter);
 
-    if (strlen(ui_state.config.recordings_dir) > 0) {
-        GFile *initial = g_file_new_for_path(ui_state.config.recordings_dir);
+    char *dir = g_path_get_dirname(ui_state.playlist_path);
+    if (dir) {
+        GFile *initial = g_file_new_for_path(dir);
         gtk_file_dialog_set_initial_folder(dialog, initial);
         g_object_unref(initial);
+        g_free(dir);
     }
 
     gtk_file_dialog_save(dialog, GTK_WINDOW(user_data), NULL, on_save_playlist_file_chosen, NULL);
     g_object_unref(filter); g_object_unref(filters);
 }
 
-void ui_command_post_init(GtkBuilder *builder, GtkWindow *window) {
-    btn_load = GTK_WIDGET(gtk_builder_get_object(builder, "btn_load"));
+void ui_command_post_init(GtkBuilder *b_cmd, GtkBuilder *b_stack, GtkWindow *window) {
+    btn_load = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_load"));
     g_signal_connect(btn_load, "clicked", G_CALLBACK(on_select_track_clicked), window);
 
-    GtkWidget *btn_load_session = GTK_WIDGET(gtk_builder_get_object(builder, "btn_load_session"));
+    btn_load_session = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_load_session"));
     g_signal_connect(btn_load_session, "clicked", G_CALLBACK(on_load_session_clicked), window);
 
-    // NEW: Map the Playlist buttons
-    GtkWidget *btn_load_playlist = GTK_WIDGET(gtk_builder_get_object(builder, "btn_load_playlist"));
+    GtkWidget *btn_load_playlist = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_load_playlist"));
     g_signal_connect(btn_load_playlist, "clicked", G_CALLBACK(on_load_playlist_clicked), window);
 
-    GtkWidget *btn_save_playlist = GTK_WIDGET(gtk_builder_get_object(builder, "btn_save_playlist"));
+    GtkWidget *btn_save_playlist = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_save_playlist"));
     g_signal_connect(btn_save_playlist, "clicked", G_CALLBACK(on_save_playlist_clicked), window);
 
-    btn_save_mux = GTK_WIDGET(gtk_builder_get_object(builder, "btn_save_mux"));
+    btn_save_mux = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_save_mux"));
     g_signal_connect(btn_save_mux, "clicked", G_CALLBACK(on_save_mux_clicked), NULL);
 
-    btn_save_session = GTK_WIDGET(gtk_builder_get_object(builder, "btn_save_session"));
+    btn_save_session = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_save_session"));
     g_signal_connect(btn_save_session, "clicked", G_CALLBACK(on_save_session_clicked), window);
 
-    btn_settings = GTK_WIDGET(gtk_builder_get_object(builder, "btn_settings"));
+    btn_settings = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_settings"));
     g_signal_connect(btn_settings, "clicked", G_CALLBACK(on_settings_clicked), window);
 
-    // Map the mode_stack globally before evaluating the toggle state so the page flip succeeds on boot
-    mode_stack = GTK_WIDGET(gtk_builder_get_object(builder, "mode_stack"));
+    mode_stack = GTK_WIDGET(gtk_builder_get_object(b_stack, "mode_stack"));
 
-    btn_looper_mode = GTK_WIDGET(gtk_builder_get_object(builder, "btn_looper_mode"));
-    g_signal_connect(btn_looper_mode, "toggled", G_CALLBACK(on_looper_mode_toggled), NULL);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_looper_mode), ui_state.config.looper_mode_active != 0);
+    btn_multitrack_mode = GTK_WIDGET(gtk_builder_get_object(b_cmd, "btn_multitrack_mode"));
+    g_signal_connect(btn_multitrack_mode, "toggled", G_CALLBACK(on_multitrack_mode_toggled), NULL);
 
-    lbl_status = GTK_WIDGET(gtk_builder_get_object(builder, "lbl_status"));
-    main_spinner = GTK_WIDGET(gtk_builder_get_object(builder, "main_spinner")); // Map the spinner
-    lbl_roadmap = GTK_WIDGET(gtk_builder_get_object(builder, "lbl_roadmap"));
+    g_signal_handlers_block_by_func(btn_multitrack_mode, G_CALLBACK(on_multitrack_mode_toggled), NULL);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_multitrack_mode), ui_state.config.multitrack_mode_active != 0);
+    g_signal_handlers_unblock_by_func(btn_multitrack_mode, G_CALLBACK(on_multitrack_mode_toggled), NULL);
+
+    atomic_store_explicit(&is_multitrack_mode, ui_state.config.multitrack_mode_active != 0, memory_order_release);
+
+    if (ui_state.config.multitrack_mode_active != 0) {
+        gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "multitrack_page");
+    } else {
+        gtk_stack_set_visible_child_name(GTK_STACK(mode_stack), "video_page");
+    }
+
+    lbl_status = GTK_WIDGET(gtk_builder_get_object(b_cmd, "lbl_status"));
+    main_spinner = GTK_WIDGET(gtk_builder_get_object(b_cmd, "main_spinner"));
+    lbl_roadmap = GTK_WIDGET(gtk_builder_get_object(b_cmd, "lbl_roadmap"));
     if (lbl_roadmap) {
         gtk_label_set_markup(GTK_LABEL(lbl_roadmap),
-                             "<span size='small' foreground='#888888'>QJams is (c) 2026 Rob Wijhenke.\nThis beta version is intended for testing purposes only.</span>");
+                             "<span size='small' foreground='#888888'>QJams is (c) 2026 Rob Wijhenke. All rights reserved.\n"
+                             "This beta version is intended for testing purposes only.\n\n"
+                             "Visit <a href='https://sites.google.com/view/qjams'>https://sites.google.com/view/qjams</a></span>");
     }
 }
