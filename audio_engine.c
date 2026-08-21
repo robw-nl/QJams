@@ -890,21 +890,27 @@ static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, in
         if (pages < 0 || page_size < 0) return true;
         available_ram = (size_t)pages * (size_t)page_size;
     }
-
-    // Add back the memory currently held by the engine, as it will be freed/recycled
+    // Add back the memory currently held by the 12 active and 12 undo arrays
+    // as it will be freed and recycled by the new track allocation
     size_t currently_held_bytes = 0;
-    if (pristine_frames > 0) {
-        currently_held_bytes += pristine_frames * 2 * sizeof(float);
-        for (int i = 0; i < MAX_TRACKS; i++) {
-            if (multitrack_tracks[i]) currently_held_bytes += pristine_frames * 2 * sizeof(float);
-        }
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (multitrack_tracks[i]) currently_held_bytes += pristine_frames * 2 * sizeof(float);
+        if (undo_tracks[i]) currently_held_bytes += pristine_frames * 2 * sizeof(float);
     }
     available_ram += currently_held_bytes;
 
-    // Reject if the track demands more than 50% of the currently free system memory
-    if (total_required_bytes > (available_ram / 2)) {
-        printf("Error: Track requires %zu MB, but only %zu MB is safely available.\n",
-               total_required_bytes / (1024 * 1024), available_ram / (1024 * 1024));
+    // 1. Calculate an absolute maximum RAM cap (e.g., 40 GB) to prevent FFmpeg decode hangs
+    size_t absolute_cap_bytes = 40ULL * 1024 * 1024 * 1024; // 40 GB
+
+    // 2. Allow up to 85% of currently available physical RAM (raised from 50%)
+    size_t dynamic_cap_bytes = (available_ram * 85) / 100;
+
+    size_t final_cap = (dynamic_cap_bytes < absolute_cap_bytes) ? dynamic_cap_bytes : absolute_cap_bytes;
+
+    // Reject if the track demands more than the allowed threshold
+    if (total_required_bytes > final_cap) {
+        printf("Error: Track requires %zu MB, but max allowed is %zu MB.\n",
+               total_required_bytes / (1024 * 1024), final_cap / (1024 * 1024));
         return false;
     }
 

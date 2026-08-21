@@ -466,14 +466,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     init_preview_queue(&preview_queue, 32);
 
-    // 1. Load the 7 isolated UI Builders natively from the ui/ directory
-    GtkBuilder *b_main  = gtk_builder_new_from_file("ui/main_window.ui");
-    GtkBuilder *b_stack = gtk_builder_new_from_file("ui/mode_stack.ui");
-    GtkBuilder *b_multi = gtk_builder_new_from_file("ui/multitrack.ui");
-    GtkBuilder *b_play  = gtk_builder_new_from_file("ui/playlist.ui");
-    GtkBuilder *b_cmd   = gtk_builder_new_from_file("ui/command_post.ui");
-    GtkBuilder *b_dash  = gtk_builder_new_from_file("ui/dashboard.ui");
-    GtkBuilder *b_wave  = gtk_builder_new_from_file("ui/waveforms.ui");
+    // 1. Load the 7 isolated UI Builders natively from the compiled GResource
+    GtkBuilder *b_main  = gtk_builder_new_from_resource("/com/rob/qjams/ui/main_window.ui");
+    GtkBuilder *b_stack = gtk_builder_new_from_resource("/com/rob/qjams/ui/mode_stack.ui");
+    GtkBuilder *b_multi = gtk_builder_new_from_resource("/com/rob/qjams/ui/multitrack.ui");
+    GtkBuilder *b_play  = gtk_builder_new_from_resource("/com/rob/qjams/ui/playlist.ui");
+    GtkBuilder *b_cmd   = gtk_builder_new_from_resource("/com/rob/qjams/ui/command_post.ui");
+    GtkBuilder *b_dash  = gtk_builder_new_from_resource("/com/rob/qjams/ui/dashboard.ui");
+    GtkBuilder *b_wave  = gtk_builder_new_from_resource("/com/rob/qjams/ui/waveforms.ui");
 
     GtkWindow *window = GTK_WINDOW(gtk_builder_get_object(b_main, "main_window"));
     gtk_window_set_application(window, app);
@@ -601,17 +601,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
         if (expected_is_offline && using_fallback && audio_status == 0) {
             snprintf(toast_msg, sizeof(toast_msg),
-                     "<span foreground='#ff6b6b' weight='bold'>Device %s not detected.</span>\n"
-                     "<span foreground='#51cf66' weight='bold'>Successfully connected device %s</span>",
+                     "<span foreground='#d32f2f' weight='semibold'>Device %s not detected.</span>\n"
+                     "<span foreground='#2e7d32' weight='semibold'>Successfully connected device %s</span>",
                      expected_audio, ui_state.config.audio_device);
         } else if (expected_is_offline || audio_status == 2) {
-            snprintf(toast_msg, sizeof(toast_msg), "<span foreground='#ff6b6b' weight='bold'>Device %s not detected.</span>", expected_audio);
+            snprintf(toast_msg, sizeof(toast_msg), "<span foreground='#d32f2f' weight='semibold'>Device %s not detected.</span>", expected_audio);
         }
 
         if (video_status != 0) {
             if (strlen(toast_msg) > 0) strcat(toast_msg, "\n");
             char v_msg[256];
-            snprintf(v_msg, sizeof(v_msg), "<span foreground='#ff6b6b' weight='bold'>Camera %s not detected.</span>", ui_state.config.video_device);
+            snprintf(v_msg, sizeof(v_msg), "<span foreground='#d32f2f' weight='semibold'>Camera %s not detected.</span>", ui_state.config.video_device);
             strcat(toast_msg, v_msg);
         }
 

@@ -54,7 +54,7 @@ void show_hw_toast(const char *msg) {
     gtk_label_set_markup(GTK_LABEL(lbl_hw_toast), msg);
     gtk_widget_set_visible(lbl_hw_toast, TRUE);
     if (hw_toast_timer_id != 0) g_source_remove(hw_toast_timer_id);
-    hw_toast_timer_id = g_timeout_add(5000, hide_hw_toast, NULL);
+    hw_toast_timer_id = g_timeout_add(50000, hide_hw_toast, NULL);
 }
 
 static gboolean apply_port_update_deferred(gpointer user_data) {
@@ -112,7 +112,7 @@ void update_dashboard_cycler_ui(void) {
             }
             if (!found) {
                 char msg[512];
-                snprintf(msg, sizeof(msg), "<span foreground='#ff6b6b' weight='bold'>%s Detached</span>", last_seen_devs[i].display_name);
+                snprintf(msg, sizeof(msg), "<span foreground='#d32f2f' weight='semibold'>%s Detached</span>", last_seen_devs[i].display_name);
                 show_hw_toast(msg);
             }
         }
@@ -125,7 +125,7 @@ void update_dashboard_cycler_ui(void) {
             }
             if (!found) {
                 char msg[512];
-                snprintf(msg, sizeof(msg), "<span foreground='#51cf66' weight='bold'>%s Attached</span>", active_devs[i].display_name);
+                snprintf(msg, sizeof(msg), "<span foreground='#2e7d32' weight='semibold'>%s Attached</span>", active_devs[i].display_name);
                 show_hw_toast(msg);
             }
         }
