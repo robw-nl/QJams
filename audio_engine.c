@@ -1071,6 +1071,7 @@ int import_to_layer(const char* filepath, int track_idx) {
     }
 
     atomic_store_explicit(&track_has_audio[track_idx], true, memory_order_release);
+    atomic_store_explicit(&track_is_soloed[track_idx], true, memory_order_release);
 
     resume_rt_thread();
 
@@ -1227,6 +1228,7 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
         undo_tracks[i] = new_undo_tracks[i];
     }
 
+    // FILE: audio_engine.c
     rt_rb_state = new_rb_state;
     pristine_read_pos = 0;
     atomic_store_explicit(&playback_pos, 0, memory_order_release);
@@ -1240,7 +1242,11 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     atomic_store_explicit(&current_recording_track, 1, memory_order_release);
 
     atomic_store_explicit(&track_has_audio[0], true, memory_order_release);
-    if (src_out2) atomic_store_explicit(&track_has_audio[1], true, memory_order_release);
+    atomic_store_explicit(&track_is_soloed[0], true, memory_order_release);
+    if (src_out2) {
+        atomic_store_explicit(&track_has_audio[1], true, memory_order_release);
+        atomic_store_explicit(&track_is_soloed[1], true, memory_order_release);
+    }
 
     resume_rt_thread();
 
@@ -1316,6 +1322,7 @@ int init_exact_loop_canvas(size_t exact_frames) {
     for (int i = 0; i < MAX_TRACKS; i++) {
         atomic_store_explicit(&track_has_audio[i], false, memory_order_release);
         atomic_store_explicit(&track_has_undo[i], false, memory_order_release);
+        atomic_store_explicit(&track_is_soloed[i], false, memory_order_release);
     }
 
     atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
@@ -1706,6 +1713,7 @@ int clear_or_restore_track(int track_idx) {
         }
 
         atomic_store_explicit(&track_has_audio[track_idx], false, memory_order_release);
+        atomic_store_explicit(&track_is_soloed[track_idx], false, memory_order_release);
         action_status = 0;
     } else {
         float *tmp = multitrack_tracks[track_idx];
@@ -1713,6 +1721,7 @@ int clear_or_restore_track(int track_idx) {
         undo_tracks[track_idx] = tmp;
 
         atomic_store_explicit(&track_has_audio[track_idx], true, memory_order_release);
+        atomic_store_explicit(&track_is_soloed[track_idx], true, memory_order_release);
         action_status = 1;
     }
 

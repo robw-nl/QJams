@@ -15,6 +15,5 @@ void on_start_clicked(GtkButton *button, gpointer user_data);
 void on_global_reset_clicked(GtkButton *button, gpointer user_data);
 
 void update_dashboard_cycler_ui(void);
-void show_hw_toast(const char *msg);
 
 #endif // UI_DASHBOARD_H

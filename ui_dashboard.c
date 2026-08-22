@@ -6,6 +6,7 @@
 #include "ui_multitrack.h"
 #include "encoder.h"
 #include "scanner.h"
+#include "video_engine.h"
 #include <math.h>
 #include <string.h>
 #include <time.h>
@@ -33,29 +34,6 @@ static float pending_speed = 1.0f;
 static guint port_update_debounce_id = 0;
 
 static GtkWidget *lbl_hw_toast = NULL;
-static guint hw_toast_timer_id = 0;
-static AudioDevice last_seen_devs[MAX_AUDIO_DEVICES];
-static int last_seen_count = -1;
-
-/**
- * @brief Hides the hardware notification toast after the timeout expires.
- */
-static gboolean hide_hw_toast(gpointer data) {
-    (void)data;
-    if (lbl_hw_toast) {
-        gtk_widget_set_visible(lbl_hw_toast, FALSE);
-    }
-    hw_toast_timer_id = 0;
-    return G_SOURCE_REMOVE;
-}
-
-void show_hw_toast(const char *msg) {
-    if (!lbl_hw_toast) return;
-    gtk_label_set_markup(GTK_LABEL(lbl_hw_toast), msg);
-    gtk_widget_set_visible(lbl_hw_toast, TRUE);
-    if (hw_toast_timer_id != 0) g_source_remove(hw_toast_timer_id);
-    hw_toast_timer_id = g_timeout_add(50000, hide_hw_toast, NULL);
-}
 
 static gboolean apply_port_update_deferred(gpointer user_data) {
     (void)user_data;
@@ -85,6 +63,61 @@ static bool cycler_is_updating = false;
 
 static void on_input_gain_changed(GtkSpinButton *spin_button, gpointer user_data); // Forward declaration
 
+/**
+ * @brief Refreshes the hardware connection status label.
+ * Strictly shows only offline Primary and Fallback devices. Disappears when fully connected.
+ */
+static void update_hardware_status_label(void) {
+    AudioDevice active_devs[MAX_AUDIO_DEVICES];
+    int online_count = scan_audio_devices(client, active_devs, MAX_AUDIO_DEVICES);
+
+    char toast_msg[1024] = "";
+    const char *primary_dev = NULL;
+    const char *fallback_dev = NULL;
+
+    for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
+        if (ui_state.config.audio_profiles[i].is_primary) {
+            primary_dev = ui_state.config.audio_profiles[i].device_name;
+        }
+        if (ui_state.config.audio_profiles[i].is_fallback) {
+            fallback_dev = ui_state.config.audio_profiles[i].device_name;
+        }
+    }
+
+    const char *devices_to_check[2] = {primary_dev, fallback_dev};
+
+    for (int i = 0; i < 2; i++) {
+        const char *dev_name = devices_to_check[i];
+        if (!dev_name || strlen(dev_name) == 0) continue;
+
+        // Prevent duplicate checks if primary == fallback
+        if (i == 1 && primary_dev && strcmp(dev_name, primary_dev) == 0) continue;
+
+        int is_online = 0;
+        for (int j = 0; j < online_count; j++) {
+            if (strcmp(dev_name, active_devs[j].display_name) == 0) {
+                is_online = 1;
+                break;
+            }
+        }
+
+        if (!is_online) {
+            char line[256];
+            snprintf(line, sizeof(line), "%s: not detected\n", dev_name);
+            strncat(toast_msg, line, sizeof(toast_msg) - strlen(toast_msg) - 1);
+        }
+    }
+
+    size_t len = strlen(toast_msg);
+    if (len > 0) {
+        if (toast_msg[len - 1] == '\n') toast_msg[len - 1] = '\0';
+        gtk_label_set_text(GTK_LABEL(lbl_hw_toast), toast_msg);
+        gtk_widget_set_visible(lbl_hw_toast, TRUE);
+    } else {
+        gtk_widget_set_visible(lbl_hw_toast, FALSE);
+    }
+}
+
 void update_dashboard_cycler_ui(void) {
     if (!input_cycler_drop) return;
     cycler_is_updating = true;
@@ -101,40 +134,7 @@ void update_dashboard_cycler_ui(void) {
     AudioDevice active_devs[MAX_AUDIO_DEVICES];
     int online_count = scan_audio_devices(client, active_devs, MAX_AUDIO_DEVICES);
 
-    // Hardware Differential Check for Toast Notifications
-    if (last_seen_count != -1) {
-        for (int i = 0; i < last_seen_count; i++) {
-            int found = 0;
-            for (int j = 0; j < online_count; j++) {
-                if (strcmp(last_seen_devs[i].display_name, active_devs[j].display_name) == 0) {
-                    found = 1; break;
-                }
-            }
-            if (!found) {
-                char msg[512];
-                snprintf(msg, sizeof(msg), "<span foreground='#d32f2f' weight='semibold'>%s Detached</span>", last_seen_devs[i].display_name);
-                show_hw_toast(msg);
-            }
-        }
-        for (int i = 0; i < online_count; i++) {
-            int found = 0;
-            for (int j = 0; j < last_seen_count; j++) {
-                if (strcmp(active_devs[i].display_name, last_seen_devs[j].display_name) == 0) {
-                    found = 1; break;
-                }
-            }
-            if (!found) {
-                char msg[512];
-                snprintf(msg, sizeof(msg), "<span foreground='#2e7d32' weight='semibold'>%s Attached</span>", active_devs[i].display_name);
-                show_hw_toast(msg);
-            }
-        }
-    }
-
-    last_seen_count = online_count;
-    for (int i = 0; i < online_count; i++) {
-        last_seen_devs[i] = active_devs[i];
-    }
+    update_hardware_status_label();
 
     for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
         if (ui_state.config.audio_profiles[i].in_cycler) {
@@ -181,7 +181,6 @@ static void on_cycler_selection_changed(GObject *gobject, GParamSpec *pspec, gpo
     if (!new_device) return;
 
     // 1. Hot-Patch the audio engine instantly
-    extern int patch_audio_ports(const char*);
     patch_audio_ports(new_device);
 
     strncpy(ui_state.config.audio_device, new_device, sizeof(ui_state.config.audio_device) - 1);
@@ -201,7 +200,6 @@ static void on_cycler_selection_changed(GObject *gobject, GParamSpec *pspec, gpo
     }
 
     ui_state.config.input_gain_multiplier = target_multiplier;
-    extern void set_input_gain(float);
     set_input_gain(target_multiplier);
 
     float loaded_db = (target_multiplier <= 0.001f) ? -24.0f : 20.0f * log10f(target_multiplier);
@@ -211,8 +209,9 @@ static void on_cycler_selection_changed(GObject *gobject, GParamSpec *pspec, gpo
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(input_gain_spinner), loaded_db);
     g_signal_handlers_unblock_by_func(input_gain_spinner, G_CALLBACK(on_input_gain_changed), NULL);
 
-    extern void save_qjams_config(const char*, const QJamsConfig*);
     save_qjams_config(ui_state.config_path, &ui_state.config);
+
+    update_hardware_status_label();
 }
 
 void update_zoom_button_label_to_length(void) {
@@ -365,8 +364,13 @@ static void* mkv_video_loop(void *arg) {
         size_t pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
         double current_audio_time = (double)pos / current_rate;
 
-        // FIX: Synchronize the original MKV video time with the Stretched audio playback time
+        // Synchronize the original MKV video time with the Stretched audio playback time
         if (fabs(current_audio_time - last_audio_time) > 0.25 && last_audio_time >= 0.0) {
+
+            // SHOWSTOPPER 4 FIX: Drain the preview queue instantly to prevent stale frame tearing during scrub delay
+            PreviewPayload stale_payload;
+            while (pop_preview_frame(&preview_queue, &stale_payload)) {}
+
             float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
             double target_mkv_time = current_audio_time * (current_speed > 0.0f ? current_speed : 1.0f);
             av_seek_frame(fmt_ctx, v_idx, (int64_t)(target_mkv_time / av_q2d(time_base)), AVSEEK_FLAG_BACKWARD);
@@ -444,8 +448,13 @@ static void* mkv_video_loop(void *arg) {
                 float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
                 double new_audio_time = rate > 0 ? ((double)pos / rate) : 0.0;
 
-                // FIX: Map standby loop seek target to original MKV video time
+                // Map standby loop seek target to original MKV video time
                 if (new_audio_time < last_standby_time - 0.5) {
+
+                    // SHOWSTOPPER 4 FIX: Drain the preview queue on loop resets
+                    PreviewPayload stale_payload;
+                    while (pop_preview_frame(&preview_queue, &stale_payload)) {}
+
                     double target_mkv_time = new_audio_time * (current_speed > 0.0f ? current_speed : 1.0f);
                     int v_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
                     av_seek_frame(fmt_ctx, v_idx, (int64_t)(target_mkv_time / av_q2d(time_base)), AVSEEK_FLAG_BACKWARD);
@@ -671,6 +680,11 @@ static void start_recording_execution(void) {
         g_free(tmp);
     }
 
+    // NEW: Delete the previous take's raw video file from disk before creating a new one
+    if (strlen(current_raw_path) > 0) {
+        remove(current_raw_path);
+    }
+
     snprintf(final_save_path, sizeof(final_save_path), "%s/%04d%02d%02d-%02d%02d%02d-%s-RAW.mkv",
              ui_state.config.recordings_dir, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec, base_name);
@@ -678,7 +692,6 @@ static void start_recording_execution(void) {
     snprintf(current_raw_path, sizeof(current_raw_path), "/tmp/qjams_raw_%04d%02d%02d_%02d%02d%02d.mkv",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec);
-
     int current_samplerate = client ? jack_get_sample_rate(client) : 48000;
 
     // ALWAYS backup the undo buffer for the active layer, even if Video Mode is rendering a performance
@@ -692,8 +705,6 @@ static void start_recording_execution(void) {
 
     // Start the Video encoder if we are in Video Mode
     if (!atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-        extern int capture_width;
-        extern int capture_height;
         if (init_and_start_encoder(current_raw_path, capture_width, capture_height, current_samplerate, &video_queue) != 0) {
             gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Encoder Failed");
             return;
@@ -817,26 +828,19 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
     bool was_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
 
     if (countdown_timer_id != 0) {
-        // Destroying the window automatically triggers on_countdown_destroyed to clean up the timer
-        if (countdown_window) {
-            gtk_window_destroy(GTK_WINDOW(countdown_window));
-        }
-
+        if (countdown_window) gtk_window_destroy(GTK_WINDOW(countdown_window));
         gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording Aborted");
         gtk_widget_set_sensitive(btn_record, TRUE);
         gtk_widget_set_sensitive(btn_play, TRUE);
         gtk_widget_set_sensitive(btn_stop, FALSE);
-
         atomic_store_explicit(&engine_is_playing, false, memory_order_release);
         atomic_store_explicit(&engine_is_recording, false, memory_order_release);
         return;
     }
 
-    extern void clear_loop_points(void);
     clear_loop_points();
 
     // --- GLOBAL DSP BARRIER ---
-    // Hoisted to the top to protect the entire stop/crop/sync sequence (Sol Finding #3 & #4)
     bool detached = await_rt_thread_detach();
 
     atomic_store_explicit(&engine_is_playing, false, memory_order_release);
@@ -844,93 +848,85 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
     atomic_store_explicit(&engine_is_armed, false, memory_order_release);
     atomic_store_explicit(&engine_is_paused, false, memory_order_release);
 
-    // --- STRICT CANVAS CROP LOGIC ---
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
 
-    // Prevent memory overrun if the RT thread overshoots the hard allocation wall
     if (pristine_frames > 0 && current_pos > pristine_frames) {
         current_pos = pristine_frames;
         atomic_store_explicit(&playback_pos, current_pos, memory_order_release);
     }
 
-    if (was_recording && current_pos > 0) {
-        bool is_looper = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
-        bool is_blank_canvas = (strlen(ui_state.selected_track_path) == 0);
-        int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-        int active_tracks = atomic_load_explicit(&active_track_count, memory_order_acquire);
+    // SHOWSTOPPER 2 FIX: Only manipulate memory arrays if the RT thread safely detached
+    if (detached) {
+        if (was_recording && current_pos > 0) {
+            bool is_looper = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+            bool is_blank_canvas = (strlen(ui_state.selected_track_path) == 0);
+            int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+            int active_tracks = atomic_load_explicit(&active_track_count, memory_order_acquire);
 
-        extern _Atomic bool track_has_audio[MAX_TRACKS];
-        atomic_store_explicit(&track_has_audio[current_rec], true, memory_order_release);
+            atomic_store_explicit(&track_has_audio[current_rec], true, memory_order_release);
+            atomic_store_explicit(&track_is_soloed[current_rec], true, memory_order_release);
 
-        // Unify crop logic: We ONLY crop if we are laying down the foundational base layer (Layer 0)
-        // of a purely blank canvas. Video Mode overdubs on Layer 4 should never truncate the canvas.
-        if (current_rec == 0 && active_tracks <= 1 && is_blank_canvas) {
-            atomic_store_explicit(&backing_track_frames, current_pos, memory_order_release);
-            pristine_frames = current_pos;
+            if (current_rec == 0 && active_tracks <= 1 && is_blank_canvas) {
+                atomic_store_explicit(&backing_track_frames, current_pos, memory_order_release);
+                pristine_frames = current_pos;
 
-            char ui_text[128];
-            int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-            int total_secs = (current_rate > 0) ? (current_pos / current_rate) : 0;
+                char ui_text[128];
+                int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+                int total_secs = (current_rate > 0) ? (current_pos / current_rate) : 0;
 
-            if (is_looper) {
-                snprintf(ui_text, sizeof(ui_text), "Track: Custom Loop [%02d:%02d]", total_secs / 60, total_secs % 60);
-                seek_backing_track(0.0);
-            } else {
-                snprintf(ui_text, sizeof(ui_text), "Track: Freestyle Take [%02d:%02d]", total_secs / 60, total_secs % 60);
+                if (is_looper) {
+                    snprintf(ui_text, sizeof(ui_text), "Track: Custom Loop [%02d:%02d]", total_secs / 60, total_secs % 60);
+                    seek_backing_track(0.0);
+                } else {
+                    snprintf(ui_text, sizeof(ui_text), "Track: Freestyle Take [%02d:%02d]", total_secs / 60, total_secs % 60);
+                }
+                gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
             }
-            gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
-        }
 
-        // ALWAYS sync the background time-stretcher engine when Track 1 is modified
-        if (current_rec == 0 && pristine_bt_buf && multitrack_tracks[0]) {
-            memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        }
-
-        // Advance track states uniformly for all overdubs, regardless of Video/Multitrack mode
-        int next_rec = current_rec + 1;
-        if (next_rec < MAX_TRACKS) {
-            atomic_store_explicit(&current_recording_track, next_rec, memory_order_release);
-            int new_active = atomic_load_explicit(&active_track_count, memory_order_acquire);
-            if (next_rec >= new_active) {
-                atomic_store_explicit(&active_track_count, next_rec + 1, memory_order_release);
+            if (current_rec == 0 && pristine_bt_buf && multitrack_tracks[0]) {
+                memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
             }
-        }
 
-        // --- NEW: FADE OUT TAIL TO PREVENT POPS ---
-        size_t fade_len = (current_pos < 256) ? current_pos : 256;
-        if (fade_len > 0) {
-            int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-            for (size_t f = 0; f < fade_len; f++) {
-                float multiplier = (float)(fade_len - 1 - f) / (float)(fade_len - 1);
-                size_t idx = current_pos - fade_len + f;
-
-                // FILE: ui_dashboard.c
-                // Apply fade out to multitrack buffer EVEN in Video Mode
-                if (rec_track >= 0 && rec_track < MAX_TRACKS && multitrack_tracks[rec_track]) {
-                    multitrack_tracks[rec_track][idx * 2] *= multiplier;
-                    multitrack_tracks[rec_track][idx * 2 + 1] *= multiplier;
+            int next_rec = current_rec + 1;
+            if (next_rec < MAX_TRACKS) {
+                atomic_store_explicit(&current_recording_track, next_rec, memory_order_release);
+                int new_active = atomic_load_explicit(&active_track_count, memory_order_acquire);
+                if (next_rec >= new_active) {
+                    atomic_store_explicit(&active_track_count, next_rec + 1, memory_order_release);
                 }
             }
+
+            size_t fade_len = (current_pos < 256) ? current_pos : 256;
+            if (fade_len > 0) {
+                int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+                for (size_t f = 0; f < fade_len; f++) {
+                    float multiplier = (float)(fade_len - 1 - f) / (float)(fade_len - 1);
+                    size_t idx = current_pos - fade_len + f;
+
+                    if (rec_track >= 0 && rec_track < MAX_TRACKS && multitrack_tracks[rec_track]) {
+                        multitrack_tracks[rec_track][idx * 2] *= multiplier;
+                        multitrack_tracks[rec_track][idx * 2 + 1] *= multiplier;
+                    }
+                }
+            }
+
+            update_zoom_button_label_to_length();
+            invalidate_waveform_caches();
         }
-
-        // Force the zoom boundaries to scale perfectly to the newly cropped track length
-        update_zoom_button_label_to_length();
-        invalidate_waveform_caches();
+        resume_rt_thread();
+    } else {
+        printf("CRITICAL: Skipped canvas crop and memory operations due to RT Detach Timeout.\n");
     }
-
-    // Release the barrier we acquired at the top of the function
-    if (detached) resume_rt_thread();
 
     if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
         update_multitrack_status_ui();
         invalidate_waveform_caches();
-        gtk_widget_queue_draw(waveform_area_bt);
-        gtk_widget_queue_draw(waveform_area_input);
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
     }
 
     stop_encoder();
 
-    // Restore live camera or original MKV backing track when ending playback of a recorded take
     if (ui_state.session_is_dirty && !atomic_load_explicit(&is_multitrack_mode, memory_order_acquire) && !was_recording) {
         if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
             atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
@@ -1163,13 +1159,10 @@ static void on_master_cut_pressed(GtkGestureClick *gesture, int n_press, double 
     bool has_shift = (state & GDK_SHIFT_MASK) != 0;
 
     if (has_shift) {
-        extern void master_blend_fade(void);
         master_blend_fade();
     } else if (has_ctrl) {
-        extern void master_smart_fade(void);
         master_smart_fade();
     } else {
-        extern void master_cut_selection(void);
         master_cut_selection();
     }
 
@@ -1177,13 +1170,9 @@ static void on_master_cut_pressed(GtkGestureClick *gesture, int n_press, double 
 
     // Refresh GUI states to account for newly reverted/blank tracks
     if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-        extern void refresh_multitrack_tracks_ui(void);
         refresh_multitrack_tracks_ui();
     }
 
-    extern GtkWidget *waveform_area_bt;
-    extern GtkWidget *waveform_area_input;
-    extern void invalidate_waveform_caches(void);
     invalidate_waveform_caches();
     if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
     if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
@@ -1192,20 +1181,15 @@ static void on_master_cut_pressed(GtkGestureClick *gesture, int n_press, double 
 static void on_master_undo_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
     (void)n_press; (void)x; (void)y; (void)user_data;
 
-    extern void master_undo_edits(void);
     master_undo_edits();
 
     gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
     // Refresh GUI states to account for restored tracks
     if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-        extern void refresh_multitrack_tracks_ui(void);
         refresh_multitrack_tracks_ui();
     }
 
-    extern GtkWidget *waveform_area_bt;
-    extern GtkWidget *waveform_area_input;
-    extern void invalidate_waveform_caches(void);
     invalidate_waveform_caches();
     if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
     if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
@@ -1294,6 +1278,9 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
     }
 
     lbl_hw_toast = GTK_WIDGET(gtk_builder_get_object(b_dash, "lbl_hw_toast"));
+    if (lbl_hw_toast) {
+        gtk_widget_set_valign(lbl_hw_toast, GTK_ALIGN_START);
+    }
 
     // Waveform mapping routes exclusively through b_wave
     waveform_area_bt = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveform_area_bt"));

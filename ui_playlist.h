@@ -65,6 +65,5 @@ bool cycle_playlist_track(int direction);
 void remove_active_track_from_playlist(const char *path);
 
 void activate_playlist_preset(int slot);
-void assign_playlist_preset(int slot); // ADD THIS
 
 #endif // UI_PLAYLIST_H

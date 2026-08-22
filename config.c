@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <glib.h>
 #include "config.h"
 
 /**
@@ -10,25 +11,30 @@
  * @return A populated QJamsConfig structure.
  */
 QJamsConfig load_qjams_config(const char* filepath) {
+    const char *home_dir = g_get_home_dir(); // Dynamically fetch /home/username
+
     QJamsConfig config = {
         .input_gain_multiplier = 1.0f,
         .bt_gain_multiplier = 1.0f,
         .playback_target = "system:playback",
-        .last_track_dir = "/home",
-        .recordings_dir = "/home",
+        .last_track_dir = "", // Initialized dynamically below
+        .recordings_dir = "", // Initialized dynamically below
         .last_playlist_path = "",
         .window_width = 1400,
         .window_height = 1024,
         .video_device = "/dev/video0",
-        .audio_device = "", // Blank fallback allows scanner to auto-select first available hardware
+        .audio_device = "",
         .multitrack_blank_canvas = 0,
         .multitrack_mode_active = 0,
         .freestyle_duration_min = 15,
         .multitrack_duration_min = 5,
         .export_format = 0,
-        .playlist_slots = {"", "", "", "", "", "", "", "", "", ""}, // 10 Slots
+        .playlist_slots = {"", "", "", "", "", "", "", "", "", ""},
         .num_audio_profiles = 0
     };
+
+    strncpy(config.last_track_dir, home_dir, sizeof(config.last_track_dir) - 1);
+    strncpy(config.recordings_dir, home_dir, sizeof(config.recordings_dir) - 1);
 
     FILE *file = fopen(filepath, "r");
     if (!file) return config;

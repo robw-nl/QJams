@@ -23,8 +23,6 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
  * @return void
  */
 
-void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
-
 gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data);
 
 void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);

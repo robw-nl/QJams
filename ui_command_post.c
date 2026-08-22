@@ -11,6 +11,7 @@
 #include <string.h>
 
 GPid active_muxer_pid = 0;
+static char temp_wav_path[1024] = ""; // NEW: Track the ephemeral WAV file for cleanup
 
 static void on_multitrack_mode_toggled(GtkToggleButton *button, gpointer user_data);
 static GtkWidget *btn_load_session = NULL;
@@ -92,6 +93,12 @@ static void on_muxer_finished(GPid pid, gint status, gpointer user_data) {
     if (status == 0) gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Muxing Complete!");
     else gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Muxing Failed (FFmpeg Error)");
     gtk_widget_set_sensitive(btn_save_mux, TRUE);
+
+    // NEW: Wipe the temporary audio file from the /tmp partition
+    if (strlen(temp_wav_path) > 0) {
+        remove(temp_wav_path);
+        temp_wav_path[0] = '\0';
+    }
 }
 
 static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, gpointer user_data) {
@@ -133,8 +140,8 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
     snprintf(raw_path, sizeof(raw_path), "%s/%s-RAW.mkv", dir, base_no_ext);
     snprintf(mix_path, sizeof(mix_path), "%s/%s-MIX.mkv", dir, base_no_ext);
 
-    char temp_raw[1024];
-    snprintf(temp_raw, sizeof(temp_raw), "/tmp/%s-RAW.wav", base_no_ext);
+    // FIX: Write to the tracked global string so it can be deleted later
+    snprintf(temp_wav_path, sizeof(temp_wav_path), "/tmp/%s-RAW.wav", base_no_ext);
 
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
@@ -158,7 +165,7 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         sfinfo.samplerate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
         sfinfo.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
 
-        SNDFILE *outfile = sf_open(temp_raw, SFM_WRITE, &sfinfo);
+        SNDFILE *outfile = sf_open(temp_wav_path, SFM_WRITE, &sfinfo);
         size_t frames_to_write = end_f - start_f;
 
         if (outfile && frames_to_write > 0) {
@@ -189,7 +196,7 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
             char *argv[64];
             int argc = 0;
             argv[argc++] = "ffmpeg"; argv[argc++] = "-y";
-            argv[argc++] = "-i"; argv[argc++] = temp_raw;
+            argv[argc++] = "-i"; argv[argc++] = temp_wav_path;
 
             char *meta_title = g_strdup_printf("title=%s", base_no_ext);
             char *meta_date = g_strdup_printf("recordingdate=%s", date_str);

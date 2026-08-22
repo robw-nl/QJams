@@ -178,9 +178,12 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
         extern void invalidate_waveform_caches(void);
         extern GtkWidget *waveform_area_bt;
         extern GtkWidget *waveform_area_input;
+        extern GtkWidget *lbl_status;
 
         int new_limit = new_config.multitrack_mode_active ? new_config.multitrack_duration_min : new_config.freestyle_duration_min;
-        if (resize_loop_canvas_seconds(new_limit * 60) == 0) {
+        int resize_result = resize_loop_canvas_seconds(new_limit * 60);
+
+        if (resize_result == 0) {
             update_zoom_button_label_to_length();
             invalidate_waveform_caches();
             if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
@@ -196,6 +199,12 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
                 extern GtkWidget *lbl_track;
                 gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
             }
+        } else if (resize_result == -2) {
+            gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Insufficient RAM to apply new duration limits!</b></span>");
+            // Revert the config limits to their previous safe state
+            ui_state.config.freestyle_duration_min = ui_state.config.freestyle_duration_min;
+            ui_state.config.multitrack_duration_min = ui_state.config.multitrack_duration_min;
+            save_qjams_config(ui_state.config_path, &ui_state.config);
         }
     }
 

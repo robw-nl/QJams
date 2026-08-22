@@ -179,7 +179,7 @@ void set_loop_points(double start_frac, double end_frac);
  * @brief Disables the active loop boundaries and restores linear playback.
  * @return void
  */
-void clear_loop_points(void);;
+void clear_loop_points(void);
 
 /**
  * @brief Instantly zeroes out the memory for a specific looper overdub layer.

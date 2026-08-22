@@ -173,7 +173,7 @@ static gboolean update_video_preview(GtkWidget *widget, GdkFrameClock *frame_clo
 }
 
 gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data) {
-    (void)keycode; (void)user_data;
+    (void)keycode; (void)user_data; (void)state;
     GtkWidget *window = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(window));
 
@@ -263,11 +263,7 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
             }
 
             if (slot != -1) {
-                if (state & GDK_CONTROL_MASK) {
-                    assign_playlist_preset(slot);
-                } else {
-                    activate_playlist_preset(slot);
-                }
+                activate_playlist_preset(slot);
                 return TRUE;
             }
             return FALSE;
@@ -384,11 +380,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     ui_state.config = load_qjams_config(ui_state.config_path);
 
     bool expected_is_offline = false;
-    bool using_fallback = false;
     char expected_audio[128] = "";
 
     if (strlen(ui_state.config.last_playlist_path) > 0) {
-        strncpy(ui_state.playlist_path, ui_state.config.last_playlist_path, sizeof(ui_state.playlist_path) - 1);
         ui_state.playlist_path[sizeof(ui_state.playlist_path) - 1] = '\0';
     }
 
@@ -440,7 +434,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                     for (int i = 0; i < a_count; i++) {
                         if (strcmp(ui_state.config.audio_profiles[p].device_name, a_devices[i].display_name) == 0) {
                             strncpy(target_audio, a_devices[i].display_name, 127);
-                            using_fallback = true;
                             break;
                         }
                     }
@@ -596,27 +589,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     adjust_blank_canvas_for_mode(ui_state.config.multitrack_mode_active != 0);
 
-    if (audio_status == 2 || video_status != 0 || expected_is_offline) {
-        char toast_msg[512] = "";
-
-        if (expected_is_offline && using_fallback && audio_status == 0) {
-            snprintf(toast_msg, sizeof(toast_msg),
-                     "<span foreground='#d32f2f' weight='semibold'>Device %s not detected.</span>\n"
-                     "<span foreground='#2e7d32' weight='semibold'>Successfully connected device %s</span>",
-                     expected_audio, ui_state.config.audio_device);
-        } else if (expected_is_offline || audio_status == 2) {
-            snprintf(toast_msg, sizeof(toast_msg), "<span foreground='#d32f2f' weight='semibold'>Device %s not detected.</span>", expected_audio);
-        }
-
-        if (video_status != 0) {
-            if (strlen(toast_msg) > 0) strcat(toast_msg, "\n");
-            char v_msg[256];
-            snprintf(v_msg, sizeof(v_msg), "<span foreground='#d32f2f' weight='semibold'>Camera %s not detected.</span>", ui_state.config.video_device);
-            strcat(toast_msg, v_msg);
-        }
-
-        show_hw_toast(toast_msg);
-
+    if (!client) {
+        gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>FATAL ERROR: JACK Audio Server is not running.</b></span>");
+        gtk_widget_set_sensitive(btn_play, FALSE);
+        gtk_widget_set_sensitive(btn_record, FALSE);
+    } else if (audio_status == 2 || video_status != 0 || expected_is_offline) {
         if (audio_status == 2 || video_status != 0) {
             gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Running with missing hardware");
         } else {
@@ -656,6 +633,21 @@ int main(int argc, char **argv) {
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
 
-    shutdown_audio_engine();
+    // --- STRICT SHUTDOWN SEQUENCE ---
+    stop_video_engine();     // Explicitly release the V4L2 camera lock
+    shutdown_audio_engine(); // Free the JACK audio buffers
+
+    // Free the UI preview queue memory leak
+    if (preview_queue.buffer) {
+        free(preview_queue.buffer);
+        preview_queue.buffer = NULL;
+    }
+
+    // Wipe the final raw MKV file from the /tmp partition
+    extern char current_raw_path[1024];
+    if (strlen(current_raw_path) > 0) {
+        remove(current_raw_path);
+    }
+
     return status;
 }
