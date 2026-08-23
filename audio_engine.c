@@ -668,7 +668,6 @@ int process_audio(jack_nframes_t nframes, void *arg) {
                 atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
             }
         }
-        // FILE: audio_engine.c
         atomic_store_explicit(&playback_pos, next_pos, memory_order_release);
     }
     return 0;
@@ -1228,7 +1227,6 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
         undo_tracks[i] = new_undo_tracks[i];
     }
 
-    // FILE: audio_engine.c
     rt_rb_state = new_rb_state;
     pristine_read_pos = 0;
     atomic_store_explicit(&playback_pos, 0, memory_order_release);
@@ -1564,7 +1562,7 @@ int init_audio_engine(size_t queue_capacity, float init_input_gain, jack_client_
     client = existing_client;
     input_gain = init_input_gain;
 
-    // NEW: Immediately query the active hardware sample rate and register the dynamic callback
+    // Immediately query the active hardware sample rate and register the dynamic callback
     jack_nframes_t current_rate = jack_get_sample_rate(client);
     atomic_store_explicit(&active_sample_rate, (int)current_rate, memory_order_release);
     jack_set_sample_rate_callback(client, jack_sample_rate_cb, 0);

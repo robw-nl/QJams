@@ -535,7 +535,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(drag_gesture_bt, "drag-end", G_CALLBACK(on_drag_end), NULL);
     gtk_widget_add_controller(waveform_area_bt, GTK_EVENT_CONTROLLER(drag_gesture_bt));
 
-    // NEW: Anchor Selection Click Gesture
+    // Anchor Selection Click Gesture
     GtkGesture *click_gesture_bt = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture_bt), GDK_BUTTON_PRIMARY);
     g_signal_connect(click_gesture_bt, "pressed", G_CALLBACK(on_waveform_click_pressed), NULL);
@@ -615,17 +615,23 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 }
 
 int main(int argc, char **argv) {
-    char exe_path[1024];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-        char *last_slash = strrchr(exe_path, '/');
-        if (last_slash) {
-            *last_slash = '\0';
-            snprintf(ui_state.config_path, sizeof(ui_state.config_path), "%s/qjams.config", exe_path);
-            snprintf(ui_state.playlist_path, sizeof(ui_state.playlist_path), "%s/qjams.m3u", exe_path);
-        }
-    }
+    // Use standard writable XDG paths (~/.config/qjams) ---
+    const char *config_dir = g_get_user_config_dir();
+    char qjams_dir[1024];
+    snprintf(qjams_dir, sizeof(qjams_dir), "%s/qjams", config_dir);
+
+    // Explicitly create the configuration directory
+    g_mkdir_with_parents(qjams_dir, 0755);
+
+    // Explicitly create the default user recordings directory
+    const char *music_dir = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
+    if (!music_dir) music_dir = g_get_home_dir();
+    char default_rec_dir[1024];
+    snprintf(default_rec_dir, sizeof(default_rec_dir), "%s/QJams", music_dir);
+    g_mkdir_with_parents(default_rec_dir, 0755);
+
+    snprintf(ui_state.config_path, sizeof(ui_state.config_path), "%s/qjams.config", qjams_dir);
+    snprintf(ui_state.playlist_path, sizeof(ui_state.playlist_path), "%s/qjams.m3u", qjams_dir);
 
     GtkApplication *app = gtk_application_new("com.rob.qjams", G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);

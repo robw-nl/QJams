@@ -158,7 +158,7 @@ static void* video_capture_loop(void* arg) {
 
         int64_t adjusted_pts = pts - total_pause_offset_us;
 
-        // NEW: Bypass sending frames to the encoder if Multi-Track Mode is active
+        // Bypass sending frames to the encoder if Multi-Track Mode is active
         if (atomic_load_explicit(&is_multitrack_mode, memory_order_relaxed)) goto frame_cleanup;
 
         size_t e_w_idx = atomic_load_explicit(&target_queue->write_index, memory_order_relaxed);

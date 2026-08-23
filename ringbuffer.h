@@ -25,7 +25,7 @@ typedef struct {
     alignas(CACHE_LINE_SIZE) atomic_size_t read_index;
 } SPSC_Audio_Queue;
 
-/**
+/**cjoice
  * @brief Opcodes for lock-free commands dispatched from the GTK UI thread to the JACK RT thread.
  * Legacy O(N) array mutation commands have been purged to enforce strict RT safety.
  */

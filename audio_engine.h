@@ -122,7 +122,6 @@ int import_to_layer(const char* filepath, int track_idx);
  * @return 0 on success, -2 on memory failure.
  */
 int init_empty_loop_canvas(int duration_seconds);
-// FILE: audio_engine.h
 /**
  * @brief Initializes a multi-track loop canvas of an exact frame count.
  * @param exact_frames The exact length of the canvas in frames.

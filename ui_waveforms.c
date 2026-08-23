@@ -14,7 +14,7 @@ static gint64 last_seek_time = 0; // Timestamp cache to debounce rapid seek comm
 
 static int cached_bt_width = 0;
 static int cached_bt_height = 0;
-static int cached_active_tracks = 1; // NEW
+static int cached_active_tracks = 1;
 float *cached_bt_ptr = NULL;
 static float bt_min_l[MAX_UI_WIDTH], bt_max_l[MAX_UI_WIDTH];
 static float bt_min_r[MAX_UI_WIDTH], bt_max_r[MAX_UI_WIDTH];
@@ -234,7 +234,6 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
     static double cached_bt_scroll_x = -1.0;
     static double cached_bt_zoom = -1.0;
-    // FILE: ui_waveforms.c
     static float *cached_track_ptrs[MAX_TRACKS] = {NULL};
     static bool cached_audible[MAX_TRACKS] = {false};
 
@@ -250,7 +249,6 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
         }
     }
 
-    // FILE: ui_waveforms.c
     bool pointers_changed = false;
     // Pass 2: Map audibility and check for state invalidation
     for (int i = 0; i < MAX_TRACKS; i++) {
@@ -298,7 +296,6 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
                 if (end_frame <= start_frame) end_frame = start_frame + 1;
                 if (start_frame >= pristine_frames) continue;
-                // FILE: ui_waveforms.c
                 if (end_frame > pristine_frames) end_frame = pristine_frames;
 
                 scan_waveform_extents(multitrack_tracks[l], start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
@@ -583,7 +580,7 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
         return G_SOURCE_CONTINUE;
     }
 
-    // NEW: Check for silent background encoder failure
+    // Check for silent background encoder failure
     extern _Atomic bool encoder_disk_error;
     if (atomic_exchange_explicit(&encoder_disk_error, false, memory_order_acquire)) {
         if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
@@ -694,7 +691,6 @@ void invalidate_waveform_caches(void) {
 * @param user_data Optional user data.
 * @return void
 */
-// FILE: ui_waveforms.c
 void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area; (void)user_data;
 

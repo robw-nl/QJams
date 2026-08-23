@@ -316,7 +316,7 @@ void prepare_engine_for_new_track(void) {
 
     pristine_frames = 0;
     backing_track_frames = 0;
-    ui_state.session_is_dirty = false; // NEW: A cleared or fresh track is inherently clean
+    ui_state.session_is_dirty = false; // A cleared or fresh track is inherently clean
     update_zoom_button_label_to_length();
 }
 
@@ -680,7 +680,7 @@ static void start_recording_execution(void) {
         g_free(tmp);
     }
 
-    // NEW: Delete the previous take's raw video file from disk before creating a new one
+    // Delete the previous take's raw video file from disk before creating a new one
     if (strlen(current_raw_path) > 0) {
         remove(current_raw_path);
     }
