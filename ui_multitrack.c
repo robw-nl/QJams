@@ -25,6 +25,10 @@ static void on_track_gain_changed(GtkSpinButton *spin_button, gpointer user_data
     float multiplier = (db <= -24.0) ? 0.0f : powf(10.0f, (float)(db / 20.0));
     set_multitrack_layer_gain(track_idx, multiplier);
 
+    if (ui_state.is_existing_session) {
+        ui_state.session_is_dirty = true;
+    }
+
     extern GtkWidget *waveform_area_bt;
     extern void invalidate_waveform_caches(void);
     invalidate_waveform_caches();
@@ -39,10 +43,16 @@ void update_multitrack_status_ui(void) {
     } else {
         snprintf(buf, sizeof(buf), "Multi-Track Ready - Overdub %d / %d", current, MAX_TRACKS - 1);
     }
-    gtk_label_set_text(GTK_LABEL(lbl_multitrack_status), buf);
+    extern GtkWidget *lbl_multitrack_status;
+    if (lbl_multitrack_status) gtk_label_set_text(GTK_LABEL(lbl_multitrack_status), buf);
 
-    size_t frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-    bool base_ready = (frames > 0 && current < MAX_TRACKS - 1);
+    extern void refresh_track_time_display(void);
+    refresh_track_time_display();
+
+    size_t bt_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+
+    bool base_ready = (bt_frames > 0 && current < MAX_TRACKS - 1);
+    extern GtkWidget *btn_multitrack_next;
     if (btn_multitrack_next) gtk_widget_set_sensitive(btn_multitrack_next, base_ready);
 
     refresh_multitrack_tracks_ui();
@@ -64,14 +74,14 @@ static void on_blank_canvas_confirm_response(GObject *source_object, GAsyncResul
         ui_state.selected_track_path[0] = '\0';
         update_playlist_toggle_state();
 
-        int loop_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
-        init_empty_loop_canvas(loop_min * 60);
+        int multitrack_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
+        init_empty_loop_canvas(multitrack_min * 60);
         zoom_multiplier = 1.0;
         atomic_store_explicit(&active_track_count, 1, memory_order_release);
         atomic_store_explicit(&current_recording_track, 0, memory_order_release);
 
         char track_lbl[128];
-        snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00]", loop_min);
+        snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00]", multitrack_min);
         gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
 
         ui_state.session_is_dirty = false;
@@ -113,31 +123,41 @@ void on_blank_canvas_toggled(GObject *gobject, GParamSpec *pspec, gpointer user_
         ui_state.selected_track_path[0] = '\0';
         update_playlist_toggle_state();
 
-        int loop_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
-        init_empty_loop_canvas(loop_min * 60);
+        int multitrack_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
+        init_empty_loop_canvas(multitrack_min * 60);
         zoom_multiplier = 1.0;
         atomic_store_explicit(&active_track_count, 1, memory_order_release);
         atomic_store_explicit(&current_recording_track, 0, memory_order_release);
 
-        char track_lbl[128];
-        snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00]", loop_min);
-        gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
+        // Inject the name safely into Track 0 so the status UI picks it up naturally
+        set_multitrack_track_name(0, "Blank Canvas");
 
         ui_state.session_is_dirty = false;
+        extern void invalidate_waveform_caches(void);
         invalidate_waveform_caches();
-        gtk_widget_queue_draw(waveform_area_bt);
-        gtk_widget_queue_draw(waveform_area_input);
+        extern GtkWidget *waveform_area_bt;
+        extern GtkWidget *waveform_area_input;
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
         update_multitrack_status_ui();
+
         gtk_widget_set_sensitive(btn_play, TRUE);
         gtk_widget_set_sensitive(btn_record, TRUE);
+        extern void update_zoom_button_label_to_length(void);
         update_zoom_button_label_to_length();
     } else {
         if (strlen(ui_state.selected_track_path) == 0) {
+            extern void prepare_engine_for_new_track(void);
             prepare_engine_for_new_track();
             gtk_widget_set_sensitive(btn_play, FALSE);
             gtk_widget_set_sensitive(btn_record, FALSE);
-            gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
+            extern GtkWidget *lbl_track;
+            if (lbl_track) gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
+            extern void invalidate_waveform_caches(void);
             invalidate_waveform_caches();
+            extern GtkWidget *waveform_area_bt;
+            extern GtkWidget *waveform_area_input;
             if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
             if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
         }
@@ -146,9 +166,10 @@ void on_blank_canvas_toggled(GObject *gobject, GParamSpec *pspec, gpointer user_
 
 void reset_multitrack_ui_states(void) {
     for (int i = 0; i < MAX_TRACKS; i++) {
-        atomic_store_explicit(&track_is_soloed[i], false, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
         snprintf(user_track_names[i], 64, "Track %d", i + 1);
     }
+    atomic_store_explicit(&selected_tracks_mask, 1, memory_order_release);
     refresh_multitrack_tracks_ui();
 }
 
@@ -200,11 +221,13 @@ void set_multitrack_track_name(int track_idx, const char *name) {
 void refresh_multitrack_tracks_ui(void) {
     init_default_track_names();
     int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
 
     for (int i = 0; i < MAX_TRACKS; i++) {
         if (!lbl_indicators[i]) continue;
         gtk_label_set_text(GTK_LABEL(lbl_indicators[i]), (i == rec_track) ? "🔴" : "  ");
-        if (i == rec_track) gtk_widget_add_css_class(row_boxes[i], "selected");
+
+        if (mask & (1 << i)) gtk_widget_add_css_class(row_boxes[i], "selected");
         else gtk_widget_remove_css_class(row_boxes[i], "selected");
 
         gtk_label_set_text(GTK_LABEL(name_editors[i]), user_track_names[i]);
@@ -212,12 +235,12 @@ void refresh_multitrack_tracks_ui(void) {
         if (color_dots[i]) gtk_widget_queue_draw(color_dots[i]);
 
         g_signal_handlers_block_by_func(btn_solos[i], G_CALLBACK(on_solo_track_toggled), GINT_TO_POINTER(i));
-        bool is_soloed = atomic_load_explicit(&track_is_soloed[i], memory_order_acquire);
+        bool is_soloed = atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_acquire);
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_solos[i]), is_soloed);
         g_signal_handlers_unblock_by_func(btn_solos[i], G_CALLBACK(on_solo_track_toggled), GINT_TO_POINTER(i));
 
         if (spin_gains[i]) {
-            float current_gain = atomic_load_explicit(&multitrack_track_gains[i], memory_order_relaxed);
+            float current_gain = atomic_load_explicit(&master_tracks[i].gain, memory_order_relaxed);
             float loaded_db = (current_gain <= 0.001f) ? -24.0f : 20.0f * log10f(current_gain);
             g_signal_handlers_block_by_func(spin_gains[i], G_CALLBACK(on_track_gain_changed), GINT_TO_POINTER(i));
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_gains[i]), loaded_db);
@@ -231,7 +254,11 @@ static void on_solo_track_toggled(GtkToggleButton *btn, gpointer user_data) {
     bool is_soloed = gtk_toggle_button_get_active(btn);
 
     // Strictly update the mixing bus state without touching the transport controls
-    atomic_store_explicit(&track_is_soloed[track_idx], is_soloed, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].is_soloed, is_soloed, memory_order_release);
+
+    if (ui_state.is_existing_session) {
+        ui_state.session_is_dirty = true;
+    }
 
     // Force a UI redraw so the canvas instantly hides muted tracks while stopped
     extern void invalidate_waveform_caches(void);
@@ -254,10 +281,14 @@ static void on_rename_track_confirm(GtkButton *btn, gpointer user_data) {
     if (strlen(new_name) > 0) {
         set_multitrack_track_name(rd->track_idx, new_name);
         refresh_multitrack_tracks_ui();
+
+        //  If we renamed the currently active track, update the header label
+        int current = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+        if (current == rd->track_idx) {
+            update_multitrack_status_ui();
+        }
     }
 
-    // FIX: Extract the window pointer safely, then destroy.
-    // GTK will naturally call free(rd) via the finalizer.
     GtkWidget *win = rd->dialog;
     gtk_window_destroy(GTK_WINDOW(win));
 }
@@ -308,15 +339,31 @@ static void on_rename_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void on_row_clicked(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
-    (void)gesture; (void)n_press; (void)x; (void)y;
+    (void)n_press; (void)x; (void)y;
     int track_idx = GPOINTER_TO_INT(user_data);
-    int current = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-    if (current != track_idx && track_idx >= 0 && track_idx < MAX_TRACKS) {
+    if (track_idx < 0 || track_idx >= MAX_TRACKS) return;
+
+    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+    uint32_t current_mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+
+    if (state & GDK_SHIFT_MASK) {
+        int start = (rec_track < track_idx) ? rec_track : track_idx;
+        int end = (rec_track > track_idx) ? rec_track : track_idx;
+        uint32_t new_mask = current_mask;
+        for (int i = start; i <= end; i++) new_mask |= (1 << i);
+        atomic_store_explicit(&selected_tracks_mask, new_mask, memory_order_release);
+    } else if (state & GDK_CONTROL_MASK) {
+        atomic_store_explicit(&selected_tracks_mask, current_mask ^ (1 << track_idx), memory_order_release);
+    } else {
         atomic_store_explicit(&current_recording_track, track_idx, memory_order_release);
-        int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
-        if (track_idx >= active) atomic_store_explicit(&active_track_count, track_idx + 1, memory_order_release);
-        update_multitrack_status_ui();
+        atomic_store_explicit(&selected_tracks_mask, (1 << track_idx), memory_order_release);
     }
+
+    int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
+    if (track_idx >= active) atomic_store_explicit(&active_track_count, track_idx + 1, memory_order_release);
+
+    update_multitrack_status_ui();
 }
 
 static GdkContentProvider* on_track_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
@@ -335,7 +382,7 @@ static gboolean on_track_drop(GtkDropTarget *target, const GValue *value, double
 
     if (src_idx == dest_idx || src_idx < 0 || src_idx >= MAX_TRACKS || dest_idx < 0 || dest_idx >= MAX_TRACKS) return FALSE;
 
-    // 1. Detach the DSP engine ONCE for the entire drag operation to prevent race conditions and timeouts
+    // 1. Detach the DSP engine ONCE for the entire drag operation to prevent race conditions
     if (!await_rt_thread_detach()) return FALSE;
 
     int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
@@ -345,13 +392,13 @@ static gboolean on_track_drop(GtkDropTarget *target, const GValue *value, double
         int next = i + step;
 
         // 2. Swap Audio Pointers explicitly inside this unified barrier
-        float *tmp_multi = multitrack_tracks[i];
-        multitrack_tracks[i] = multitrack_tracks[next];
-        multitrack_tracks[next] = tmp_multi;
+        float *tmp_multi = master_tracks[i].active_buffer;
+        master_tracks[i].active_buffer = master_tracks[next].active_buffer;
+        master_tracks[next].active_buffer = tmp_multi;
 
-        float *tmp_undo = undo_tracks[i];
-        undo_tracks[i] = undo_tracks[next];
-        undo_tracks[next] = tmp_undo;
+        float *tmp_undo = master_tracks[i].undo_buffer;
+        master_tracks[i].undo_buffer = master_tracks[next].undo_buffer;
+        master_tracks[next].undo_buffer = tmp_undo;
 
         // 3. Swap Names
         char temp_name[64];
@@ -364,17 +411,26 @@ static gboolean on_track_drop(GtkDropTarget *target, const GValue *value, double
         strncpy(hidden_track_names[i], hidden_track_names[next], 64);
         strncpy(hidden_track_names[next], temp_hidden, 64);
 
-        // 4. Swap Solo States
-        bool solo_i = atomic_load_explicit(&track_is_soloed[i], memory_order_acquire);
-        bool solo_next = atomic_load_explicit(&track_is_soloed[next], memory_order_acquire);
-        atomic_store_explicit(&track_is_soloed[i], solo_next, memory_order_release);
-        atomic_store_explicit(&track_is_soloed[next], solo_i, memory_order_release);
+        // 4. Swap Atomic States (Solo, Gain, Audio Flags)
+        bool solo_i = atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_acquire);
+        bool solo_next = atomic_load_explicit(&master_tracks[next].is_soloed, memory_order_acquire);
+        atomic_store_explicit(&master_tracks[i].is_soloed, solo_next, memory_order_release);
+        atomic_store_explicit(&master_tracks[next].is_soloed, solo_i, memory_order_release);
 
-        // 5. Swap Clip Gains
-        float gain_i = atomic_load_explicit(&multitrack_track_gains[i], memory_order_acquire);
-        float gain_next = atomic_load_explicit(&multitrack_track_gains[next], memory_order_acquire);
-        atomic_store_explicit(&multitrack_track_gains[i], gain_next, memory_order_release);
-        atomic_store_explicit(&multitrack_track_gains[next], gain_i, memory_order_release);
+        float gain_i = atomic_load_explicit(&master_tracks[i].gain, memory_order_acquire);
+        float gain_next = atomic_load_explicit(&master_tracks[next].gain, memory_order_acquire);
+        atomic_store_explicit(&master_tracks[i].gain, gain_next, memory_order_release);
+        atomic_store_explicit(&master_tracks[next].gain, gain_i, memory_order_release);
+
+        bool audio_i = atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
+        bool audio_next = atomic_load_explicit(&master_tracks[next].has_audio, memory_order_acquire);
+        atomic_store_explicit(&master_tracks[i].has_audio, audio_next, memory_order_release);
+        atomic_store_explicit(&master_tracks[next].has_audio, audio_i, memory_order_release);
+
+        bool undo_i = atomic_load_explicit(&master_tracks[i].has_undo, memory_order_acquire);
+        bool undo_next = atomic_load_explicit(&master_tracks[next].has_undo, memory_order_acquire);
+        atomic_store_explicit(&master_tracks[i].has_undo, undo_next, memory_order_release);
+        atomic_store_explicit(&master_tracks[next].has_undo, undo_i, memory_order_release);
 
         if (current_rec == i) current_rec = next;
         else if (current_rec == next) current_rec = i;
@@ -382,15 +438,38 @@ static gboolean on_track_drop(GtkDropTarget *target, const GValue *value, double
 
     atomic_store_explicit(&current_recording_track, current_rec, memory_order_release);
 
+    // 5. Sync the master stretcher buffer if the base track was altered during the drop
+    if (src_idx == 0 || dest_idx == 0) {
+        extern float *pristine_bt_buf;
+        extern size_t pristine_frames;
+        if (pristine_bt_buf && master_tracks[0].active_buffer) {
+            memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+
+            // Trigger a lock-free playhead seek to the current position.
+            // This safely forces the RT engine to flush the static stretcher queue internally.
+            extern atomic_size_t playback_pos;
+            extern atomic_size_t backing_track_frames;
+            size_t pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+            size_t frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            if (frames > 0) {
+                extern void seek_backing_track(double);
+                seek_backing_track((double)pos / (double)frames);
+            }
+        }
+    }
+
     // 6. Dynamically expand active_track_count so the renderer loops far enough to draw the dragged track
     int current_active = atomic_load_explicit(&active_track_count, memory_order_acquire);
     if (dest_idx >= current_active) {
         atomic_store_explicit(&active_track_count, dest_idx + 1, memory_order_release);
     }
 
+    ui_state.session_is_dirty = true;
+
     // 7. Safely resume the DSP engine
     resume_rt_thread();
 
+    extern void invalidate_waveform_caches(void);
     invalidate_waveform_caches();
     extern GtkWidget *waveform_area_bt;
     extern GtkWidget *waveform_area_input;
@@ -478,9 +557,12 @@ static void import_stem_ready(GObject *source_object, GAsyncResult *res, gpointe
     gtk_spinner_stop(GTK_SPINNER(main_spinner));
 
     if (result == 0 || result == 1) {
-        ui_state.session_is_dirty = true;
+        // Only dirty the session if importing an overdub layer, not the base backing track
+        if (track_idx > 0 || ui_state.is_existing_session) {
+            ui_state.session_is_dirty = true;
+        }
 
-        // FIX: Register Base Track imports for the '+' button
+        // Register Base Track imports for the '+' button
         if (track_idx == 0) {
             strncpy(ui_state.selected_track_path, data->filepath, sizeof(ui_state.selected_track_path) - 1);
             ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
@@ -495,10 +577,18 @@ static void import_stem_ready(GObject *source_object, GAsyncResult *res, gpointe
         g_free(basename);
 
         refresh_multitrack_tracks_ui();
-        invalidate_waveform_caches();
-        gtk_widget_queue_draw(waveform_area_bt);
-        gtk_widget_queue_draw(waveform_area_input);
 
+        // Synchronize the dashboard label to reflect the freshly imported and armed track
+        update_multitrack_status_ui();
+
+        extern void invalidate_waveform_caches(void);
+        invalidate_waveform_caches();
+        extern GtkWidget *waveform_area_bt;
+        extern GtkWidget *waveform_area_input;
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+        extern GtkWidget *lbl_status;
         if (result == 1) {
             gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444' weight='heavy'>WARNING: Dropped track was truncated to match canvas length!</span>");
             g_timeout_add(3000, reset_status_label_deferred, NULL);
@@ -511,130 +601,6 @@ static void import_stem_ready(GObject *source_object, GAsyncResult *res, gpointe
         gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Stem Import Failed (Corrupt or Empty Media)</b></span>");
     } else {
         gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Stem Import Failed</b></span>");
-    }
-}
-
-/**
- * @brief Handles track-level destructive cuts, V-fades, and blend crossfades.
- * Reads modifier keys: Click (Cut), Ctrl (Smart V-Fade), Shift (Blend Crossfade).
- * Invalidates peak caches and forces canvas redrawing upon completion.
- * @param gesture The click gesture controller.
- * @param n_press Press count.
- * @param x Coordinate x.
- * @param y Coordinate y.
- * @param user_data Target layer index cast to gpointer.
- */
-static void on_cut_track_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
-    (void)n_press; (void)x; (void)y;
-    int track_idx = GPOINTER_TO_INT(user_data);
-    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
-
-    bool has_ctrl = (state & GDK_CONTROL_MASK) != 0;
-    bool has_shift = (state & GDK_SHIFT_MASK) != 0;
-
-    if (has_shift) {
-        extern void apply_blend_fade_to_track(int);
-        apply_blend_fade_to_track(track_idx);
-    } else if (has_ctrl) {
-        extern void apply_smart_fade_to_track(int);
-        apply_smart_fade_to_track(track_idx);
-    } else {
-        extern void cut_multitrack_track_selection(int);
-        cut_multitrack_track_selection(track_idx);
-    }
-
-    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
-    refresh_multitrack_tracks_ui();
-
-    extern GtkWidget *waveform_area_bt;
-    extern GtkWidget *waveform_area_input;
-    extern void invalidate_waveform_caches(void);
-    invalidate_waveform_caches();
-    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
-}
-
-/**
- * @brief Async dialog response handler for full destructive track wipe confirmation.
- * @param source_object The alert dialog instance.
- * @param res Async result object.
- * @param user_data Layer index cast to gpointer.
- */
-static void on_wipe_track_confirmed(GObject *source_object, GAsyncResult *res, gpointer user_data) {
-    int track_idx = GPOINTER_TO_INT(user_data);
-    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
-    GError *error = NULL;
-    int response = gtk_alert_dialog_choose_finish(alert, res, &error);
-
-    if (error) {
-        g_error_free(error);
-        return;
-    }
-
-    // Response 0 is "Wipe Track"
-    if (response == 0) {
-        extern void clear_multitrack_track(int);
-        clear_multitrack_track(track_idx);
-
-        char default_name[64];
-        snprintf(default_name, sizeof(default_name), "Track %d", track_idx + 1);
-        set_multitrack_track_name(track_idx, default_name);
-
-        refresh_multitrack_tracks_ui();
-
-        extern GtkWidget *waveform_area_bt;
-        extern GtkWidget *waveform_area_input;
-        extern void invalidate_waveform_caches(void);
-        invalidate_waveform_caches();
-        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
-    }
-}
-
-/**
- * @brief Handles track-level undo operations and routes to wipe confirmation when empty.
- * Restores previous audio snapshot or displays warning dialog if buffer is exhausted.
- * @param gesture The click gesture controller.
- * @param n_press Press count.
- * @param x Coordinate x.
- * @param y Coordinate y.
- * @param user_data Target layer index cast to gpointer.
- */
-static void on_undo_track_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
-    (void)n_press; (void)x; (void)y;
-    int track_idx = GPOINTER_TO_INT(user_data);
-    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
-    bool has_ctrl = (state & GDK_CONTROL_MASK) != 0;
-
-    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
-
-    extern _Atomic bool track_has_undo[MAX_TRACKS];
-    bool has_undo = atomic_load_explicit(&track_has_undo[track_idx], memory_order_acquire);
-
-    if (has_ctrl || !has_undo) {
-        GtkWindow *window = GTK_WINDOW(gtk_widget_get_ancestor(gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture)), GTK_TYPE_WINDOW));
-        char title[64];
-        snprintf(title, sizeof(title), "Wipe Track %d?", track_idx + 1);
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", title);
-        gtk_alert_dialog_set_detail(alert, "This will permanently delete all audio on this track. This action cannot be undone.");
-
-        const char *buttons[] = {"Wipe Track", "Cancel", NULL};
-        gtk_alert_dialog_set_buttons(alert, buttons);
-        gtk_alert_dialog_set_cancel_button(alert, 1);
-        gtk_alert_dialog_set_default_button(alert, 0);
-
-        gtk_alert_dialog_choose(alert, window, NULL, on_wipe_track_confirmed, GINT_TO_POINTER(track_idx));
-    } else {
-        extern void undo_track_edit(int);
-        undo_track_edit(track_idx);
-        refresh_multitrack_tracks_ui();
-
-        extern GtkWidget *waveform_area_bt;
-        extern GtkWidget *waveform_area_input;
-        extern void invalidate_waveform_caches(void);
-        invalidate_waveform_caches();
-        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
     }
 }
 
@@ -694,7 +660,7 @@ GtkWidget* create_multitrack_tracks_widget(void) {
         g_signal_connect(drop_target, "drop", G_CALLBACK(on_track_drop), GINT_TO_POINTER(i));
         gtk_widget_add_controller(hbox, GTK_EVENT_CONTROLLER(drop_target));
 
-        // --- NEW: PHASE 4 DUAL-FORMAT FILE DROP FOR STEM IMPORTS ---
+        // --- PHASE 4 DUAL-FORMAT FILE DROP FOR STEM IMPORTS ---
         GType file_drop_types[] = { GDK_TYPE_FILE_LIST, QJ_TYPE_TRACK };
         GtkDropTarget *file_drop_target = gtk_drop_target_new(G_TYPE_INVALID, GDK_ACTION_COPY | GDK_ACTION_MOVE);
         gtk_drop_target_set_gtypes(file_drop_target, file_drop_types, 2);
@@ -725,7 +691,7 @@ GtkWidget* create_multitrack_tracks_widget(void) {
         g_signal_connect(btn_rename, "clicked", G_CALLBACK(on_rename_clicked), GINT_TO_POINTER(i));
 
         /** Read directly from the audio engine instead of the persistent config */
-        float current_gain = atomic_load_explicit(&multitrack_track_gains[i], memory_order_relaxed);
+        float current_gain = atomic_load_explicit(&master_tracks[i].gain, memory_order_relaxed);
         float loaded_db = (current_gain <= 0.001f) ? -24.0f : 20.0f * log10f(current_gain);
 
         GtkAdjustment *adj = gtk_adjustment_new(loaded_db, -24.0, 24.0, 1.0, 5.0, 0.0);
@@ -743,22 +709,6 @@ GtkWidget* create_multitrack_tracks_widget(void) {
         gtk_widget_set_tooltip_text(btn_solos[i], "Solo this track");
         g_signal_connect(btn_solos[i], "toggled", G_CALLBACK(on_solo_track_toggled), GINT_TO_POINTER(i));
 
-        GtkWidget *btn_undo = gtk_button_new_from_icon_name("edit-undo-symbolic");
-        gtk_widget_set_tooltip_text(btn_undo, "Undo / Redo Audio (Ctrl+Click: Full Track Wipe)");
-        GtkGesture *undo_click = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(undo_click), GDK_BUTTON_PRIMARY);
-        g_signal_connect(undo_click, "pressed", G_CALLBACK(on_undo_track_pressed), GINT_TO_POINTER(i));
-        gtk_widget_add_controller(btn_undo, GTK_EVENT_CONTROLLER(undo_click));
-
-        GtkWidget *btn_cut = gtk_button_new_from_icon_name("edit-cut-symbolic");
-        gtk_widget_set_tooltip_text(btn_cut, "Cut (Click) | V-Fade (Ctrl) | Blend (Shift)");
-        gtk_widget_add_css_class(btn_cut, "flat");
-
-        GtkGesture *cut_click = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(cut_click), GDK_BUTTON_PRIMARY);
-        g_signal_connect(cut_click, "pressed", G_CALLBACK(on_cut_track_pressed), GINT_TO_POINTER(i));
-        gtk_widget_add_controller(btn_cut, GTK_EVENT_CONTROLLER(cut_click));
-
         gtk_box_append(GTK_BOX(hbox), drag_icon);
         gtk_box_append(GTK_BOX(hbox), lbl_indicators[i]);
         gtk_box_append(GTK_BOX(hbox), name_editors[i]);
@@ -766,8 +716,6 @@ GtkWidget* create_multitrack_tracks_widget(void) {
         gtk_box_append(GTK_BOX(hbox), btn_rename);
         gtk_box_append(GTK_BOX(hbox), spin_gains[i]);
         gtk_box_append(GTK_BOX(hbox), btn_solos[i]);
-        gtk_box_append(GTK_BOX(hbox), btn_cut);
-        gtk_box_append(GTK_BOX(hbox), btn_undo);
 
         gtk_box_append(GTK_BOX(main_box), hbox);
     }

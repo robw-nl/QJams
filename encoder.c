@@ -146,7 +146,10 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     if (fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
         video_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
-    avcodec_open2(video_enc_ctx, v_codec, NULL);
+    if (avcodec_open2(video_enc_ctx, v_codec, NULL) < 0) {
+        printf("[Encoder] Error: Could not open video codec.\n");
+        goto encoder_cleanup;
+    }
 
     video_stream = avformat_new_stream(fmt_ctx, v_codec);
     video_stream->time_base = video_enc_ctx->time_base;
@@ -157,13 +160,16 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     // PCM is extremely CPU efficient for raw capture and natively guarantees S16 interleaved support
     const AVCodec *a_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
 
-    // STREAM 0: Master Mix (Hardware Input + Looper Matrix)
+    // STREAM 0: Master Mix (Hardware Input + Multitrack Matrix)
     codec_ctx_mix = avcodec_alloc_context3(a_codec);
     codec_ctx_mix->sample_rate = sample_rate;
     av_channel_layout_default(&codec_ctx_mix->ch_layout, 2);
     codec_ctx_mix->sample_fmt = AV_SAMPLE_FMT_S16;
     codec_ctx_mix->time_base = (AVRational){1, sample_rate};
-    avcodec_open2(codec_ctx_mix, a_codec, NULL);
+    if (avcodec_open2(codec_ctx_mix, a_codec, NULL) < 0) {
+        printf("[Encoder] Error: Could not open audio codec.\n");
+        goto encoder_cleanup;
+    }
     audio_stream_mix = avformat_new_stream(fmt_ctx, a_codec);
     avcodec_parameters_from_context(audio_stream_mix->codecpar, codec_ctx_mix);
 

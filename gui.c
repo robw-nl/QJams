@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include "audio_engine.h"
 #include "video_engine.h"
 #include "scanner.h"
@@ -18,6 +19,8 @@
 extern jack_client_t *client;
 extern SPSC_Video_Queue video_queue;
 SPSC_Preview_Queue preview_queue;
+
+_Atomic bool is_multitrack_mode = false; // Decoupled UI state flag
 
 // --- INSTANTIATE UI GLOBALS ---
 QJamsUIState ui_state = { .is_loading_track = false, .selected_track_path = "", .freestyle_duration_min = 15, .multitrack_duration_min = 5, .session_is_dirty = false };
@@ -94,8 +97,41 @@ static void on_force_quit_response(GObject *source_object, GAsyncResult *res, gp
     }
 }
 
+// New global flag to allow the window to close after user confirmation
+static bool force_quit_approved = false;
+
+static void on_unsaved_quit_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
+    GtkWidget *win = GTK_WIDGET(user_data);
+
+    if (response == 0) {
+        // Route to the appropriate save pipeline natively
+        extern GtkWidget *btn_save_session;
+        extern GtkWidget *btn_save_mux;
+        if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+            if (btn_save_session) g_signal_emit_by_name(btn_save_session, "clicked");
+        } else {
+            if (btn_save_mux) g_signal_emit_by_name(btn_save_mux, "clicked");
+        }
+    } else if (response == 1) {
+        // Discard selected: Approve the quit and re-trigger destruction
+        force_quit_approved = true;
+        gtk_window_destroy(GTK_WINDOW(win));
+    }
+}
+
 static gboolean on_window_close(GtkWindow *window, gpointer user_data) {
     (void)user_data;
+
+    // If the user already authorized the data wipe, bypass the checks and allow destruction
+    if (force_quit_approved) {
+        ui_state.config.window_width = gtk_widget_get_width(GTK_WIDGET(window));
+        ui_state.config.window_height = gtk_widget_get_height(GTK_WIDGET(window));
+        save_qjams_config(ui_state.config_path, &ui_state.config);
+        return FALSE;
+    }
+
     if (active_muxer_pid != 0) {
         GtkAlertDialog *alert = gtk_alert_dialog_new("Muxing in Progress");
         gtk_alert_dialog_set_detail(alert, "FFmpeg is currently processing the export in the background.\n\nDo you want to wait for it to finish, or Force Quit and abandon the export?");
@@ -108,6 +144,30 @@ static gboolean on_window_close(GtkWindow *window, gpointer user_data) {
         g_object_unref(alert);
         return TRUE; // Block immediate close
     }
+
+    bool has_raw_video = (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0);
+    bool is_dirty = (ui_state.session_is_dirty && pristine_frames > 0);
+
+    if (is_dirty || has_raw_video) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Unsaved Changes");
+        bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+
+        if (is_multitrack) {
+            gtk_alert_dialog_set_detail(alert, "You have unsaved audio overdubs on the canvas. If you quit now, your progress will be permanently lost.");
+        } else {
+            gtk_alert_dialog_set_detail(alert, "You have an un-exported video recording. If you quit now, the temporary video file will be permanently deleted.");
+        }
+
+        const char *buttons[] = { is_multitrack ? "Save Session" : "Export Mix", "Discard & Quit", "Cancel", NULL };
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 2);
+        gtk_alert_dialog_set_default_button(alert, 0);
+
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(window), NULL, on_unsaved_quit_response, window);
+        g_object_unref(alert);
+        return TRUE; // Block immediate close
+    }
+
     ui_state.config.window_width = gtk_widget_get_width(GTK_WIDGET(window));
     ui_state.config.window_height = gtk_widget_get_height(GTK_WIDGET(window));
     save_qjams_config(ui_state.config_path, &ui_state.config);
@@ -200,24 +260,139 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
 
         case GDK_KEY_r:
         case GDK_KEY_R:
-            if (btn_record && gtk_widget_is_sensitive(btn_record)) {
+            if (!(state & GDK_CONTROL_MASK) && btn_record && gtk_widget_is_sensitive(btn_record)) {
                 g_signal_emit_by_name(btn_record, "clicked");
             }
             return TRUE;
 
         case GDK_KEY_s:
         case GDK_KEY_S:
-            if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+            if (!(state & GDK_CONTROL_MASK) && btn_stop && gtk_widget_is_sensitive(btn_stop)) {
                 g_signal_emit_by_name(btn_stop, "clicked");
             }
             return TRUE;
 
         case GDK_KEY_c:
         case GDK_KEY_C:
+            if (state & GDK_CONTROL_MASK) {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    extern void copy_selection(void);
+                    copy_selection();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            }
             if (btn_speed && gtk_widget_is_sensitive(btn_speed)) {
                 g_signal_emit_by_name(btn_speed, "clicked");
             }
             return TRUE;
+
+        case GDK_KEY_x:
+        case GDK_KEY_X:
+            if (state & GDK_CONTROL_MASK) {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    extern void cut_selection(void);
+                    cut_selection();
+                    ui_state.session_is_dirty = true;
+                    extern void invalidate_waveform_caches(void);
+                    invalidate_waveform_caches();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            } else {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    extern void apply_blend_fade_selection(void);
+                    apply_blend_fade_selection();
+                    ui_state.session_is_dirty = true;
+                    extern void invalidate_waveform_caches(void);
+                    invalidate_waveform_caches();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            }
+
+        case GDK_KEY_v:
+        case GDK_KEY_V:
+            if (state & GDK_CONTROL_MASK) {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    if (state & GDK_SHIFT_MASK) {
+                        extern void global_paste_selection(void);
+                        global_paste_selection();
+                    } else {
+                        extern void paste_selection(void);
+                        paste_selection();
+                    }
+                    ui_state.session_is_dirty = true;
+                    extern void update_zoom_button_label_to_length(void);
+                    update_zoom_button_label_to_length();
+                    extern void invalidate_waveform_caches(void);
+                    invalidate_waveform_caches();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            }
+            return FALSE;
+
+        case GDK_KEY_z:
+        case GDK_KEY_Z:
+            if (state & GDK_CONTROL_MASK) {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    extern void undo_selection(void);
+                    undo_selection();
+
+                    ui_state.session_is_dirty = true; // Wake up the safety guardrails
+
+                    extern void refresh_multitrack_tracks_ui(void);
+                    refresh_multitrack_tracks_ui();
+                    extern void update_multitrack_status_ui(void);
+                    update_multitrack_status_ui();
+
+                    extern void invalidate_waveform_caches(void);
+                    invalidate_waveform_caches();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            }
+            return FALSE;
+
+        case GDK_KEY_f:
+        case GDK_KEY_F:
+            if (!(state & GDK_CONTROL_MASK)) {
+                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                    extern void apply_smart_fade_selection(void);
+                    apply_smart_fade_selection();
+                    ui_state.session_is_dirty = true;
+                    extern void invalidate_waveform_caches(void);
+                    invalidate_waveform_caches();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                }
+                return TRUE;
+            }
+            return FALSE;
+
+        case GDK_KEY_Delete:
+            if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+                if (state & GDK_SHIFT_MASK) {
+                    extern void global_ripple_delete_selection(void);
+                    global_ripple_delete_selection();
+                } else {
+                    extern void delete_selection(void);
+                    delete_selection();
+                }
+                ui_state.session_is_dirty = true;
+                extern void invalidate_waveform_caches(void);
+                invalidate_waveform_caches();
+                gtk_widget_queue_draw(waveform_area_bt);
+                gtk_widget_queue_draw(waveform_area_input);
+                return TRUE;
+            }
+            return FALSE;
 
         case GDK_KEY_Escape:
             if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
@@ -238,20 +413,56 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
 
         case GDK_KEY_Home:
             if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
-                extern void clear_loop_points(void);
-                clear_loop_points();
-                seek_backing_track(0.0);
+                if (state & GDK_SHIFT_MASK) {
+                    size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+                    if (total > 0) {
+                        double end_frac = 1.0;
+                        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                            end_frac = (double)atomic_load_explicit(&loop_end_frame, memory_order_acquire) / (double)total;
+                        } else {
+                            end_frac = (double)atomic_load_explicit(&playback_pos, memory_order_acquire) / (double)total;
+                        }
+                        set_loop_points(0.0, end_frac);
+                        seek_backing_track(0.0);
+                        gtk_widget_queue_draw(waveform_area_bt);
+                        gtk_widget_queue_draw(waveform_area_input);
+                    }
+                } else {
+                    extern void clear_loop_points(void);
+                    clear_loop_points();
+                    seek_backing_track(0.0);
+                }
             }
             return TRUE;
 
         case GDK_KEY_End:
-            if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) seek_backing_track(1.0);
+            if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+                if (state & GDK_SHIFT_MASK) {
+                    size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+                    if (total > 0) {
+                        double start_frac = 0.0;
+                        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                            start_frac = (double)atomic_load_explicit(&loop_start_frame, memory_order_acquire) / (double)total;
+                        } else {
+                            start_frac = (double)atomic_load_explicit(&playback_pos, memory_order_acquire) / (double)total;
+                        }
+                        set_loop_points(start_frac, 1.0);
+                        seek_backing_track(start_frac);
+                        gtk_widget_queue_draw(waveform_area_bt);
+                        gtk_widget_queue_draw(waveform_area_input);
+                    }
+                } else {
+                    extern void clear_loop_points(void);
+                    clear_loop_points();
+                    seek_backing_track(1.0);
+                }
+            }
             return TRUE;
 
         case GDK_KEY_F2:
             multitrack_start_rename();
             return TRUE;
-            // Playlist Preset Triggers
+
         case GDK_KEY_1: case GDK_KEY_2: case GDK_KEY_3: case GDK_KEY_4: case GDK_KEY_5:
         case GDK_KEY_6: case GDK_KEY_7: case GDK_KEY_8: case GDK_KEY_9: case GDK_KEY_0:
         {
@@ -353,6 +564,139 @@ static void on_open(GtkApplication *app, GFile **files, gint n_files, const gcha
     g_application_activate(G_APPLICATION(app));
 }
 
+// --- BOOT RECOVERY LOGIC ---
+static void on_audio_recovery_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
+    char *autosave_path = (char *)user_data;
+
+    if (response == 0) {
+        extern void command_post_load_session(const char *path);
+        command_post_load_session(autosave_path);
+    } else {
+        remove(autosave_path);
+    }
+    g_free(autosave_path);
+}
+
+static void on_video_recovery_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
+    char *raw_path = (char *)user_data;
+
+    if (response == 0) {
+        strncpy(current_raw_path, raw_path, sizeof(current_raw_path) - 1);
+        strncpy(ui_state.selected_track_path, raw_path, sizeof(ui_state.selected_track_path) - 1);
+
+        extern GtkWidget *btn_multitrack_mode;
+        if (btn_multitrack_mode) {
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_multitrack_mode), FALSE);
+        }
+
+        trigger_track_load();
+
+        extern GtkWidget *btn_save_mux;
+        if (btn_save_mux) {
+            gtk_widget_remove_css_class(btn_save_mux, "needs-save");
+            gtk_widget_add_css_class(btn_save_mux, "needs-save");
+        }
+    } else {
+        remove(raw_path);
+    }
+    g_free(raw_path);
+}
+
+static gboolean check_for_crash_recovery(gpointer user_data) {
+    GtkWindow *window = GTK_WINDOW(user_data);
+
+    // 1. Check for Audio Autosave
+    char autosave_path[1024];
+    snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
+
+    if (access(autosave_path, F_OK) == 0) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Recover Unsaved Session?");
+        gtk_alert_dialog_set_detail(alert, "QJams recovered an unsaved multitrack session from a previous crash. Would you like to restore it?");
+        const char *buttons[] = { "Restore Session", "Discard", NULL };
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 1);
+        gtk_alert_dialog_set_default_button(alert, 0);
+
+        gtk_alert_dialog_choose(alert, window, NULL, on_audio_recovery_response, g_strdup(autosave_path));
+        return G_SOURCE_REMOVE;
+    }
+
+    // 2. Check for Video Raw MKV in /tmp (Keep the newest, purge the rest)
+    GDir *dir = g_dir_open("/tmp", 0, NULL);
+    if (dir) {
+        const char *filename;
+        char latest_raw[1024] = "";
+        time_t latest_time = 0;
+
+        while ((filename = g_dir_read_name(dir)) != NULL) {
+            if (g_str_has_prefix(filename, "qjams_raw_") && g_str_has_suffix(filename, ".mkv")) {
+                char full_path[1024];
+                snprintf(full_path, sizeof(full_path), "/tmp/%s", filename);
+
+                struct stat st;
+                if (stat(full_path, &st) == 0) {
+                    if (st.st_mtime > latest_time) {
+                        if (strlen(latest_raw) > 0) remove(latest_raw); // Delete older orphaned file
+                        latest_time = st.st_mtime;
+                        strncpy(latest_raw, full_path, sizeof(latest_raw) - 1);
+                    } else {
+                        remove(full_path); // Delete older orphaned file
+                    }
+                }
+            }
+        }
+        g_dir_close(dir);
+
+        if (strlen(latest_raw) > 0) {
+            GtkAlertDialog *alert = gtk_alert_dialog_new("Recover Un-Exported Video?");
+            gtk_alert_dialog_set_detail(alert, "QJams recovered an un-exported video recording. Would you like to load it for export?");
+
+            // Use clear, accurate terminology
+            const char *buttons[] = { "Restore Recording", "Discard", NULL };
+
+            gtk_alert_dialog_set_buttons(alert, buttons);
+            gtk_alert_dialog_set_cancel_button(alert, 1);
+            gtk_alert_dialog_set_default_button(alert, 0);
+
+            gtk_alert_dialog_choose(alert, window, NULL, on_video_recovery_response, g_strdup(latest_raw));
+        }
+    }
+
+    return G_SOURCE_REMOVE;
+}
+// --- 5-MINUTE IDLE AUTO-SAVE ---
+static gboolean idle_autosave_tick(gpointer user_data) {
+    (void)user_data;
+    static bool has_autosaved = false;
+
+    bool is_playing = atomic_load_explicit(&engine_is_playing, memory_order_acquire);
+    bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
+
+    // Reset the lock whenever the transport is active so new takes get saved
+    if (is_recording || is_playing) {
+        has_autosaved = false;
+        return G_SOURCE_CONTINUE;
+    }
+
+    if (has_autosaved || !ui_state.session_is_dirty || pristine_frames == 0) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    char autosave_path[1024];
+    snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
+
+    extern int save_qjams_session(const char* filepath);
+    if (save_qjams_session(autosave_path) == 0) {
+        has_autosaved = true;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
 static void on_activate(GtkApplication *app, gpointer user_data) {
     (void)user_data;
 
@@ -383,6 +727,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     char expected_audio[128] = "";
 
     if (strlen(ui_state.config.last_playlist_path) > 0) {
+        strncpy(ui_state.playlist_path, ui_state.config.last_playlist_path, sizeof(ui_state.playlist_path) - 1);
         ui_state.playlist_path[sizeof(ui_state.playlist_path) - 1] = '\0';
     }
 
@@ -519,10 +864,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *playlist_widget = create_playlist_widget();
     gtk_box_append(GTK_BOX(play_root), playlist_widget);
 
-    // Map looper logic to the XML multitrack scroll window
-    GtkWidget *looper_scroll = GTK_WIDGET(gtk_builder_get_object(b_multi, "multitrack_tracks_scroll"));
-    GtkWidget *looper_list = create_multitrack_tracks_widget();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(looper_scroll), looper_list);
+    // Map multitrack logic to the XML multitrack scroll window
+    GtkWidget *multitrack_scroll = GTK_WIDGET(gtk_builder_get_object(b_multi, "multitrack_tracks_scroll"));
+    GtkWidget *multitrack_list = create_multitrack_tracks_widget();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(multitrack_scroll), multitrack_list);
 
     // Setup waveform drawing handlers through the extracted b_wave pointers
     waveform_area_bt = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveform_area_bt"));
@@ -612,6 +957,12 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             trigger_track_load();
         }
     }
+
+    // Scan for recovering crashed files after the UI is fully drawn
+    g_idle_add(check_for_crash_recovery, window);
+
+    // Start the 5-minute (300000 milliseconds) silent autosave loop
+    g_timeout_add(300000, idle_autosave_tick, NULL);
 }
 
 int main(int argc, char **argv) {
@@ -654,6 +1005,11 @@ int main(int argc, char **argv) {
     if (strlen(current_raw_path) > 0) {
         remove(current_raw_path);
     }
+
+    // Wipe the hidden audio autosave file on a clean exit
+    char autosave_path[1024];
+    snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
+    remove(autosave_path);
 
     return status;
 }

@@ -158,9 +158,6 @@ static void* video_capture_loop(void* arg) {
 
         int64_t adjusted_pts = pts - total_pause_offset_us;
 
-        // Bypass sending frames to the encoder if Multi-Track Mode is active
-        if (atomic_load_explicit(&is_multitrack_mode, memory_order_relaxed)) goto frame_cleanup;
-
         size_t e_w_idx = atomic_load_explicit(&target_queue->write_index, memory_order_relaxed);
         size_t e_r_idx = atomic_load_explicit(&target_queue->read_index, memory_order_acquire);
         if (e_w_idx - e_r_idx >= target_queue->capacity) goto frame_cleanup;

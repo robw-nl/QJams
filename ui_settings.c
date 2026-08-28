@@ -41,7 +41,7 @@ typedef struct {
  */
 static void apply_hardware_changes(QJamsConfig *new_config) {
     // 1. Audio Capture (JACK Hot-Patch)
-    // FIX: Unconditionally patch audio ports to ensure late-booting hardware connects
+    // Unconditionally patch audio ports to ensure late-booting hardware connects
     printf("State Manager: Re-patching Audio Capture to %s\n", new_config->audio_device);
     patch_audio_ports(new_config->audio_device);
 
@@ -65,7 +65,7 @@ static void apply_hardware_changes(QJamsConfig *new_config) {
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(input_gain_spinner), loaded_db);
 
     // 2. Audio Playback (JACK Hot-Patch)
-    // FIX: Unconditionally patch playback ports
+    // Unconditionally patch playback ports
     printf("State Manager: Re-patching Audio Playback to %s\n", new_config->playback_target);
     patch_playback_ports(new_config->playback_target);
 
@@ -447,7 +447,7 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     gtk_box_append(GTK_BOX(free_vbox), spin_free);
     gtk_box_append(GTK_BOX(wf_hbox), free_vbox);
 
-    // Looper Spinner
+    // Multitrack Spinner
     GtkWidget *loop_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_box_append(GTK_BOX(loop_vbox), gtk_label_new("Multi-Track Limit (min):"));
     GtkAdjustment *adj_loop = gtk_adjustment_new(ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5, 1, 60, 1, 5, 0);

@@ -41,11 +41,11 @@ static void draw_playhead(cairo_t *cr, int width, int height, size_t current_pos
 void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames);
 
 /**
- * @brief Assigns a highly visible neon color for each looper layer.
+ * @brief Assigns a highly visible neon color for each multitrack layer.
  */
 static void set_track_color(cairo_t *cr, int track_idx, double alpha) {
     switch (track_idx) {
-        case 0: cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, alpha); break; // Base: Brighter Silver/Gray
+        case 0: cairo_set_source_rgba(cr, 0.9, 0.9, 0.9, alpha); break; // Base: Brighter Silver/Gray
         case 1: cairo_set_source_rgba(cr, 0.0, 0.8, 1.0, alpha); break; // Overdub 1: Cyan/Electric Blue
         case 2: cairo_set_source_rgba(cr, 1.0, 0.2, 0.8, alpha); break; // Overdub 2: Neon Magenta
         case 3: cairo_set_source_rgba(cr, 0.4, 1.0, 0.2, alpha); break; // Overdub 3: Lime Green
@@ -75,8 +75,7 @@ void on_draw_track_color_dot(GtkDrawingArea *area, cairo_t *cr, int width, int h
     int track_idx = GPOINTER_TO_INT(user_data);
     set_track_color(cr, track_idx, 1.0);
 
-    extern _Atomic bool track_has_audio[MAX_TRACKS];
-    bool has_audio = atomic_load_explicit(&track_has_audio[track_idx], memory_order_acquire);
+    bool has_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
 
     double radius = (width < height ? width : height) / 2.0 - 1.0;
     double cx = width / 2.0;
@@ -134,17 +133,17 @@ static inline void scan_waveform_extents(const float *src_buf, size_t start_fram
 
 /**
  * @brief Draws the background timeline grid and timestamp labels for the waveform area.
- * Utilizes a major/minor tick system to prevent text overlap on long tracks while maintaining visual granularity.
+ * Dynamically scales the tick intervals based on the visible viewport duration rather than the total track length,
+ * ensuring continuous granularity at deep zoom levels.
  * @param cr The Cairo rendering context.
  * @param width The width of the drawing area.
  * @param height The height of the drawing area.
- * @param total_frames The total length of the loaded track for calculating dynamic intervals.
+ * @param total_frames The total length of the loaded track for calculating bounds.
  */
 void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames) {
     cairo_set_source_rgb(cr, 0.15, 0.15, 0.18);
     cairo_paint(cr);
 
-    // Draw center horizontal divider for Left/Right audio channels
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 0, height / 2.0);
@@ -154,53 +153,100 @@ void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames)
     if (total_frames == 0 || active_sample_rate <= 0) return;
 
     double total_seconds = (double)total_frames / active_sample_rate;
-    double total_minutes = total_seconds / 60.0;
-
-    int text_step = 60;
-    int tick_step = 15;
-
-    if (total_minutes > 60.0) { text_step = 300; tick_step = 60; }
-    else if (total_minutes > 30.0) { text_step = 120; tick_step = 30; }
-    else if (total_minutes > 15.0) { text_step = 60; tick_step = 15; }
-    else if (total_minutes > 5.0) { text_step = 30; tick_step = 10; }
-    else if (total_seconds > 60.0) { text_step = 10; tick_step = 5; }
-    else if (total_seconds > 15.0) { text_step = 5; tick_step = 1; }
-    else { text_step = 2; tick_step = 1; }
-
     int bt_width = gtk_widget_get_width(waveform_area_bt);
     double virtual_width = bt_width * zoom_multiplier;
     double pixels_per_sec = virtual_width / total_seconds;
     double scroll_x = gtk_adjustment_get_value(waveform_adj);
 
+    double visible_seconds = width / pixels_per_sec;
+
+    // --- Algorithmic Grid Scaling ---
+    // Mathematically target ~8 text labels across whatever the current visible screen width is
+    double target_text_step = visible_seconds / 8.0;
+
+    // Calculate dynamic base-10 magnitude to snap to clean numbers (1, 2, or 5)
+    double mag = pow(10.0, floor(log10(target_text_step)));
+    double rel = target_text_step / mag;
+
+    double text_step, tick_step;
+    if (rel < 2.0) text_step = 1.0 * mag;
+    else if (rel < 5.0) text_step = 2.0 * mag;
+    else text_step = 5.0 * mag;
+
+    // Safety bounds for extreme atomic-level zooming
+    if (text_step < 0.00001) text_step = 0.00001;
+    tick_step = text_step / 10.0;
+
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 10.0);
     cairo_set_line_width(cr, 1.0);
 
-    for (int s = tick_step; s < total_seconds; s += tick_step) {
-        double x = (s * pixels_per_sec) - scroll_x;
-        if (x < -50 || x > width + 50) continue; // Cull invisible geometry safely off-screen
+    double start_sec = scroll_x / pixels_per_sec;
+    double end_sec = (scroll_x + width) / pixels_per_sec;
 
-        if (s % text_step == 0) {
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.25);
+    // Align starting tick safely to the grid
+    double current_sec = floor(start_sec / tick_step) * tick_step;
+
+    // High multiplier for safe float modulo math (handles nanosecond bounds safely)
+    long long mult = 100000000LL;
+    long long txt_val = llround(text_step * mult);
+    long long mid_val = txt_val / 2;
+
+    while (current_sec <= end_sec && current_sec <= total_seconds) {
+        if (current_sec < 0.0) {
+            current_sec += tick_step;
+            continue;
+        }
+
+        double x = (current_sec * pixels_per_sec) - scroll_x;
+        if (x < -50 || x > width + 50) {
+            current_sec += tick_step;
+            continue;
+        }
+
+        long long cur_val = llround(current_sec * mult);
+        bool is_text = (txt_val > 0) && (cur_val % txt_val == 0);
+        bool is_mid = (mid_val > 0) && (cur_val % mid_val == 0);
+
+        if (is_text) {
+            cairo_set_source_rgba(cr, 0.8, 0.8, 0.8, 1.0); // Major Tick
             cairo_move_to(cr, x, 0);
             cairo_line_to(cr, x, height);
             cairo_stroke(cr);
 
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.7);
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.8);
             cairo_move_to(cr, x + 3, 12);
 
             char time_str[32];
-            int mins = s / 60;
-            int secs = s % 60;
-            if (secs == 0) snprintf(time_str, sizeof(time_str), "%d:00", mins);
-            else snprintf(time_str, sizeof(time_str), "%d:%02d", mins, secs);
+            if (text_step >= 1.0) {
+                int mins = (int)current_sec / 60;
+                int secs = (int)current_sec % 60;
+                if (secs == 0) snprintf(time_str, sizeof(time_str), "%d:00", mins);
+                else snprintf(time_str, sizeof(time_str), "%d:%02d", mins, secs);
+            } else if (text_step >= 0.1) {
+                snprintf(time_str, sizeof(time_str), "%.1fs", current_sec);
+            } else if (text_step >= 0.01) {
+                snprintf(time_str, sizeof(time_str), "%.2fs", current_sec);
+            } else if (text_step >= 0.001) {
+                snprintf(time_str, sizeof(time_str), "%.3fs", current_sec);
+            } else if (text_step >= 0.0001) {
+                snprintf(time_str, sizeof(time_str), "%.4fs", current_sec);
+            } else {
+                snprintf(time_str, sizeof(time_str), "%.5fs", current_sec);
+            }
             cairo_show_text(cr, time_str);
+        } else if (is_mid) {
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.20); // Medium Tick
+            cairo_move_to(cr, x, 0);
+            cairo_line_to(cr, x, height);
+            cairo_stroke(cr);
         } else {
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.08);
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.08); // Minor Tick
             cairo_move_to(cr, x, 0);
             cairo_line_to(cr, x, height);
             cairo_stroke(cr);
         }
+        current_sec += tick_step;
     }
 }
 
@@ -239,11 +285,10 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
     bool any_solo_active = false;
     bool track_audible[MAX_TRACKS] = {false};
-    extern _Atomic bool track_has_audio[MAX_TRACKS];
 
     // Pass 1: Determine if any solo is engaged
     for (int l = 0; l < MAX_TRACKS; l++) {
-        if (atomic_load_explicit(&track_is_soloed[l], memory_order_relaxed)) {
+        if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
             any_solo_active = true;
             break;
         }
@@ -253,12 +298,12 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
     // Pass 2: Map audibility and check for state invalidation
     for (int i = 0; i < MAX_TRACKS; i++) {
         // STRICT: A layer is only audible if it is unmuted/soloed AND explicitly contains recorded audio
-        track_audible[i] = (!any_solo_active || atomic_load_explicit(&track_is_soloed[i], memory_order_relaxed)) &&
-        atomic_load_explicit(&track_has_audio[i], memory_order_acquire);
+        track_audible[i] = (!any_solo_active || atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_relaxed)) &&
+        atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
 
-        if (multitrack_tracks[i] != cached_track_ptrs[i]) {
+        if (master_tracks[i].active_buffer != cached_track_ptrs[i]) {
             pointers_changed = true;
-            cached_track_ptrs[i] = multitrack_tracks[i];
+            cached_track_ptrs[i] = master_tracks[i].active_buffer;
         }
         if (track_audible[i] != cached_audible[i]) {
             pointers_changed = true;
@@ -279,10 +324,13 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
 
     draw_waveform_grid(surface_cr, width, height, backing_track_frames);
 
+    // Clamp the render bounds to strictly prevent out-of-bounds pointer sweeps
     int max_render_track = active_tracks;
+    if (max_render_track > MAX_TRACKS) max_render_track = MAX_TRACKS;
 
     for (int l = 0; l < max_render_track; l++) {
-        if (!multitrack_tracks[l] || !track_audible[l]) continue;
+        float *active_buf = master_tracks[l].active_buffer;
+        if (!active_buf || !track_audible[l]) continue;
 
         if (frames_per_pixel >= 1.0) {
             memset(bt_min_l, 0, sizeof(bt_min_l));
@@ -298,10 +346,10 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
                 if (start_frame >= pristine_frames) continue;
                 if (end_frame > pristine_frames) end_frame = pristine_frames;
 
-                scan_waveform_extents(multitrack_tracks[l], start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
+                scan_waveform_extents(active_buf, start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
             }
 
-            float layer_gain = atomic_load_explicit(&multitrack_track_gains[l], memory_order_relaxed);
+            float layer_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
 
             // Restore OVER operator to prevent additive color clipping when tracks stack
             cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
@@ -312,7 +360,7 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
             draw_envelope_waveform(surface_cr, width, height, bt_min_l, bt_max_l, layer_gain, height / 4.0);
             draw_envelope_waveform(surface_cr, width, height, bt_min_r, bt_max_r, layer_gain, 3.0 * height / 4.0);
         } else {
-            float layer_gain = atomic_load_explicit(&multitrack_track_gains[l], memory_order_relaxed);
+            float layer_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
             double alpha = 0.65;
 
             // Restore OVER operator here as well for deep zoom views
@@ -320,8 +368,8 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
             set_track_color(surface_cr, l, alpha);
 
             cairo_set_line_width(surface_cr, 1.5);
-            draw_sample_waveform(surface_cr, width, height, multitrack_tracks[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, height / 4.0, 0);
-            draw_sample_waveform(surface_cr, width, height, multitrack_tracks[l], pristine_frames, scroll_x, frames_per_pixel, layer_gain, 3.0 * height / 4.0, 1);
+            draw_sample_waveform(surface_cr, width, height, active_buf, pristine_frames, scroll_x, frames_per_pixel, layer_gain, height / 4.0, 0);
+            draw_sample_waveform(surface_cr, width, height, active_buf, pristine_frames, scroll_x, frames_per_pixel, layer_gain, 3.0 * height / 4.0, 1);
         }
     }
 
@@ -340,7 +388,9 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
         }
 
         if (active_tracks > 1 && atomic_load_explicit(&engine_is_recording, memory_order_relaxed)) {
-            if (frames_per_pixel >= 1.0) {
+            float *rec_buf = master_tracks[rec_track].active_buffer;
+
+            if (frames_per_pixel >= 1.0 && rec_buf) {
                 memset(sweep_min_l, 0, sizeof(sweep_min_l));
                 memset(sweep_max_l, 0, sizeof(sweep_max_l));
                 memset(sweep_min_r, 0, sizeof(sweep_min_r));
@@ -353,10 +403,8 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
                     if (start_frame >= current_pos) break;
                     if (end_frame > current_pos) end_frame = current_pos;
 
-                    if (multitrack_tracks[rec_track]) {
-                        scan_waveform_extents(multitrack_tracks[rec_track], start_frame, end_frame,
-                                              &sweep_min_l[x], &sweep_max_l[x], &sweep_min_r[x], &sweep_max_r[x]);
-                    }
+                    scan_waveform_extents(rec_buf, start_frame, end_frame,
+                                          &sweep_min_l[x], &sweep_max_l[x], &sweep_min_r[x], &sweep_max_r[x]);
                 }
 
                 cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
@@ -364,12 +412,12 @@ void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int heigh
                 cairo_set_line_width(cr, 1.0);
                 draw_envelope_waveform(cr, width, height, sweep_min_l, sweep_max_l, 1.0f, height / 4.0);
                 draw_envelope_waveform(cr, width, height, sweep_min_r, sweep_max_r, 1.0f, 3.0 * height / 4.0);
-            } else {
+            } else if (rec_buf) {
                 cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
                 set_track_color(cr, rec_track, 0.5);
                 cairo_set_line_width(cr, 1.5);
-                draw_sample_waveform(cr, width, height, multitrack_tracks[rec_track], current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
-                draw_sample_waveform(cr, width, height, multitrack_tracks[rec_track], current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
+                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
+                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
             }
         }
 
@@ -580,6 +628,13 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
         return G_SOURCE_CONTINUE;
     }
 
+    // TELEMETRY: Extract RT Audio Dropouts safely on the UI thread
+    extern _Atomic uint32_t rt_dropped_audio_frames;
+    uint32_t dropped = atomic_exchange_explicit(&rt_dropped_audio_frames, 0, memory_order_relaxed);
+    if (dropped > 0) {
+        printf("[RT-EVENT] Warning: Dropped %u audio frames (Ringbuffer Overrun)\n", dropped);
+    }
+
     // Check for silent background encoder failure
     extern _Atomic bool encoder_disk_error;
     if (atomic_exchange_explicit(&encoder_disk_error, false, memory_order_acquire)) {
@@ -601,10 +656,15 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
     atomic_load_explicit(&engine_is_recording, memory_order_acquire);
 
     bool layers_swapped = false;
+
+    // Update dynamic track time label
+    extern void refresh_track_time_display(void);
+    refresh_track_time_display();
+
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i] != last_tick_layers[i]) {
+        if (master_tracks[i].active_buffer != last_tick_layers[i]) {
             layers_swapped = true;
-            last_tick_layers[i] = multitrack_tracks[i];
+            last_tick_layers[i] = master_tracks[i].active_buffer;
         }
     }
 
@@ -696,7 +756,7 @@ void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int he
 
     bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
     int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
-    float *active_input_buf = multitrack_tracks[rec_track];
+    float *active_input_buf = master_tracks[rec_track].active_buffer;
 
     if (ui_state.is_loading_track || !active_input_buf || backing_track_frames == 0) {
         draw_waveform_grid(cr, width, height, 0);
@@ -848,7 +908,7 @@ void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, 
 }
 
 /**
- * @brief Gesture callback triggered when a looper drag starts.
+ * @brief Gesture callback triggered when a multitrack drag starts.
  * @param gesture The drag gesture object.
  * @param start_x The starting X coordinate.
  * @param start_y The starting Y coordinate.
@@ -898,7 +958,7 @@ void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpoi
 
 
 /**
- * @brief Gesture callback triggered during a looper drag operation.
+ * @brief Gesture callback triggered during a multitrack drag operation.
  * @param gesture The drag gesture object.
  * @param offset_x The current X offset from start.
  * @param offset_y The current Y offset from start.
@@ -945,7 +1005,7 @@ void on_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, g
 }
 
 /**
- * @brief Gesture callback triggered when a looper drag operation completes, applying loop points.
+ * @brief Gesture callback triggered when a multitrack drag operation completes, applying loop points.
  * @param gesture The drag gesture object.
  * @param offset_x The total X offset from start.
  * @param offset_y The total Y offset from start.
@@ -991,47 +1051,11 @@ void on_drag_end(GtkGestureDrag *gesture, double offset_x, double offset_y, gpoi
     gtk_widget_queue_draw(waveform_area_input); // Ensure final boundary snaps to bottom canvas
 }
 
-static guint scroll_debounce_id = 0;
-
-static gboolean reset_scroll_debounce(gpointer data) {
-    (void)data;
-    scroll_debounce_id = 0;
-    return G_SOURCE_REMOVE;
-}
-
 gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data) {
     (void)user_data;
     GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller));
 
     if (state & GDK_SHIFT_MASK) {
-        extern _Atomic bool loop_active;
-        if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return FALSE;
-
-        extern _Atomic int current_recording_track;
-        int track_idx = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-
-        if (scroll_debounce_id == 0) {
-            extern void backup_track_for_edit(int);
-            backup_track_for_edit(track_idx);
-        } else {
-            g_source_remove(scroll_debounce_id);
-        }
-        scroll_debounce_id = g_timeout_add(500, reset_scroll_debounce, NULL);
-
-        double delta = (dx != 0.0) ? dx : dy;
-        float db_delta = (delta < 0) ? 0.5f : -0.5f;
-
-        extern void amplify_track_selection(int, float);
-        amplify_track_selection(track_idx, db_delta);
-
-        extern GtkWidget *waveform_area_bt;
-        extern GtkWidget *waveform_area_input;
-        extern void invalidate_waveform_caches(void);
-
-        invalidate_waveform_caches();
-        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
-
         return TRUE;
     }
 
@@ -1039,9 +1063,9 @@ gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, dou
         double delta = (dy != 0.0) ? dy : dx;
 
         if (delta < 0) {
-            zoom_multiplier *= 1.25;
+            zoom_multiplier *= 1.10;
         } else {
-            zoom_multiplier /= 1.25;
+            zoom_multiplier /= 1.10;
         }
 
         if (zoom_multiplier < 1.0) zoom_multiplier = 1.0;

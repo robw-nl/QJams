@@ -112,6 +112,7 @@ static bool extract_track_metadata(const char *filepath, char *output_buffer, si
             snprintf(output_buffer, max_len, "%s", basename);
             g_free(basename);
         }
+
         avformat_close_input(&fmt_ctx);
     } else {
         gchar *basename = g_path_get_basename(filepath);
@@ -378,9 +379,19 @@ static void on_session_overwrite_confirm(GObject *source_object, GAsyncResult *r
 }
 
 static void request_track_activation(const char *filepath, GtkWidget *parent) {
-    if (g_str_has_suffix(filepath, ".qjams") && ui_state.session_is_dirty && pristine_frames > 0) {
-        GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Active Session?");
-        gtk_alert_dialog_set_detail(alert, "Loading this session will discard your currently recorded, unsaved multi-track audio. Continue?");
+    bool is_multi = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+    bool is_qjams = g_str_has_suffix(filepath, ".qjams");
+
+    bool will_overwrite = false;
+    if (is_qjams) {
+        will_overwrite = true; // Loading a session always overwrites
+    } else if (!is_multi) {
+        will_overwrite = true; // Loading a base track overwrites
+    }
+
+    if (will_overwrite && ui_state.session_is_dirty && pristine_frames > 0) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new(is_qjams ? "Overwrite Active Session?" : "Discard Active Recording?");
+        gtk_alert_dialog_set_detail(alert, is_qjams ? "Loading this session will discard your currently recorded, unsaved audio. Continue?" : "Loading this track will discard your current unsaved recording. Continue?");
         const char *buttons[] = { "Discard & Load", "Cancel", NULL };
         gtk_alert_dialog_set_buttons(alert, buttons);
         gtk_alert_dialog_set_cancel_button(alert, 1);

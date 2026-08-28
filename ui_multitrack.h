@@ -1,5 +1,5 @@
-#ifndef UI_LOOPER_H
-#define UI_LOOPER_H
+#ifndef UI_MULTITRACK_H
+#define UI_MULTITRACK_H
 
 #include <gtk/gtk.h>
 
@@ -15,4 +15,4 @@ void ui_multitrack_init(GtkBuilder *b_multi, GtkBuilder *b_stack);
 
 void multitrack_import_file_async(const char *filepath, int track_idx); // ADD THIS
 
-#endif // UI_LOOPER_H
+#endif // UI_MULTITRACK_H

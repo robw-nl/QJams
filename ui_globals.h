@@ -3,6 +3,7 @@
 
 #include <gtk/gtk.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include "config.h"
 
 typedef struct {
@@ -13,7 +14,8 @@ typedef struct {
     bool is_loading_track;
     int freestyle_duration_min; // Default should be 15
     int multitrack_duration_min;    // Default should be 5
-    bool session_is_dirty;      // Tracks if canvas has been recorded to
+    bool is_existing_session;   // Tracks origin: true = loaded .qjams project, false = practice canvas
+    bool session_is_dirty;      // Tracks if canvas has been recorded to or edited
 } QJamsUIState;
 
 extern QJamsUIState ui_state;
@@ -39,11 +41,10 @@ extern GtkWidget *right_vbox;
 extern GtkWidget *command_post_box;
 extern GtkWidget *settings_dialog;
 
-// Looper Controls
+// Multitrack Controls
 extern GtkWidget *mode_stack;
 extern GtkWidget *btn_multitrack_mode;
 extern GtkWidget *lbl_multitrack_status;
-extern GtkWidget *btn_multitrack_undo;
 extern GtkWidget *btn_multitrack_next;
 
 // Dashboard & Command Post Widgets
@@ -64,6 +65,7 @@ extern char final_save_path[1024];
 extern char current_raw_path[1024];
 extern GPid active_muxer_pid;
 extern _Atomic bool is_mkv_mode;
+extern _Atomic bool is_multitrack_mode; // Migrated from audio engine for UI routing
 
 void trigger_track_load(void);
 void on_stop_clicked(GtkButton *button, gpointer user_data);

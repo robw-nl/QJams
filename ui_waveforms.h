@@ -78,7 +78,7 @@ void clear_waveform_anchor(void);
 void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 
 /**
- * @brief Gesture callback triggered when a looper drag starts.
+ * @brief Gesture callback triggered when a multitrack drag starts.
  * @param gesture The drag gesture object.
  * @param start_x The starting X coordinate.
  * @param start_y The starting Y coordinate.
@@ -87,7 +87,7 @@ void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, 
  */
 void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpointer user_data);
 /**
- * @brief Gesture callback triggered during a looper drag operation.
+ * @brief Gesture callback triggered during a multitrack drag operation.
  * @param gesture The drag gesture object.
  * @param offset_x The current X offset from start.
  * @param offset_y The current Y offset from start.
@@ -96,7 +96,7 @@ void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpoi
  */
 void on_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, gpointer user_data);
 /**
- * @brief Gesture callback triggered when a looper drag operation completes, applying loop points.
+ * @brief Gesture callback triggered when a multitrack drag operation completes, applying loop points.
  * @param gesture The drag gesture object.
  * @param offset_x The total X offset from start.
  * @param offset_y The total Y offset from start.

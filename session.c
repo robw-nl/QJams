@@ -14,7 +14,7 @@
 #define QJAMS_MAGIC "QJMS"
 #define QJAMS_VERSION 3
 
-// FIX: Enforce strict byte-packing and fixed-width types to guarantee cross-architecture portability
+// Enforce strict byte-packing and fixed-width types to guarantee cross-architecture portability
 typedef struct __attribute__((packed)) {
     char magic[4];
     uint32_t version;
@@ -88,7 +88,7 @@ static sf_count_t vio_tell(void *user_data) {
 }
 
 /**
- * @brief Saves the current looper session as a .tar archive containing a metadata header and compressed FLAC stems.
+ * @brief Saves the current multitrack session as a .tar archive containing a metadata header and compressed FLAC stems.
  * Runs purely in RAM using Virtual I/O buffers for maximum performance.
  * @param filepath Absolute path to the destination file.
  * @return 0 on success, or a negative error code.
@@ -120,11 +120,11 @@ int save_qjams_session(const char* filepath) {
 
     for (int i = 0; i < MAX_TRACKS; i++) {
         header.track_is_muted[i] = false;
-        header.track_is_soloed[i] = atomic_load_explicit(&track_is_soloed[i], memory_order_acquire);
+        header.track_is_soloed[i] = atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_acquire);
         get_multitrack_track_name(i, header.track_names[i]);
         header.track_names[i][sizeof(header.track_names[i]) - 1] = '\0';
-        header.track_has_audio[i] = atomic_load_explicit(&track_has_audio[i], memory_order_acquire);
-        header.track_gains[i] = atomic_load_explicit(&multitrack_track_gains[i], memory_order_acquire);
+        header.track_has_audio[i] = atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
+        header.track_gains[i] = atomic_load_explicit(&master_tracks[i].gain, memory_order_acquire);
     }
 
     struct archive_entry *entry = archive_entry_new();
@@ -145,7 +145,7 @@ int save_qjams_session(const char* filepath) {
     };
 
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (header.track_has_audio[i] && multitrack_tracks[i]) {
+        if (header.track_has_audio[i] && master_tracks[i].active_buffer) {
             VirtMemIO vio = { .data = malloc(1024 * 1024), .capacity = 1024 * 1024, .offset = 0, .length = 0 };
 
             SF_INFO sfinfo = {0};
@@ -155,7 +155,7 @@ int save_qjams_session(const char* filepath) {
 
             SNDFILE *sf = sf_open_virtual(&sf_vio, SFM_WRITE, &sfinfo, &vio);
             if (sf) {
-                sf_writef_float(sf, multitrack_tracks[i], header.pristine_frames);
+                sf_writef_float(sf, master_tracks[i].active_buffer, header.pristine_frames);
                 sf_close(sf);
 
                 char flac_name[32];
@@ -272,12 +272,10 @@ int load_qjams_session(const char* filepath) {
         .tell = vio_tell
     };
 
-    extern _Atomic bool track_has_undo[MAX_TRACKS];
-
     for (int i = 0; i < MAX_TRACKS; i++) {
-        atomic_store_explicit(&track_is_soloed[i], header.track_is_soloed[i] != 0, memory_order_release);
-        atomic_store_explicit(&track_has_audio[i], header.track_has_audio[i] != 0, memory_order_release);
-        atomic_store_explicit(&track_has_undo[i], false, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].is_soloed, header.track_is_soloed[i] != 0, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].has_audio, header.track_has_audio[i] != 0, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
 
         float gain_val = (header.track_gains[i] >= 0.0f && header.track_gains[i] <= 10.0f) ? header.track_gains[i] : 1.0f;
         set_multitrack_layer_gain(i, gain_val);
@@ -285,19 +283,19 @@ int load_qjams_session(const char* filepath) {
         header.track_names[i][sizeof(header.track_names[i]) - 1] = '\0';
         set_multitrack_track_name(i, header.track_names[i]);
 
-        if (header.track_has_audio[i] && multitrack_tracks[i] && track_vios[i].data) {
+        if (header.track_has_audio[i] && master_tracks[i].active_buffer && track_vios[i].data) {
             SF_INFO sfinfo = {0};
             SNDFILE *sf = sf_open_virtual(&sf_vio, SFM_READ, &sfinfo, &track_vios[i]);
             if (sf) {
-                sf_readf_float(sf, multitrack_tracks[i], header.pristine_frames);
+                sf_readf_float(sf, master_tracks[i].active_buffer, header.pristine_frames);
                 sf_close(sf);
             }
         }
         if (track_vios[i].data) free(track_vios[i].data);
     }
 
-    if (pristine_bt_buf && multitrack_tracks[0]) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], header.pristine_frames * 2 * sizeof(float));
+    if (pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, header.pristine_frames * 2 * sizeof(float));
     }
 
     resume_rt_thread();

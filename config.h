@@ -26,7 +26,7 @@ typedef struct {
     char video_device[128];
     char audio_device[128];
     int multitrack_blank_canvas;
-    int multitrack_mode_active; // Persist looper mode state
+    int multitrack_mode_active; // Persist multitrack mode state
     int freestyle_duration_min;
     int multitrack_duration_min;
     int export_format; // 0 = FLAC, 1 = WAV, 2 = BOTH

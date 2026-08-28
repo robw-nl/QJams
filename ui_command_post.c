@@ -11,7 +11,7 @@
 #include <string.h>
 
 GPid active_muxer_pid = 0;
-static char temp_wav_path[1024] = ""; // NEW: Track the ephemeral WAV file for cleanup
+static char temp_wav_path[1024] = ""; // Track the ephemeral WAV file for cleanup
 
 static void on_multitrack_mode_toggled(GtkToggleButton *button, gpointer user_data);
 static GtkWidget *btn_load_session = NULL;
@@ -56,8 +56,7 @@ static void on_file_chosen(GObject *source_object, GAsyncResult *res, gpointer u
     }
 }
 
-void on_select_track_clicked(GtkButton *button, gpointer window) {
-    (void)button;
+static void execute_load_track_dialog(GtkWidget *window) {
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "Select Media Track");
 
@@ -94,7 +93,7 @@ static void on_muxer_finished(GPid pid, gint status, gpointer user_data) {
     else gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Muxing Failed (FFmpeg Error)");
     gtk_widget_set_sensitive(btn_save_mux, TRUE);
 
-    // NEW: Wipe the temporary audio file from the /tmp partition
+    // Wipe the temporary audio file from the /tmp partition
     if (strlen(temp_wav_path) > 0) {
         remove(temp_wav_path);
         temp_wav_path[0] = '\0';
@@ -134,13 +133,13 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         base_no_ext[len - 4] = '\0';
     }
 
-    bool is_looper = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+    bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
     char raw_path[1024];
     char mix_path[1024];
     snprintf(raw_path, sizeof(raw_path), "%s/%s-RAW.mkv", dir, base_no_ext);
     snprintf(mix_path, sizeof(mix_path), "%s/%s-MIX.mkv", dir, base_no_ext);
 
-    // FIX: Write to the tracked global string so it can be deleted later
+    // Write to the tracked global string so it can be deleted later
     snprintf(temp_wav_path, sizeof(temp_wav_path), "/tmp/%s-RAW.wav", base_no_ext);
 
     time_t t = time(NULL);
@@ -159,7 +158,7 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         end_f = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
     }
 
-    if (is_looper) {
+    if (is_multitrack) {
         SF_INFO sfinfo = {0};
         sfinfo.channels = 2;
         sfinfo.samplerate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
@@ -169,25 +168,16 @@ static void on_save_mux_file_chosen(GObject *source_object, GAsyncResult *res, g
         size_t frames_to_write = end_f - start_f;
 
         if (outfile && frames_to_write > 0) {
-            int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
-            float *mix_buf = calloc(frames_to_write * 2, sizeof(float));
-            if (mix_buf) {
-                if (await_rt_thread_detach()) {
-                    for (int l = 0; l < active && l < MAX_TRACKS; l++) {
-                        if (multitrack_tracks[l]) {
-                            for (size_t i = 0; i < frames_to_write; i++) {
-                                mix_buf[i * 2] += multitrack_tracks[l][(start_f + i) * 2];
-                                mix_buf[i * 2 + 1] += multitrack_tracks[l][(start_f + i) * 2 + 1];
-                            }
-                        }
-                    }
-                    resume_rt_thread();
-                }
+            float *mix_buf = NULL;
 
-                for (size_t i = 0; i < frames_to_write * 2; i++) {
-                    if (mix_buf[i] > 1.0f) mix_buf[i] = 1.0f;
-                    else if (mix_buf[i] < -1.0f) mix_buf[i] = -1.0f;
-                }
+            // Delegate the heavy lifting to the mathematically accurate unified DSP engine
+            if (await_rt_thread_detach()) {
+                extern float* render_mixdown_region(size_t, size_t);
+                mix_buf = render_mixdown_region(start_f, end_f);
+                resume_rt_thread();
+            }
+
+            if (mix_buf) {
                 sf_writef_float(outfile, mix_buf, frames_to_write);
                 free(mix_buf);
             }
@@ -344,6 +334,9 @@ static void on_save_session_file_chosen(GObject *source_object, GAsyncResult *re
 
             gtk_widget_remove_css_class(btn_save_mux, "needs-save");
             gtk_widget_remove_css_class(btn_save_session, "needs-save");
+
+            ui_state.is_existing_session = true;
+            ui_state.session_is_dirty = false;
         } else {
             gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Failed to save session.");
         }
@@ -401,7 +394,8 @@ static void load_session_ready(GObject *source_object, GAsyncResult *res, gpoint
     gtk_spinner_stop(GTK_SPINNER(main_spinner));
 
     if (load_status >= 0) {
-        ui_state.session_is_dirty = true;
+        ui_state.is_existing_session = true;
+        ui_state.session_is_dirty = false; // Freshly loaded from disk, so it's clean
 
         // 1. Force Engine into Multitrack Mode FIRST to ensure cache builder reads correct flags
         if (!atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
@@ -420,7 +414,6 @@ static void load_session_ready(GObject *source_object, GAsyncResult *res, gpoint
         update_playlist_toggle_state();
 
         // 2. Refresh UI elements
-        extern void refresh_multitrack_tracks_ui(void);
         refresh_multitrack_tracks_ui();
         extern void update_multitrack_status_ui(void);
         update_multitrack_status_ui();
@@ -475,9 +468,8 @@ void command_post_load_session(const char *path) {
     extern _Atomic size_t backing_track_frames;
     atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
 
-    extern _Atomic bool track_has_audio[12];
     for (int i = 0; i < 12; i++) {
-        atomic_store_explicit(&track_has_audio[i], false, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
     }
 
     gtk_spinner_start(GTK_SPINNER(main_spinner));
@@ -512,8 +504,33 @@ static void on_load_session_file_chosen(GObject *source_object, GAsyncResult *re
     }
 }
 
-static void on_load_session_clicked(GtkButton *button, gpointer user_data) {
+static void on_load_track_overwrite_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        execute_load_track_dialog(GTK_WIDGET(user_data));
+    }
+}
+
+void on_select_track_clicked(GtkButton *button, gpointer window) {
     (void)button;
+    bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+
+    // Destructive only if NOT in multitrack mode (multitrack safely imports as a layer)
+    if (!is_multitrack && ui_state.session_is_dirty && pristine_frames > 0) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Discard Active Recording?");
+        gtk_alert_dialog_set_detail(alert, "Loading a new track will discard your current unsaved recording. Continue?");
+        const char *buttons[] = { "Discard & Load", "Cancel", NULL };
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 1);
+        gtk_alert_dialog_set_default_button(alert, 1);
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(window), NULL, on_load_track_overwrite_confirm, window);
+    } else {
+        execute_load_track_dialog(GTK_WIDGET(window));
+    }
+}
+
+// --- LOAD SESSION INTERCEPTION ---
+static void execute_load_session_dialog(GtkWidget *window) {
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "Load Multi-Track Session");
     GtkFileFilter *filter = gtk_file_filter_new();
@@ -529,7 +546,29 @@ static void on_load_session_clicked(GtkButton *button, gpointer user_data) {
         g_object_unref(initial_folder);
     }
     g_object_unref(filter); g_object_unref(filters);
-    gtk_file_dialog_open(dialog, GTK_WINDOW(user_data), NULL, on_load_session_file_chosen, NULL);
+    gtk_file_dialog_open(dialog, GTK_WINDOW(window), NULL, on_load_session_file_chosen, NULL);
+}
+
+static void on_load_session_overwrite_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        execute_load_session_dialog(GTK_WIDGET(user_data));
+    }
+}
+
+static void on_load_session_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    if (ui_state.session_is_dirty && pristine_frames > 0) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Active Session?");
+        gtk_alert_dialog_set_detail(alert, "Loading a new session will discard your currently recorded, unsaved audio. Continue?");
+        const char *buttons[] = { "Discard & Load", "Cancel", NULL };
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 1);
+        gtk_alert_dialog_set_default_button(alert, 1);
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(user_data), NULL, on_load_session_overwrite_confirm, user_data);
+    } else {
+        execute_load_session_dialog(GTK_WIDGET(user_data));
+    }
 }
 
 static void on_multitrack_mode_toggled(GtkToggleButton *button, gpointer user_data) {

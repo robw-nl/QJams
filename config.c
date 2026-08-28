@@ -11,7 +11,12 @@
  * @return A populated QJamsConfig structure.
  */
 QJamsConfig load_qjams_config(const char* filepath) {
-    const char *home_dir = g_get_home_dir(); // Dynamically fetch /home/username
+    // Dynamically fetch OS-standard Music directory, fallback to Home
+    const char *target_dir = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
+    if (!target_dir) target_dir = g_get_home_dir();
+
+    char default_dir[512];
+    snprintf(default_dir, sizeof(default_dir), "%s/QJams", target_dir);
 
     QJamsConfig config = {
         .input_gain_multiplier = 1.0f,
@@ -33,8 +38,8 @@ QJamsConfig load_qjams_config(const char* filepath) {
         .num_audio_profiles = 0
     };
 
-    strncpy(config.last_track_dir, home_dir, sizeof(config.last_track_dir) - 1);
-    strncpy(config.recordings_dir, home_dir, sizeof(config.recordings_dir) - 1);
+    strncpy(config.last_track_dir, default_dir, sizeof(config.last_track_dir) - 1);
+    strncpy(config.recordings_dir, default_dir, sizeof(config.recordings_dir) - 1);
 
     FILE *file = fopen(filepath, "r");
     if (!file) return config;

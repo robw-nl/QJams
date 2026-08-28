@@ -28,14 +28,10 @@
 // UI -> RT Communication (Aligned to 64 bytes to prevent false sharing with RT writes)
 /** Destructive pre-buffer multiplier applied directly to incoming hardware samples before writing to memory. */
 alignas(64) static _Atomic float input_gain = 1.0f;
+
 /** Master output multiplier applied dynamically during real-time playback. */
 static _Atomic float bt_gain = 1.0f;
-/** Non-destructive post-buffer multipliers applied dynamically to individual tracks during playback. */
-_Atomic float multitrack_track_gains[MAX_TRACKS] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 _Atomic float playback_speed = 1.0f;
-
-_Atomic bool track_has_audio[MAX_TRACKS] = {false};
-_Atomic bool track_has_undo[MAX_TRACKS] = {false};
 
 _Atomic bool engine_is_recording = false;
 _Atomic bool engine_is_armed = false;
@@ -73,13 +69,19 @@ static _Atomic bool stretcher_keep_running = false;
 static _Atomic bool stretcher_flush_request = false;
 static _Atomic bool stretcher_ratio_update = false;
 
-// Multi-Track Looper Engine State
-float *multitrack_tracks[MAX_TRACKS] = {NULL};
-float *undo_tracks[MAX_TRACKS] = {NULL};
-_Atomic bool track_is_soloed[MAX_TRACKS] = {false};
+// Multi-Track Multitrack Engine State
+QJTrackBuffer master_tracks[MAX_TRACKS] = {
+    { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f },
+    { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f },
+    { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }
+};
+
+float *clipboard_buffers[MAX_TRACKS] = {NULL};
+size_t clipboard_frames = 0;
+_Atomic uint32_t selected_tracks_mask = 1;
+
 _Atomic int active_track_count = 0;
 _Atomic int current_recording_track = 0;
-_Atomic bool is_multitrack_mode = false;
 
 atomic_size_t backing_track_frames = 0; // Dynamic tracking for UI playhead completion
 alignas(64) atomic_size_t playback_pos = 0;
@@ -96,11 +98,64 @@ _Atomic bool request_track_free = false;
 _Atomic bool safe_to_free_track = false;
 _Atomic bool stretcher_safe_to_free = false;
 
+// --- GLOBAL RT ANOMALY COUNTERS ---
+_Atomic uint32_t rt_dropped_audio_frames = 0;
+_Atomic uint32_t rt_cmd_queue_full = 0;
+
+/**
+ * @brief GTK idle callback to safely free memory on the UI thread.
+ * @param data Pointer to the memory block.
+ * @return G_SOURCE_REMOVE
+ */
+static gboolean deferred_free_cb(gpointer data) {
+    printf("[MEM-TEARDOWN] Deferred release: Pointer=%p\n", data);
+    free(data);
+    return G_SOURCE_REMOVE;
+}
+
+/**
+ * @brief Defers memory deallocation to the GTK main loop, preventing Use-After-Free crashes during drawing.
+ * @param ptr Pointer to the memory block to free.
+ */
+static inline void safe_deferred_free(void *ptr) {
+    if (ptr) g_idle_add(deferred_free_cb, ptr);
+}
+
+/**
+ * @brief GTK idle callback to safely destroy a RubberBand state on the UI thread.
+ * @param data Pointer to the RubberBandState.
+ * @return G_SOURCE_REMOVE
+ */
+static gboolean deferred_rb_free_cb(gpointer data) {
+    printf("[MEM-TEARDOWN] Deferred release: RubberBandState=%p\n", data);
+    rubberband_delete((RubberBandState)data);
+    return G_SOURCE_REMOVE;
+}
+
+/**
+ * @brief Defers RubberBand state destruction to the GTK main loop.
+ * @param rb The RubberBandState to destroy.
+ */
+static inline void safe_deferred_rb_free(RubberBandState rb) {
+    if (rb) g_idle_add(deferred_rb_free_cb, rb);
+}
+
+/** Serializes access to the RT detachment barrier to prevent UI and background thread collisions. */
+static pthread_mutex_t dsp_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /**
  * @brief Centralized synchronization barrier. Requests all DSP threads (RT and Stretcher) to detach from active memory buffers and spins until safe.
  * @return true if both threads successfully detached, false if the operation timed out.
  */
 bool await_rt_thread_detach(void) {
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+    pthread_mutex_lock(&dsp_barrier_mutex);
+
+    atomic_store_explicit(&safe_to_free_track, false, memory_order_relaxed);
+    atomic_store_explicit(&stretcher_safe_to_free, false, memory_order_relaxed);
+
     atomic_store_explicit(&request_track_free, true, memory_order_release);
     int timeout = 500;
     while ((!atomic_load_explicit(&safe_to_free_track, memory_order_acquire) ||
@@ -110,13 +165,16 @@ bool await_rt_thread_detach(void) {
         }
 
         if (timeout == 0) {
-            printf("CRITICAL: DSP Barrier Timeout. Aborting safe memory swap to prevent deadlock.\n");
-            // Failsafe: Reset flags so the RT engine doesn't remain muted forever
+            printf("[DSP-SYNC:CRITICAL] Detach Timeout (500ms). Handshake aborted.\n");
             atomic_store_explicit(&request_track_free, false, memory_order_release);
-            atomic_store_explicit(&safe_to_free_track, false, memory_order_relaxed);
-            atomic_store_explicit(&stretcher_safe_to_free, false, memory_order_relaxed);
+            pthread_mutex_unlock(&dsp_barrier_mutex);
             return false;
         }
+
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+        (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
+        printf("[DSP-SYNC] Detached in %.2fms (Threads: RT=ACK, Stretcher=ACK)\n", elapsed_ms);
 
         return true;
 }
@@ -128,10 +186,72 @@ void resume_rt_thread(void) {
     atomic_store_explicit(&safe_to_free_track, false, memory_order_relaxed);
     atomic_store_explicit(&stretcher_safe_to_free, false, memory_order_relaxed);
     atomic_store_explicit(&request_track_free, false, memory_order_release);
+    pthread_mutex_unlock(&dsp_barrier_mutex);
 }
 
-// Forward declaration to resolve implicit usage in load_audio_ffmpeg
-static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, int target_rate);
+/**
+ * @brief Dynamically calculates if the system has enough available physical memory
+ * to safely load and pre-allocate recording buffers for the requested track.
+ * @param source_frames Total frames in the source file.
+ * @param source_rate Sample rate of the source file.
+ * @param target_rate The active JACK hardware sample rate.
+ * @return true if safe to load, false if it exceeds safe RAM limits.
+ */
+static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, int target_rate) {
+    if (source_rate <= 0 || target_rate <= 0) return false;
+
+    double ratio = (double)target_rate / (double)source_rate;
+    size_t pristine_frames_est = (size_t)(source_frames * ratio);
+
+    size_t pristine_bytes = pristine_frames_est * 2 * sizeof(float);
+    size_t layer_bytes = pristine_frames_est * 2 * sizeof(float);
+    size_t total_required_bytes = pristine_bytes + (layer_bytes * MAX_TRACKS * 2);
+
+    size_t available_ram = 0;
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo) {
+        char line[256];
+        while (fgets(line, sizeof(line), meminfo)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                long long avail_kb;
+                if (sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) {
+                    available_ram = (size_t)avail_kb * 1024;
+                }
+                break;
+            }
+        }
+        fclose(meminfo);
+    }
+
+    if (available_ram == 0) {
+        long pages = sysconf(_SC_AVPHYS_PAGES);
+        long page_size = sysconf(_SC_PAGE_SIZE);
+        if (pages < 0 || page_size < 0) return true;
+        available_ram = (size_t)pages * (size_t)page_size;
+    }
+
+    size_t currently_held_bytes = 0;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (master_tracks[i].active_buffer) currently_held_bytes += pristine_frames * 2 * sizeof(float);
+        if (master_tracks[i].undo_buffer) currently_held_bytes += pristine_frames * 2 * sizeof(float);
+    }
+    available_ram += currently_held_bytes;
+
+    size_t absolute_cap_bytes = 40ULL * 1024 * 1024 * 1024;
+    size_t dynamic_cap_bytes = (available_ram * 85) / 100;
+    size_t final_cap = (dynamic_cap_bytes < absolute_cap_bytes) ? dynamic_cap_bytes : absolute_cap_bytes;
+
+    if (total_required_bytes > final_cap) {
+        printf("[MEM-GATE] Track allocation: Req=%.1f MB | Available=%.1f MB | Result=FAIL\n",
+               (double)total_required_bytes / (1024 * 1024), (double)final_cap / (1024 * 1024));
+        return false;
+    }
+
+    printf("[MEM-GATE] Track allocation: Req=%.1f MB | Available=%.1f MB | Result=PASS\n",
+           (double)total_required_bytes / (1024 * 1024), (double)final_cap / (1024 * 1024));
+    return true;
+}
+
 /**
  * @brief Drains all available frames from the provided decoder context and extracts them as normalized interleaved floats.
  * Dynamically resizes the destination buffer if the extracted samples exceed current capacity.
@@ -284,17 +404,19 @@ static int load_audio_ffmpeg(const char* filepath, float** out_raw, sf_count_t* 
         if (pkt->stream_index == stream_idx1) {
             if (avcodec_send_packet(codec_ctx1, pkt) == 0) {
                 if (drain_and_extract_frames(codec_ctx1, frame, &raw_buf1, &capacity1, &total_samples1, channels) < 0) {
+                    av_packet_unref(pkt); // Prevent leak on abort
                     goto loop_cleanup;
                 }
             }
         } else if (codec_ctx2 && pkt->stream_index == stream_idx2) {
             if (avcodec_send_packet(codec_ctx2, pkt) == 0) {
                 if (drain_and_extract_frames(codec_ctx2, frame, &raw_buf2, &capacity2, &total_samples2, ch2) < 0) {
+                    av_packet_unref(pkt); // Prevent leak on abort
                     goto loop_cleanup;
                 }
             }
         }
-        av_packet_unref(pkt);
+        av_packet_unref(pkt); // Safely drops the internal payload
     }
 
     /**
@@ -462,7 +584,14 @@ static void* stretcher_loop(void* arg) {
     return NULL;
 }
 
-// Runs at SCHED_FIFO priority. Absolutely no blocking calls permitted here.
+/**
+* @brief Core lock-free audio processing loop running at SCHED_FIFO priority.
+* Iterates through the unified master_tracks struct array to perform real-time mixing,
+* routing, and encoding without memory allocation or blocking calls.
+* @param nframes Number of frames to process.
+* @param arg Opaque user data.
+* @return 0 on success.
+*/
 int process_audio(jack_nframes_t nframes, void *arg) {
     (void)arg;
 
@@ -557,18 +686,32 @@ int process_audio(jack_nframes_t nframes, void *arg) {
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
 
+    bool is_looping = atomic_load_explicit(&loop_active, memory_order_acquire);
+    size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
+    size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
+    size_t active_pos = current_pos;
+
     for (jack_nframes_t i = 0; i < nframes; i++) {
+        if (active && !paused && is_looping && active_pos >= l_end) {
+            active_pos = l_start + (active_pos - l_end);
+
+            size_t target_pristine = (size_t)(((double)active_pos / (double)backing_track_frames) * pristine_frames);
+            atomic_store_explicit(&pristine_read_pos, target_pristine, memory_order_release);
+            atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+            atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+        }
+
         float raw_bt_l = 0.0f;
         float raw_bt_r = 0.0f;
 
         if (active && !paused) {
             float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
-            float l0_gain = atomic_load_explicit(&is_multitrack_mode, memory_order_relaxed) ? atomic_load_explicit(&multitrack_track_gains[0], memory_order_relaxed) : 1.0f;
+            float l0_gain = atomic_load_explicit(&master_tracks[0].gain, memory_order_relaxed);
 
-            if (current_speed == 1.0f && atomic_load_explicit(&is_multitrack_mode, memory_order_relaxed) && multitrack_tracks[0]) {
-                if ((current_pos + i) < pristine_frames) {
-                    raw_bt_l = multitrack_tracks[0][(current_pos + i) * 2] * l0_gain;
-                    raw_bt_r = multitrack_tracks[0][(current_pos + i) * 2 + 1] * l0_gain;
+            if (current_speed == 1.0f && master_tracks[0].active_buffer) {
+                if (active_pos < pristine_frames) {
+                    raw_bt_l = master_tracks[0].active_buffer[active_pos * 2] * l0_gain;
+                    raw_bt_r = master_tracks[0].active_buffer[active_pos * 2 + 1] * l0_gain;
                 }
             } else {
                 StereoFrame sf;
@@ -583,15 +726,15 @@ int process_audio(jack_nframes_t nframes, void *arg) {
 
         bool any_solo_active = false;
         for (int l = 0; l < MAX_TRACKS; l++) {
-            if (atomic_load_explicit(&track_is_soloed[l], memory_order_relaxed)) {
+            if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
                 any_solo_active = true;
                 break;
             }
         }
 
-        if (active && !paused && (current_pos + i) < backing_track_frames) {
+        if (active && !paused && active_pos < backing_track_frames) {
             bool base_audible = true;
-            if (any_solo_active && !atomic_load_explicit(&track_is_soloed[0], memory_order_relaxed)) base_audible = false;
+            if (any_solo_active && !atomic_load_explicit(&master_tracks[0].is_soloed, memory_order_relaxed)) base_audible = false;
 
             if (!base_audible) {
                 raw_bt_l = 0.0f;
@@ -599,17 +742,33 @@ int process_audio(jack_nframes_t nframes, void *arg) {
             }
 
             for (int l = 1; l < layers && l < MAX_TRACKS; l++) {
-                if (!multitrack_tracks[l]) continue;
+                if (!master_tracks[l].active_buffer) continue;
 
                 bool overdub_audible = true;
-                if (any_solo_active && !atomic_load_explicit(&track_is_soloed[l], memory_order_relaxed)) overdub_audible = false;
+                if (any_solo_active && !atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) overdub_audible = false;
 
-                if (overdub_audible && (current_pos + i) < pristine_frames) {
-                    float l_gain = atomic_load_explicit(&multitrack_track_gains[l], memory_order_relaxed);
-                    raw_bt_l += multitrack_tracks[l][(current_pos + i) * 2] * l_gain;
-                    raw_bt_r += multitrack_tracks[l][(current_pos + i) * 2 + 1] * l_gain;
+                if (overdub_audible && active_pos < pristine_frames) {
+                    float l_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
+                    raw_bt_l += master_tracks[l].active_buffer[active_pos * 2] * l_gain;
+                    raw_bt_r += master_tracks[l].active_buffer[active_pos * 2 + 1] * l_gain;
                 }
             }
+        }
+
+        // ---------------------------------------------------------
+        // REAL-TIME PLAYBACK DE-CLICKER
+        // Applies a 2.6ms (128 sample) V-fade perfectly straddling
+        // the loop boundary to mask zero-crossing waveform pops.
+        // ---------------------------------------------------------
+        if (active && !paused && is_looping && l_end > l_start + 256) {
+            float fade_mult = 1.0f;
+            if (active_pos >= l_end - 128) {
+                fade_mult = (float)(l_end - active_pos) / 128.0f;
+            } else if (active_pos < l_start + 128) {
+                fade_mult = (float)(active_pos - l_start) / 128.0f;
+            }
+            raw_bt_l *= fade_mult;
+            raw_bt_r *= fade_mult;
         }
 
         float scaled_bt_l = raw_bt_l * current_bt_gain;
@@ -629,22 +788,27 @@ int process_audio(jack_nframes_t nframes, void *arg) {
         if (fabsf(scaled_input_l) > max_l) max_l = fabsf(scaled_input_l);
         if (fabsf(scaled_input_r) > max_r) max_r = fabsf(scaled_input_r);
 
-        if (recording && !paused && (current_pos + i) < pristine_frames) {
+        if (recording && !paused && active_pos < pristine_frames) {
             int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
-            // ALWAYS route audio to the active multitrack layer to allow Video Mode overdubs
-            if (rec_track >= 0 && rec_track < MAX_TRACKS && multitrack_tracks[rec_track]) {
-                multitrack_tracks[rec_track][(current_pos + i) * 2] = scaled_input_l;
-                multitrack_tracks[rec_track][(current_pos + i) * 2 + 1] = scaled_input_r;
+            if (rec_track >= 0 && rec_track < MAX_TRACKS && master_tracks[rec_track].active_buffer) {
+                master_tracks[rec_track].active_buffer[active_pos * 2] = scaled_input_l;
+                master_tracks[rec_track].active_buffer[active_pos * 2 + 1] = scaled_input_r;
             }
 
             AudioFrame *frame = acquire_audio_frame(&audio_queue);
             if (frame) {
                 frame->mix_l = soft_clip(scaled_bt_l + scaled_input_l);
                 frame->mix_r = soft_clip(scaled_bt_r + scaled_input_r);
-                frame->pts = (int64_t)(cycle_start_time + i); // Lock payload perfectly to the hardware clock
+                frame->pts = (int64_t)(cycle_start_time + i);
                 commit_audio_frame(&audio_queue);
                 wake_encoder();
+            } else {
+                atomic_fetch_add_explicit(&rt_dropped_audio_frames, 1, memory_order_relaxed);
             }
+        }
+
+        if (active && !paused) {
+            active_pos++;
         }
     }
 
@@ -654,22 +818,9 @@ int process_audio(jack_nframes_t nframes, void *arg) {
     update_peak_decay(&vu_peak_bt_r, max_bt_r);
 
     if (active && !paused) {
-        size_t next_pos = current_pos + nframes;
-        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
-            size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
-            if (next_pos >= l_end) {
-                size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
-                next_pos = l_start + (next_pos - l_end);
-
-                size_t target_pristine = (size_t)(((double)next_pos / (double)backing_track_frames) * pristine_frames);
-                atomic_store_explicit(&pristine_read_pos, target_pristine, memory_order_release);
-
-                atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-            }
-        }
-        atomic_store_explicit(&playback_pos, next_pos, memory_order_release);
+        atomic_store_explicit(&playback_pos, active_pos, memory_order_release);
     }
+
     return 0;
 }
 
@@ -846,77 +997,6 @@ void jack_port_registration_cb(jack_port_id_t port_id, int register_port, void *
 }
 
 /**
- * @brief Dynamically calculates if the system has enough available physical memory
- * to safely load and pre-allocate recording buffers for the requested track.
- * @param source_frames Total frames in the source file.
- * @param source_rate Sample rate of the source file.
- * @param target_rate The active JACK hardware sample rate.
- * @return true if safe to load, false if it exceeds safe RAM limits.
- */
-static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, int target_rate) {
-    if (source_rate <= 0 || target_rate <= 0) return false;
-
-    // Calculate the exact frame count after resampling
-    double ratio = (double)target_rate / (double)source_rate;
-    size_t pristine_frames_est = (size_t)(source_frames * ratio);
-
-    // Calculate total required memory footprint: Pristine + 6 Full-Length Looper Layers + 6 Undo Buffers (Stereo Floats)
-    size_t pristine_bytes = pristine_frames_est * 2 * sizeof(float);
-    size_t layer_bytes = pristine_frames_est * 2 * sizeof(float);
-    size_t total_required_bytes = pristine_bytes + (layer_bytes * MAX_TRACKS * 2);
-
-    // Query Linux for currently available physical RAM using /proc/meminfo
-    size_t available_ram = 0;
-    FILE *meminfo = fopen("/proc/meminfo", "r");
-    if (meminfo) {
-        char line[256];
-        while (fgets(line, sizeof(line), meminfo)) {
-            if (strncmp(line, "MemAvailable:", 13) == 0) {
-                long long avail_kb;
-                if (sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) {
-                    available_ram = (size_t)avail_kb * 1024;
-                }
-                break;
-            }
-        }
-        fclose(meminfo);
-    }
-
-    // Fallback to sysconf if MemAvailable is missing
-    if (available_ram == 0) {
-        long pages = sysconf(_SC_AVPHYS_PAGES);
-        long page_size = sysconf(_SC_PAGE_SIZE);
-        if (pages < 0 || page_size < 0) return true;
-        available_ram = (size_t)pages * (size_t)page_size;
-    }
-    // Add back the memory currently held by the 12 active and 12 undo arrays
-    // as it will be freed and recycled by the new track allocation
-    size_t currently_held_bytes = 0;
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i]) currently_held_bytes += pristine_frames * 2 * sizeof(float);
-        if (undo_tracks[i]) currently_held_bytes += pristine_frames * 2 * sizeof(float);
-    }
-    available_ram += currently_held_bytes;
-
-    // 1. Calculate an absolute maximum RAM cap (e.g., 40 GB) to prevent FFmpeg decode hangs
-    size_t absolute_cap_bytes = 40ULL * 1024 * 1024 * 1024; // 40 GB
-
-    // 2. Allow up to 85% of currently available physical RAM (raised from 50%)
-    size_t dynamic_cap_bytes = (available_ram * 85) / 100;
-
-    size_t final_cap = (dynamic_cap_bytes < absolute_cap_bytes) ? dynamic_cap_bytes : absolute_cap_bytes;
-
-    // Reject if the track demands more than the allowed threshold
-    if (total_required_bytes > final_cap) {
-        printf("Error: Track requires %zu MB, but max allowed is %zu MB.\n",
-               total_required_bytes / (1024 * 1024), final_cap / (1024 * 1024));
-        return false;
-    }
-
-    return true;
-}
-
-/**
  * @brief Resamples a generic interleaved float audio stream using a configured SwrContext.
  * Processes data in chunks to bound memory usage and completely flushes the resampler at EOF.
  * @param swr_ctx The configured FFmpeg software resampler context.
@@ -969,8 +1049,7 @@ static void resample_stream(SwrContext *swr_ctx, const float *in_data, sf_count_
 
 /**
  * @brief Decodes an audio file and safely imports it into a specific multitrack layer.
- * Enforces Strict Bounding: truncates long files and zero-pads short files to match pristine_frames.
- * Uses the centralized atomic handshake to safely swap the memory pointer.
+ * @warning CRITICAL: Pointer swapping must occur exclusively while the RT thread is detached to prevent use-after-free faults.
  * @param filepath The absolute path to the audio file.
  * @param track_idx The target layer index (0 to MAX_TRACKS - 1).
  * @return 0 on success, -1 on format error, -2 on memory failure, -3 on corrupt media.
@@ -982,9 +1061,17 @@ int import_to_layer(const char* filepath, int track_idx) {
     float* raw_data = NULL;
     jack_nframes_t jack_rate = jack_get_sample_rate(client);
 
-    SNDFILE *file = sf_open(filepath, SFM_READ, &sfinfo);
+    SNDFILE *file = NULL;
+    if (!g_str_has_suffix(filepath, ".mp3") && !g_str_has_suffix(filepath, ".MP3")) {
+        file = sf_open(filepath, SFM_READ, &sfinfo);
+    }
+
     if (file) {
         raw_data = calloc(sfinfo.frames * sfinfo.channels, sizeof(float));
+        if (!raw_data) {
+            sf_close(file);
+            return -2;
+        }
         sf_readf_float(file, raw_data, sfinfo.frames);
         sf_close(file);
     } else {
@@ -1005,6 +1092,12 @@ int import_to_layer(const char* filepath, int track_idx) {
 
     double ratio = (double)jack_rate / (double)sfinfo.samplerate;
     size_t resampled_frames = (size_t)(sfinfo.frames * ratio);
+
+    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+    if (current_pos + resampled_frames > pristine_frames) {
+        int required_seconds = (int)((current_pos + resampled_frames) / jack_rate) + 1;
+        resize_loop_canvas_seconds(required_seconds);
+    }
 
     float* new_layer_buf = calloc(pristine_frames * 2, sizeof(float));
     float* src_out = calloc(resampled_frames * 2, sizeof(float));
@@ -1034,7 +1127,6 @@ int import_to_layer(const char* filepath, int track_idx) {
     swr_free(&swr_ctx);
     free(raw_data);
 
-    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
     int truncated = 0;
     size_t frames_to_copy = resampled_frames;
 
@@ -1053,10 +1145,12 @@ int import_to_layer(const char* filepath, int track_idx) {
         return -1;
     }
 
-    float *old_undo = undo_tracks[track_idx];
-    undo_tracks[track_idx] = multitrack_tracks[track_idx];
-    multitrack_tracks[track_idx] = new_layer_buf;
-    if (old_undo) free(old_undo);
+    bool prev_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
+
+    float *old_undo = master_tracks[track_idx].undo_buffer;
+    master_tracks[track_idx].undo_buffer = master_tracks[track_idx].active_buffer;
+    master_tracks[track_idx].active_buffer = new_layer_buf;
+    if (old_undo) safe_deferred_free(old_undo);
 
     if (track_idx == 0 && pristine_bt_buf) {
         memcpy(pristine_bt_buf, new_layer_buf, pristine_frames * 2 * sizeof(float));
@@ -1069,23 +1163,68 @@ int import_to_layer(const char* filepath, int track_idx) {
         atomic_store_explicit(&active_track_count, track_idx + 1, memory_order_release);
     }
 
-    atomic_store_explicit(&track_has_audio[track_idx], true, memory_order_release);
-    atomic_store_explicit(&track_is_soloed[track_idx], true, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].has_audio, true, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].is_soloed, true, memory_order_release);
+
+    atomic_store_explicit(&master_tracks[track_idx].undo_has_audio, prev_audio, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].has_undo, true, memory_order_release);
+
+    // Auto-focus the newly imported track into the bitmask so Ctrl+Z works immediately
+    atomic_store_explicit(&current_recording_track, track_idx, memory_order_release);
+    atomic_store_explicit(&selected_tracks_mask, (1 << track_idx), memory_order_release);
 
     resume_rt_thread();
+
+    // TELEMETRY: Safely emit the decode summary
+    char *base_name = g_path_get_basename(filepath);
+    printf("[IO-DECODE] Loaded: \"%s\" | Track %d | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=%s\n",
+           base_name, track_idx, sfinfo.samplerate, jack_rate, ratio, resampled_frames, truncated ? "TRUNCATED" : "OK");
+    g_free(base_name);
 
     return truncated ? 1 : 0;
 }
 
 /**
  * @brief Loads an audio file, resamples it to match the JACK sample rate, and initializes the RubberBand stretcher.
- * Utilizes the centralized lock-free atomic handshake to detach the RT thread safely before swapping memory maps.
+ * @warning CRITICAL: Memory allocations occur outside the barrier. Array assignments swap pointers atomically inside the barrier.
  * @param filepath The absolute path to the audio file.
  * @param client_ptr Pointer to the active JACK client.
  * @return 0 on success, -1 on format error, -2 if RAM check fails, -3 on corrupt decode.
  */
 int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     if (!client_ptr) return -1;
+
+    // --- RT-SAFE POINTER STEALING ---
+    float* stolen_pristine = NULL;
+    float* stolen_active[MAX_TRACKS] = {NULL};
+    float* stolen_undo[MAX_TRACKS] = {NULL};
+    RubberBandState stolen_rb = NULL;
+
+    if (await_rt_thread_detach()) {
+        stolen_pristine = pristine_bt_buf;
+        pristine_bt_buf = NULL;
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            stolen_active[i] = master_tracks[i].active_buffer;
+            stolen_undo[i] = master_tracks[i].undo_buffer;
+            master_tracks[i].active_buffer = NULL;
+            master_tracks[i].undo_buffer = NULL;
+        }
+        stolen_rb = rt_rb_state;
+        rt_rb_state = NULL;
+        pristine_frames = 0;
+        atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
+        resume_rt_thread();
+    } else {
+        return -1;
+    }
+
+    if (stolen_pristine) safe_deferred_free(stolen_pristine);
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (stolen_active[i]) safe_deferred_free(stolen_active[i]);
+        if (stolen_undo[i]) safe_deferred_free(stolen_undo[i]);
+    }
+    if (stolen_rb) safe_deferred_rb_free(stolen_rb);
+
     SF_INFO sfinfo = {0};
     float* raw_data = NULL;
     float* raw_data2 = NULL;
@@ -1093,14 +1232,21 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
 
     jack_nframes_t jack_rate = jack_get_sample_rate(client_ptr);
 
-    SNDFILE *file = sf_open(filepath, SFM_READ, &sfinfo);
+    SNDFILE *file = NULL;
+    if (!g_str_has_suffix(filepath, ".mp3") && !g_str_has_suffix(filepath, ".MP3")) {
+        file = sf_open(filepath, SFM_READ, &sfinfo);
+    }
+
     if (file) {
         if (!is_ram_allocation_safe(sfinfo.frames, sfinfo.samplerate, jack_rate)) {
             sf_close(file);
             return -2;
         }
-
         raw_data = calloc(sfinfo.frames * sfinfo.channels, sizeof(float));
+        if (!raw_data) {
+            sf_close(file);
+            return -2;
+        }
         sf_readf_float(file, raw_data, sfinfo.frames);
         sf_close(file);
     } else {
@@ -1167,15 +1313,16 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     int rb_options = RubberBandOptionProcessRealTime | RubberBandOptionEngineFiner | RubberBandOptionPitchHighQuality | RubberBandOptionPhaseIndependent | RubberBandOptionWindowLong | RubberBandOptionPitchHighConsistency;
     RubberBandState new_rb_state = rubberband_new(jack_rate, 2, rb_options, 1.0, 1.0);
 
-    float* new_multitrack_tracks[MAX_TRACKS] = {NULL};
-    float* new_undo_tracks[MAX_TRACKS] = {NULL};
+    float* temp_active[MAX_TRACKS] = {NULL};
+    float* temp_undo[MAX_TRACKS] = {NULL};
+
     for (int i = 0; i < MAX_TRACKS; i++) {
-        new_multitrack_tracks[i] = calloc(new_pristine_frames * 2, sizeof(float));
-        new_undo_tracks[i] = calloc(new_pristine_frames * 2, sizeof(float));
-        if (!new_multitrack_tracks[i] || !new_undo_tracks[i]) {
+        temp_active[i] = calloc(new_pristine_frames * 2, sizeof(float));
+        temp_undo[i] = calloc(new_pristine_frames * 2, sizeof(float));
+        if (!temp_active[i] || !temp_undo[i]) {
             for (int j = 0; j <= i; j++) {
-                if (new_multitrack_tracks[j]) free(new_multitrack_tracks[j]);
-                if (new_undo_tracks[j]) free(new_undo_tracks[j]);
+                if (temp_active[j]) free(temp_active[j]);
+                if (temp_undo[j]) free(temp_undo[j]);
             }
             free(new_pristine_buf);
             if (src_out) free(src_out);
@@ -1188,16 +1335,15 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     }
 
     for (size_t i = 0; i < new_pristine_frames * 2; i++) {
-        new_multitrack_tracks[0][i] = src_out[i];
+        temp_active[0][i] = src_out[i];
     }
 
     free(src_out);
     free(raw_data);
 
-    // Route dual-audio containers natively into Track 2
     if (src_out2) {
         for (size_t i = 0; i < new_pristine_frames * 2; i++) {
-            new_multitrack_tracks[1][i] = src_out2[i];
+            temp_active[1][i] = src_out2[i];
         }
         free(src_out2);
     }
@@ -1205,33 +1351,25 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
 
     if (!await_rt_thread_detach()) {
         for (int i = 0; i < MAX_TRACKS; i++) {
-            if (new_multitrack_tracks[i]) free(new_multitrack_tracks[i]);
-            if (new_undo_tracks[i]) free(new_undo_tracks[i]);
+            if (temp_active[i]) free(temp_active[i]);
+            if (temp_undo[i]) free(temp_undo[i]);
         }
         free(new_pristine_buf);
         rubberband_delete(new_rb_state);
         return -1;
     }
 
-    if (pristine_bt_buf) free(pristine_bt_buf);
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i]) free(multitrack_tracks[i]);
-        if (undo_tracks[i]) free(undo_tracks[i]);
-    }
-
-    if (rt_rb_state) rubberband_delete(rt_rb_state);
-
     pristine_bt_buf = new_pristine_buf;
     for (int i = 0; i < MAX_TRACKS; i++) {
-        multitrack_tracks[i] = new_multitrack_tracks[i];
-        undo_tracks[i] = new_undo_tracks[i];
+        master_tracks[i].active_buffer = temp_active[i];
+        master_tracks[i].undo_buffer = temp_undo[i];
     }
 
     rt_rb_state = new_rb_state;
     pristine_read_pos = 0;
     atomic_store_explicit(&playback_pos, 0, memory_order_release);
     pristine_frames = new_pristine_frames;
-    backing_track_frames = new_pristine_frames;
+    atomic_store_explicit(&backing_track_frames, new_pristine_frames, memory_order_release);
 
     atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
     atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
@@ -1239,11 +1377,11 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     atomic_store_explicit(&active_track_count, 2, memory_order_release);
     atomic_store_explicit(&current_recording_track, 1, memory_order_release);
 
-    atomic_store_explicit(&track_has_audio[0], true, memory_order_release);
-    atomic_store_explicit(&track_is_soloed[0], true, memory_order_release);
-    if (src_out2) {
-        atomic_store_explicit(&track_has_audio[1], true, memory_order_release);
-        atomic_store_explicit(&track_is_soloed[1], true, memory_order_release);
+    atomic_store_explicit(&master_tracks[0].has_audio, true, memory_order_release);
+    atomic_store_explicit(&master_tracks[0].is_soloed, true, memory_order_release);
+    if (master_tracks[1].active_buffer && atomic_load_explicit(&master_tracks[1].has_audio, memory_order_acquire) == false) {
+        atomic_store_explicit(&master_tracks[1].has_audio, true, memory_order_release);
+        atomic_store_explicit(&master_tracks[1].is_soloed, true, memory_order_release);
     }
 
     resume_rt_thread();
@@ -1251,13 +1389,18 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
     set_playback_speed(current_speed);
 
-    printf("Loaded and resampled backing track to %d Hz for JIT streaming\n", jack_rate);
+    // TELEMETRY: Safely emit the decode summary
+    char *base_name = g_path_get_basename(filepath);
+    printf("[IO-DECODE] Base Track Loaded: \"%s\" | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=OK\n",
+           base_name, sfinfo.samplerate, jack_rate, ratio, new_pristine_frames);
+    g_free(base_name);
+
     return 0;
 }
 
 /**
  * @brief Initializes a multi-track loop canvas of an exact frame count.
- * Pauses the RT thread via atomic handshake before wiping and allocating arrays.
+ * @warning CRITICAL: Uses staging pointers to swap memory safely inside the RT barrier.
  * @param exact_frames The exact length of the canvas in frames.
  * @return 0 on success, -2 on memory failure, -1 on timeout.
  */
@@ -1266,22 +1409,52 @@ int init_exact_loop_canvas(size_t exact_frames) {
     jack_nframes_t jack_rate = jack_get_sample_rate(client);
     atomic_store_explicit(&active_sample_rate, (int)jack_rate, memory_order_release);
 
-    if (!is_ram_allocation_safe(exact_frames, jack_rate, jack_rate)) return -2;
-
-    float* new_multitrack_tracks[MAX_TRACKS] = {NULL};
-    float* new_undo_tracks[MAX_TRACKS] = {NULL};
-
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        new_multitrack_tracks[i] = calloc(exact_frames * 2, sizeof(float));
-        new_undo_tracks[i] = calloc(exact_frames * 2, sizeof(float));
-        if (!new_multitrack_tracks[i] || !new_undo_tracks[i]) {
-            for (int j = 0; j <= i; j++) {
-                if (new_multitrack_tracks[j]) free(new_multitrack_tracks[j]);
-                if (new_undo_tracks[j]) free(new_undo_tracks[j]);
-            }
-            return -2;
+    if (exact_frames == pristine_frames && pristine_bt_buf) {
+        if (!await_rt_thread_detach()) return -1;
+        memset(pristine_bt_buf, 0, exact_frames * 2 * sizeof(float));
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (master_tracks[i].active_buffer) memset(master_tracks[i].active_buffer, 0, exact_frames * 2 * sizeof(float));
+            if (master_tracks[i].undo_buffer) memset(master_tracks[i].undo_buffer, 0, exact_frames * 2 * sizeof(float));
+            atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
+            atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
+            atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
         }
+        if (rt_rb_state) rubberband_reset(rt_rb_state);
+        pristine_read_pos = 0;
+        atomic_store_explicit(&playback_pos, 0, memory_order_release);
+        atomic_store_explicit(&backing_track_frames, exact_frames, memory_order_release);
+        atomic_store_explicit(&active_track_count, 1, memory_order_release);
+        atomic_store_explicit(&current_recording_track, 0, memory_order_release);
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+        resume_rt_thread();
+        return 0;
     }
+
+    float* stolen_pristine = NULL;
+    float* stolen_active[MAX_TRACKS] = {NULL};
+    float* stolen_undo[MAX_TRACKS] = {NULL};
+
+    if (!await_rt_thread_detach()) return -1;
+    stolen_pristine = pristine_bt_buf;
+    pristine_bt_buf = NULL;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        stolen_active[i] = master_tracks[i].active_buffer;
+        stolen_undo[i] = master_tracks[i].undo_buffer;
+        master_tracks[i].active_buffer = NULL;
+        master_tracks[i].undo_buffer = NULL;
+    }
+    pristine_frames = 0;
+    atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
+    resume_rt_thread();
+
+    if (stolen_pristine) safe_deferred_free(stolen_pristine);
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (stolen_active[i]) safe_deferred_free(stolen_active[i]);
+        if (stolen_undo[i]) safe_deferred_free(stolen_undo[i]);
+    }
+
+    if (!is_ram_allocation_safe(exact_frames, jack_rate, jack_rate)) return -2;
 
     RubberBandState new_rb_state = rt_rb_state;
     if (!new_rb_state) {
@@ -1289,22 +1462,40 @@ int init_exact_loop_canvas(size_t exact_frames) {
         new_rb_state = rubberband_new(jack_rate, 2, rb_options, 1.0, 1.0);
     }
 
+    float *temp_pristine = calloc(exact_frames * 2, sizeof(float));
+    if (!temp_pristine) return -2;
+
+    float *temp_active[MAX_TRACKS] = {NULL};
+    float *temp_undo[MAX_TRACKS] = {NULL};
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        temp_active[i] = calloc(exact_frames * 2, sizeof(float));
+        temp_undo[i] = calloc(exact_frames * 2, sizeof(float));
+        if (!temp_active[i] || !temp_undo[i]) {
+            free(temp_pristine);
+            for (int j = 0; j <= i; j++) {
+                if (temp_active[j]) free(temp_active[j]);
+                if (temp_undo[j]) free(temp_undo[j]);
+            }
+            return -2;
+        }
+    }
+
     if (!await_rt_thread_detach()) {
+        free(temp_pristine);
         for (int i = 0; i < MAX_TRACKS; i++) {
-            if (new_multitrack_tracks[i]) free(new_multitrack_tracks[i]);
-            if (new_undo_tracks[i]) free(new_undo_tracks[i]);
+            free(temp_active[i]);
+            free(temp_undo[i]);
         }
         return -1;
     }
 
-    if (pristine_bt_buf) free(pristine_bt_buf);
-    pristine_bt_buf = calloc(exact_frames * 2, sizeof(float));
-
+    pristine_bt_buf = temp_pristine;
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i]) free(multitrack_tracks[i]);
-        if (undo_tracks[i]) free(undo_tracks[i]);
-        multitrack_tracks[i] = new_multitrack_tracks[i];
-        undo_tracks[i] = new_undo_tracks[i];
+        master_tracks[i].active_buffer = temp_active[i];
+        master_tracks[i].undo_buffer = temp_undo[i];
+        atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
+        atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
     }
 
     rt_rb_state = new_rb_state;
@@ -1313,21 +1504,14 @@ int init_exact_loop_canvas(size_t exact_frames) {
     pristine_read_pos = 0;
     atomic_store_explicit(&playback_pos, 0, memory_order_release);
     pristine_frames = exact_frames;
-    backing_track_frames = exact_frames;
+    atomic_store_explicit(&backing_track_frames, exact_frames, memory_order_release);
     atomic_store_explicit(&active_track_count, 1, memory_order_release);
     atomic_store_explicit(&current_recording_track, 0, memory_order_release);
-
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        atomic_store_explicit(&track_has_audio[i], false, memory_order_release);
-        atomic_store_explicit(&track_has_undo[i], false, memory_order_release);
-        atomic_store_explicit(&track_is_soloed[i], false, memory_order_release);
-    }
 
     atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
     atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
 
     resume_rt_thread();
-
     return 0;
 }
 
@@ -1337,13 +1521,17 @@ int init_exact_loop_canvas(size_t exact_frames) {
  * @return 0 on success, -2 on memory failure.
  */
 int init_empty_loop_canvas(int duration_seconds) {
-    if (!client) return -1;
+    if (!client || duration_seconds <= 0) return -1;
+
     jack_nframes_t jack_rate = jack_get_sample_rate(client);
-    return init_exact_loop_canvas(jack_rate * duration_seconds);
+
+    // Explicitly cast to size_t prior to multiplication to guarantee 64-bit arithmetic
+    return init_exact_loop_canvas((size_t)jack_rate * (size_t)duration_seconds);
 }
 
 /**
  * @brief Non-destructively resizes the active recording canvas.
+ * @warning CRITICAL: Relies on external buffer allocation to safely copy memory during the RT barrier lock.
  * @param duration_seconds The new length of the canvas in seconds.
  * @return 0 on success, -1 on timeout, -2 on memory failure.
  */
@@ -1353,64 +1541,55 @@ int resize_loop_canvas_seconds(int duration_seconds) {
     if (jack_rate <= 0) jack_rate = 48000;
 
     size_t new_exact_frames = (size_t)jack_rate * duration_seconds;
-    if (new_exact_frames == pristine_frames) return 0;
+    if (new_exact_frames <= pristine_frames) return 0;
 
     if (!is_ram_allocation_safe(new_exact_frames, jack_rate, jack_rate)) return -2;
 
-    float* new_multitrack_tracks[MAX_TRACKS] = {NULL};
-    float* new_undo_tracks[MAX_TRACKS] = {NULL};
+    size_t frames_to_copy = pristine_frames;
 
     for (int i = 0; i < MAX_TRACKS; i++) {
-        new_multitrack_tracks[i] = calloc(new_exact_frames * 2, sizeof(float));
-        new_undo_tracks[i] = calloc(new_exact_frames * 2, sizeof(float));
-        if (!new_multitrack_tracks[i] || !new_undo_tracks[i]) {
-            for (int j = 0; j <= i; j++) {
-                if (new_multitrack_tracks[j]) free(new_multitrack_tracks[j]);
-                if (new_undo_tracks[j]) free(new_undo_tracks[j]);
-            }
+        float *new_active = calloc(new_exact_frames * 2, sizeof(float));
+        float *new_undo = calloc(new_exact_frames * 2, sizeof(float));
+
+        if (!new_active || !new_undo) {
+            if (new_active) free(new_active);
+            if (new_undo) free(new_undo);
             return -2;
         }
-    }
 
-    float* new_pristine_bt_buf = calloc(new_exact_frames * 2, sizeof(float));
-
-    if (!new_pristine_bt_buf) {
-        for (int i = 0; i < MAX_TRACKS; i++) {
-            free(new_multitrack_tracks[i]);
-            free(new_undo_tracks[i]);
+        if (!await_rt_thread_detach()) {
+            free(new_active);
+            free(new_undo);
+            return -1;
         }
-        return -2;
+
+        if (master_tracks[i].active_buffer) {
+            memcpy(new_active, master_tracks[i].active_buffer, frames_to_copy * 2 * sizeof(float));
+            safe_deferred_free(master_tracks[i].active_buffer);
+        }
+        if (master_tracks[i].undo_buffer) {
+            memcpy(new_undo, master_tracks[i].undo_buffer, frames_to_copy * 2 * sizeof(float));
+            safe_deferred_free(master_tracks[i].undo_buffer);
+        }
+
+        master_tracks[i].active_buffer = new_active;
+        master_tracks[i].undo_buffer = new_undo;
+        resume_rt_thread();
     }
+
+    float *new_pristine = calloc(new_exact_frames * 2, sizeof(float));
+    if (!new_pristine) return -2;
 
     if (!await_rt_thread_detach()) {
-        free(new_pristine_bt_buf);
-        for (int i = 0; i < MAX_TRACKS; i++) {
-            free(new_multitrack_tracks[i]);
-            free(new_undo_tracks[i]);
-        }
+        free(new_pristine);
         return -1;
     }
 
-    size_t frames_to_copy = (pristine_frames < new_exact_frames) ? pristine_frames : new_exact_frames;
-
     if (pristine_bt_buf) {
-        memcpy(new_pristine_bt_buf, pristine_bt_buf, frames_to_copy * 2 * sizeof(float));
-        free(pristine_bt_buf);
+        memcpy(new_pristine, pristine_bt_buf, frames_to_copy * 2 * sizeof(float));
+        safe_deferred_free(pristine_bt_buf);
     }
-    pristine_bt_buf = new_pristine_bt_buf;
-
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i]) {
-            memcpy(new_multitrack_tracks[i], multitrack_tracks[i], frames_to_copy * 2 * sizeof(float));
-            free(multitrack_tracks[i]);
-        }
-        if (undo_tracks[i]) {
-            memcpy(new_undo_tracks[i], undo_tracks[i], frames_to_copy * 2 * sizeof(float));
-            free(undo_tracks[i]);
-        }
-        multitrack_tracks[i] = new_multitrack_tracks[i];
-        undo_tracks[i] = new_undo_tracks[i];
-    }
+    pristine_bt_buf = new_pristine;
 
     pristine_frames = new_exact_frames;
     atomic_store_explicit(&backing_track_frames, new_exact_frames, memory_order_release);
@@ -1447,7 +1626,7 @@ void set_bt_gain(float multiplier) {
 
 void set_multitrack_layer_gain(int track_idx, float multiplier) {
     if (track_idx >= 0 && track_idx < MAX_TRACKS) {
-        atomic_store_explicit(&multitrack_track_gains[track_idx], multiplier, memory_order_relaxed);
+        atomic_store_explicit(&master_tracks[track_idx].gain, multiplier, memory_order_relaxed);
     }
 }
 
@@ -1522,14 +1701,14 @@ void multitrack_undo_track(void) {
     if (!await_rt_thread_detach()) return;
 
     if (current > 1) {
-        if (multitrack_tracks[current] && pristine_frames > 0) {
-            memset(multitrack_tracks[current], 0, pristine_frames * 2 * sizeof(float));
+        if (master_tracks[current].active_buffer && pristine_frames > 0) {
+            memset(master_tracks[current].active_buffer, 0, pristine_frames * 2 * sizeof(float));
         }
         atomic_store_explicit(&current_recording_track, current - 1, memory_order_release);
         atomic_store_explicit(&active_track_count, current, memory_order_release);
     } else if (current == 1) {
-        if (multitrack_tracks[current] && pristine_frames > 0) {
-            memset(multitrack_tracks[current], 0, pristine_frames * 2 * sizeof(float));
+        if (master_tracks[current].active_buffer && pristine_frames > 0) {
+            memset(master_tracks[current].active_buffer, 0, pristine_frames * 2 * sizeof(float));
         }
     }
 
@@ -1598,10 +1777,10 @@ int init_audio_engine(size_t queue_capacity, float init_input_gain, jack_client_
 }
 
 /**
- * @brief Closes the JACK client and frees all allocated DSP buffers, queues, and states.
- * @return void
- */
-void shutdown_audio_engine() {
+* @brief Closes the JACK client and frees all allocated DSP buffers, queues, and states.
+* @return void
+*/
+void shutdown_audio_engine(void) {
     if (atomic_exchange_explicit(&stretcher_keep_running, false, memory_order_release)) {
         pthread_join(stretcher_thread, NULL);
     }
@@ -1616,10 +1795,14 @@ void shutdown_audio_engine() {
     if (stretch_queue.buffer) free(stretch_queue.buffer);
     if (cmd_queue.buffer) free(cmd_queue.buffer);
     if (pristine_bt_buf) free(pristine_bt_buf);
+
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (multitrack_tracks[i]) { free(multitrack_tracks[i]); multitrack_tracks[i] = NULL; }
-        if (undo_tracks[i]) { free(undo_tracks[i]); undo_tracks[i] = NULL; }
+        if (master_tracks[i].active_buffer) { free(master_tracks[i].active_buffer); master_tracks[i].active_buffer = NULL; }
+        if (master_tracks[i].undo_buffer) { free(master_tracks[i].undo_buffer); master_tracks[i].undo_buffer = NULL; }
+        if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
     }
+
+    clipboard_frames = 0;
 
     atomic_store_explicit(&vu_peak_input_l, 0.0f, memory_order_relaxed);
     atomic_store_explicit(&vu_peak_input_r, 0.0f, memory_order_relaxed);
@@ -1631,19 +1814,14 @@ void swap_multitrack_tracks(int idx_a, int idx_b) {
     if (idx_a >= 0 && idx_b >= 0 && idx_a < MAX_TRACKS && idx_b < MAX_TRACKS) {
         if (!await_rt_thread_detach()) return;
 
-        // Swap live layers
-        float *tmp_multi = multitrack_tracks[idx_a];
-        multitrack_tracks[idx_a] = multitrack_tracks[idx_b];
-        multitrack_tracks[idx_b] = tmp_multi;
-
-        // Swap undo layers simultaneously inside the same RT barrier
-        float *tmp_undo = undo_tracks[idx_a];
-        undo_tracks[idx_a] = undo_tracks[idx_b];
-        undo_tracks[idx_b] = tmp_undo;
+        // Swap complete structures safely inside the barrier
+        QJTrackBuffer tmp = master_tracks[idx_a];
+        master_tracks[idx_a] = master_tracks[idx_b];
+        master_tracks[idx_b] = tmp;
 
         // Synchronize the time-stretcher buffer if Track 1 was moved
         if ((idx_a == 0 || idx_b == 0) && pristine_bt_buf && pristine_frames > 0) {
-            memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
+            memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
             atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
             atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
         }
@@ -1660,17 +1838,16 @@ void swap_multitrack_tracks(int idx_a, int idx_b) {
  * @return void
  */
 void swap_undo_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx] || !undo_tracks[track_idx]) return;
+    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer || !master_tracks[track_idx].undo_buffer) return;
 
     if (!await_rt_thread_detach()) return;
 
-    float *tmp = multitrack_tracks[track_idx];
-    multitrack_tracks[track_idx] = undo_tracks[track_idx];
-    undo_tracks[track_idx] = tmp;
+    float *tmp = master_tracks[track_idx].active_buffer;
+    master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
+    master_tracks[track_idx].undo_buffer = tmp;
 
     resume_rt_thread();
 }
-
 /**
  * @brief Clears a layer to absolute silence (backing up to undo) or restores it if already empty.
  * Uses the centralized atomic handshake to safely detach the RT thread before memory manipulation.
@@ -1678,11 +1855,10 @@ void swap_undo_track(int track_idx) {
  * @return 0 if cleared, 1 if restored, -1 on error.
  */
 int clear_or_restore_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx] || !undo_tracks[track_idx]) return -1;
+    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer || !master_tracks[track_idx].undo_buffer) return -1;
 
     size_t total_samples = pristine_frames * 2;
-    // Massive O(1) Performance Upgrade: Bypass the heavy array loop scan
-    bool has_audio = atomic_load_explicit(&track_has_audio[track_idx], memory_order_acquire);
+    bool has_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
     int action_status = -1;
 
     if (!await_rt_thread_detach()) return -1;
@@ -1695,36 +1871,36 @@ int clear_or_restore_track(int track_idx) {
     if (has_audio) {
         bool undo_is_silent = true;
         for (size_t i = 0; i < total_samples; i++) {
-            if (undo_tracks[track_idx][i] != 0.0f) {
+            if (master_tracks[track_idx].undo_buffer[i] != 0.0f) {
                 undo_is_silent = false;
                 break;
             }
         }
 
         if (undo_is_silent) {
-            float *tmp = multitrack_tracks[track_idx];
-            multitrack_tracks[track_idx] = undo_tracks[track_idx];
-            undo_tracks[track_idx] = tmp;
+            float *tmp = master_tracks[track_idx].active_buffer;
+            master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
+            master_tracks[track_idx].undo_buffer = tmp;
         } else {
-            memcpy(undo_tracks[track_idx], multitrack_tracks[track_idx], total_samples * sizeof(float));
-            memset(multitrack_tracks[track_idx], 0, total_samples * sizeof(float));
+            memcpy(master_tracks[track_idx].undo_buffer, master_tracks[track_idx].active_buffer, total_samples * sizeof(float));
+            memset(master_tracks[track_idx].active_buffer, 0, total_samples * sizeof(float));
         }
 
-        atomic_store_explicit(&track_has_audio[track_idx], false, memory_order_release);
-        atomic_store_explicit(&track_is_soloed[track_idx], false, memory_order_release);
+        atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
+        atomic_store_explicit(&master_tracks[track_idx].is_soloed, false, memory_order_release);
         action_status = 0;
     } else {
-        float *tmp = multitrack_tracks[track_idx];
-        multitrack_tracks[track_idx] = undo_tracks[track_idx];
-        undo_tracks[track_idx] = tmp;
+        float *tmp = master_tracks[track_idx].active_buffer;
+        master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
+        master_tracks[track_idx].undo_buffer = tmp;
 
-        atomic_store_explicit(&track_has_audio[track_idx], true, memory_order_release);
-        atomic_store_explicit(&track_is_soloed[track_idx], true, memory_order_release);
+        atomic_store_explicit(&master_tracks[track_idx].has_audio, true, memory_order_release);
+        atomic_store_explicit(&master_tracks[track_idx].is_soloed, true, memory_order_release);
         action_status = 1;
     }
 
     if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], total_samples * sizeof(float));
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, total_samples * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -1734,25 +1910,45 @@ int clear_or_restore_track(int track_idx) {
     return action_status;
 }
 
-// ==============================================================================
-// INTERNAL MATH CORES (No RT Locks, No Bounds Checking)
-// ==============================================================================
+void clear_multitrack_track(int track_idx) {
+    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer) return;
 
-static inline void internal_backup_track(int track_idx) {
-    memcpy(undo_tracks[track_idx], multitrack_tracks[track_idx], pristine_frames * 2 * sizeof(float));
-    atomic_store_explicit(&track_has_undo[track_idx], true, memory_order_release);
+    if (!await_rt_thread_detach()) return;
+
+    memset(master_tracks[track_idx].active_buffer, 0, pristine_frames * 2 * sizeof(float));
+    atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].has_undo, false, memory_order_release);
+
+    resume_rt_thread();
 }
 
-static inline void internal_cut_math(int track_idx, size_t start, size_t end) {
+// ==============================================================================
+// TRUE MULTI-SELECT NLE CORE (Unified DSP)
+// ==============================================================================
+
+static inline void internal_backup_masked_tracks(uint32_t mask) {
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer && master_tracks[i].undo_buffer) {
+            memcpy(master_tracks[i].undo_buffer, master_tracks[i].active_buffer, pristine_frames * 2 * sizeof(float));
+            bool prev_audio = atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[i].undo_has_audio, prev_audio, memory_order_release);
+            atomic_store_explicit(&master_tracks[i].has_undo, true, memory_order_release);
+        }
+    }
+}
+
+static inline void apply_nle_cut_math(int track_idx, size_t start, size_t end) {
     size_t cut_len = end - start;
     size_t remaining = pristine_frames - end;
-    size_t fade_len = (cut_len < 256) ? cut_len : 256;
+    int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+    size_t fade_len = (size_t)((rate > 0 ? rate : 48000) * 0.005);
+    if (fade_len > cut_len) fade_len = cut_len;
 
     if (start >= fade_len) {
         for (size_t i = 0; i < fade_len; i++) {
             float mult = (float)(fade_len - i) / (float)fade_len;
-            multitrack_tracks[track_idx][(start - fade_len + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(start - fade_len + i) * 2 + 1] *= mult;
+            master_tracks[track_idx].active_buffer[(start - fade_len + i) * 2] *= mult;
+            master_tracks[track_idx].active_buffer[(start - fade_len + i) * 2 + 1] *= mult;
         }
     }
 
@@ -1760,338 +1956,120 @@ static inline void internal_cut_math(int track_idx, size_t start, size_t end) {
         size_t apply_fade = (remaining < fade_len) ? remaining : fade_len;
         for (size_t i = 0; i < apply_fade; i++) {
             float mult = (float)i / (float)apply_fade;
-            multitrack_tracks[track_idx][(end + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(end + i) * 2 + 1] *= mult;
+            master_tracks[track_idx].active_buffer[(end + i) * 2] *= mult;
+            master_tracks[track_idx].active_buffer[(end + i) * 2 + 1] *= mult;
         }
-        memmove(&multitrack_tracks[track_idx][start * 2], &multitrack_tracks[track_idx][end * 2], remaining * 2 * sizeof(float));
+        memmove(&master_tracks[track_idx].active_buffer[start * 2], &master_tracks[track_idx].active_buffer[end * 2], remaining * 2 * sizeof(float));
     }
-
-    memset(&multitrack_tracks[track_idx][(pristine_frames - cut_len) * 2], 0, cut_len * 2 * sizeof(float));
+    memset(&master_tracks[track_idx].active_buffer[(pristine_frames - cut_len) * 2], 0, cut_len * 2 * sizeof(float));
 }
 
-static inline void internal_smart_fade_math(int track_idx, size_t start, size_t end) {
-    size_t sel_len = end - start;
-    bool touches_start = (start == 0 || (start > 0 && multitrack_tracks[track_idx][(start - 1) * 2] == 0.0f));
-    bool touches_end = (end >= pristine_frames || (end < pristine_frames && multitrack_tracks[track_idx][end * 2] == 0.0f));
+static inline void apply_nle_clear_math(int track_idx, size_t start, size_t end) {
+    size_t clear_len = end - start;
+    int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+    size_t fade_len = (size_t)((rate > 0 ? rate : 48000) * 0.005);
+    if (fade_len > clear_len / 2) fade_len = clear_len / 2;
 
-    if (touches_start && !touches_end) {
-        for (size_t i = 0; i < sel_len; i++) {
-            float mult = (float)i / (float)(sel_len - 1);
-            multitrack_tracks[track_idx][(start + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(start + i) * 2 + 1] *= mult;
-        }
-    } else if (touches_end && !touches_start) {
-        for (size_t i = 0; i < sel_len; i++) {
-            float mult = 1.0f - ((float)i / (float)(sel_len - 1));
-            multitrack_tracks[track_idx][(start + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(start + i) * 2 + 1] *= mult;
-        }
-    } else {
-        size_t half_len = sel_len / 2;
-        for (size_t i = 0; i < half_len; i++) {
-            float mult = 1.0f - ((float)i / (float)half_len);
-            multitrack_tracks[track_idx][(start + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(start + i) * 2 + 1] *= mult;
-        }
-        multitrack_tracks[track_idx][(start + half_len) * 2] = 0.0f;
-        multitrack_tracks[track_idx][(start + half_len) * 2 + 1] = 0.0f;
-        for (size_t i = 1; i < (sel_len - half_len); i++) {
-            float mult = (float)i / (float)(sel_len - half_len - 1);
-            multitrack_tracks[track_idx][(start + half_len + i) * 2] *= mult;
-            multitrack_tracks[track_idx][(start + half_len + i) * 2 + 1] *= mult;
+    if (start >= fade_len) {
+        for (size_t i = 0; i < fade_len; i++) {
+            float mult = (float)(fade_len - i) / (float)fade_len;
+            master_tracks[track_idx].active_buffer[(start - fade_len + i) * 2] *= mult;
+            master_tracks[track_idx].active_buffer[(start - fade_len + i) * 2 + 1] *= mult;
         }
     }
-}
-
-static inline void internal_blend_fade_math(int track_idx, size_t start, size_t end) {
-    size_t sel_len = end - start;
-    size_t half_len = sel_len / 2;
-
-    for (size_t i = 0; i < half_len; i++) {
-        float mult = 1.0f - ((float)i / (float)half_len);
-        multitrack_tracks[track_idx][(start + i) * 2] *= mult;
-        multitrack_tracks[track_idx][(start + i) * 2 + 1] *= mult;
-    }
-    for (size_t i = 0; i < half_len; i++) {
-        float mult = ((float)i / (float)half_len);
-        multitrack_tracks[track_idx][(start + i) * 2] += multitrack_tracks[track_idx][(start + half_len + i) * 2] * mult;
-        multitrack_tracks[track_idx][(start + i) * 2 + 1] += multitrack_tracks[track_idx][(start + half_len + i) * 2 + 1] * mult;
-    }
-
     size_t remaining = pristine_frames - end;
-    if (remaining > 0) {
-        memmove(&multitrack_tracks[track_idx][(start + half_len) * 2],
-                &multitrack_tracks[track_idx][end * 2],
-                remaining * 2 * sizeof(float));
-    }
-    memset(&multitrack_tracks[track_idx][(pristine_frames - half_len) * 2], 0, half_len * 2 * sizeof(float));
-}
-
-static inline void internal_undo_math(int track_idx) {
-    memcpy(multitrack_tracks[track_idx], undo_tracks[track_idx], pristine_frames * 2 * sizeof(float));
-}
-
-// ==============================================================================
-// SINGLE TRACK EDITS
-// ==============================================================================
-
-/**
- * @brief Extracts the selected loop region from a layer and shifts the remaining audio left (Ripple Delete).
- * Includes a 5ms V-fade at the splice boundary to prevent zero-crossing audio pops.
- * Uses the centralized atomic handshake to safely detach the RT thread before memory manipulation.
- * @param track_idx The index of the layer to cut.
- * @return void
- */
-void cut_multitrack_track_selection(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
-
-    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
-    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
-    if (start >= end || end > pristine_frames) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    internal_backup_track(track_idx);
-    internal_cut_math(track_idx, start, end);
-
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-    }
-
-    atomic_store_explicit(&playback_pos, start, memory_order_release);
-    resume_rt_thread();
-
-    clear_loop_points();
-}
-
-/**
- * @brief Instantly zeroes out the memory for a specific looper overdub layer.* @brief Instantly zeroes out the memory for a specific looper overdub layer.
- * @param track_idx The index of the layer to clear.
- * @return void
- */
-void clear_multitrack_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-
-    if (!await_rt_thread_detach()) return; // Failsafe abort if JACK hangs
-
-    memset(multitrack_tracks[track_idx], 0, pristine_frames * 2 * sizeof(float));
-    atomic_store_explicit(&track_has_audio[track_idx], false, memory_order_release);
-    atomic_store_explicit(&track_has_undo[track_idx], false, memory_order_release);
-
-    resume_rt_thread();
-}
-
-/**
- * @brief Applies a smart destructive fade (In, Out, or V-Duck) to the active loop selection.
- * Enforces mathematically perfect 0.0f and 1.0f boundaries to prevent visual/auditory overlap.
- * @param track_idx The index of the layer to fade.
- * @return void
- */
-void apply_smart_fade_to_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
-
-    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
-    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
-    if (start >= end || end > pristine_frames) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    internal_backup_track(track_idx);
-    internal_smart_fade_math(track_idx, start, end);
-
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-    }
-
-    resume_rt_thread();
-    clear_loop_points();
-}
-
-/**
- * @brief Applies a Ripple Crossfade (Blend Fade) across the selection.
- * Fades out the left half, fades in the right half, mixes them together, and ripple-shifts
- * the remaining timeline leftwards by half the selection length to create a seamless overlap.
- * @param track_idx The index of the layer to fade.
- * @return void
- */
-void apply_blend_fade_to_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
-
-    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
-    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
-    if (start >= end || end > pristine_frames) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    internal_backup_track(track_idx);
-    internal_blend_fade_math(track_idx, start, end);
-
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-    }
-
-    resume_rt_thread();
-    clear_loop_points();
-}
-
-/**
- * @brief Restores the layer's audio buffer from the undo snapshot.
- * Bypasses the DSP barrier to safely overwrite the active memory.
- * @param track_idx The index of the layer to restore.
- * @return void
- */
-void undo_track_edit(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx] || !undo_tracks[track_idx]) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    internal_undo_math(track_idx);
-    atomic_store_explicit(&track_has_undo[track_idx], false, memory_order_release);
-
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-    }
-
-    resume_rt_thread();
-}
-
-/**
- * @brief Manually triggers an undo backup for a track. Used for debouncing rapid scroll wheel events.
- * @param track_idx The index of the track.
- */
-void backup_track_for_edit(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-    if (!await_rt_thread_detach()) return;
-    internal_backup_track(track_idx);
-    resume_rt_thread();
-}
-
-/**
- * @brief Destructively amplifies or attenuates the selected region of a track by a specific dB amount.
- * @param track_idx The index of the track to edit.
- * @param db_delta The relative volume change in decibels (e.g., +0.5 or -0.5).
- */
-void amplify_track_selection(int track_idx, float db_delta) {
-    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
-    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
-    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
-    if (start >= end || end > pristine_frames) return;
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !multitrack_tracks[track_idx]) return;
-
-    float multiplier = powf(10.0f, db_delta / 20.0f);
-
-    if (!await_rt_thread_detach()) return;
-
-    // Calculate a 30ms sloped transition based on the active hardware sample rate
-    int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-    size_t fade_len = (size_t)((current_rate > 0 ? current_rate : 48000) * 0.030);
-
-    // Safety cap: don't let the fade overlap if the selection is extremely narrow
-    if (end - start < fade_len * 2) fade_len = (end - start) / 2;
-
-    for (size_t i = 0; i < fade_len; i++) {
-        float progress = (float)i / (float)fade_len;
-        // Apply an S-Curve (Smoothstep) for natural volume ramping instead of a hard linear angle
-        float curve = progress * progress * (3.0f - 2.0f * progress);
-        float current_mult = 1.0f + (multiplier - 1.0f) * curve;
-
-        multitrack_tracks[track_idx][(start + i) * 2] *= current_mult;
-        multitrack_tracks[track_idx][(start + i) * 2 + 1] *= current_mult;
-    }
-
-    for (size_t i = fade_len; i < (end - start) - fade_len; i++) {
-        multitrack_tracks[track_idx][(start + i) * 2] *= multiplier;
-        multitrack_tracks[track_idx][(start + i) * 2 + 1] *= multiplier;
-    }
-
-    for (size_t i = 0; i < fade_len; i++) {
-        float progress = (float)i / (float)fade_len;
-        float curve = progress * progress * (3.0f - 2.0f * progress);
-        float current_mult = multiplier + (1.0f - multiplier) * curve;
-
-        multitrack_tracks[track_idx][(end - fade_len + i) * 2] *= current_mult;
-        multitrack_tracks[track_idx][(end - fade_len + i) * 2 + 1] *= current_mult;
-    }
-
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
-        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-    }
-
-    resume_rt_thread();
-}
-
-// ==============================================================================
-// MASTER TRACK EDITS
-// ==============================================================================
-
-/**
- * @brief Master cut: extracts the loop region across all active multitrack layers
- * and shifts the remaining audio left, using a single RT DSP lock.
- * @return void
- */
-void master_cut_selection(void) {
-    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
-    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
-    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
-    if (start >= end || end > pristine_frames) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    int layers = atomic_load_explicit(&active_track_count, memory_order_acquire);
-    for (int l = 0; l < layers && l < MAX_TRACKS; l++) {
-        if (multitrack_tracks[l]) {
-            internal_backup_track(l);
-            internal_cut_math(l, start, end);
+    if (remaining >= fade_len) {
+        for (size_t i = 0; i < fade_len; i++) {
+            float mult = (float)i / (float)fade_len;
+            master_tracks[track_idx].active_buffer[(end + i) * 2] *= mult;
+            master_tracks[track_idx].active_buffer[(end + i) * 2 + 1] *= mult;
         }
     }
+    memset(&master_tracks[track_idx].active_buffer[start * 2], 0, clear_len * 2 * sizeof(float));
+}
 
-    if (pristine_bt_buf && multitrack_tracks[0]) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
+void copy_selection(void) {
+    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
+    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+    if (start >= end || end > pristine_frames) return;
+
+    size_t copy_len = end - start;
+    if (!await_rt_thread_detach()) return;
+
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (mask & (1 << i)) {
+            if (master_tracks[i].active_buffer) {
+                float *new_buf = realloc(clipboard_buffers[i], copy_len * 2 * sizeof(float));
+                if (new_buf) {
+                    clipboard_buffers[i] = new_buf;
+                    memcpy(clipboard_buffers[i], &master_tracks[i].active_buffer[start * 2], copy_len * 2 * sizeof(float));
+                }
+            }
+        } else {
+            if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
+        }
+    }
+    clipboard_frames = copy_len;
+    resume_rt_thread();
+    clear_loop_points();
+}
+
+void cut_selection(void) {
+    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
+    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+    if (start >= end || end > pristine_frames) return;
+
+    if (!await_rt_thread_detach()) return;
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    internal_backup_masked_tracks(mask);
+
+    size_t copy_len = end - start;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            float *new_buf = realloc(clipboard_buffers[i], copy_len * 2 * sizeof(float));
+            if (new_buf) {
+                clipboard_buffers[i] = new_buf;
+                memcpy(clipboard_buffers[i], &master_tracks[i].active_buffer[start * 2], copy_len * 2 * sizeof(float));
+            }
+            apply_nle_cut_math(i, start, end);
+        } else {
+            if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
+        }
+    }
+    clipboard_frames = copy_len;
+
+    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
-
     atomic_store_explicit(&playback_pos, start, memory_order_release);
     resume_rt_thread();
     clear_loop_points();
 }
 
-/**
- * @brief Master smart fade: applies V-fade (in, out, or duck) across all active layers
- * synchronously under a single RT DSP lock.
- * @return void
- */
-void master_smart_fade(void) {
+void delete_selection(void) {
     if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
     size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
     size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
     if (start >= end || end > pristine_frames) return;
 
     if (!await_rt_thread_detach()) return;
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    internal_backup_masked_tracks(mask);
 
-    int layers = atomic_load_explicit(&active_track_count, memory_order_acquire);
-    for (int l = 0; l < layers && l < MAX_TRACKS; l++) {
-        if (multitrack_tracks[l]) {
-            internal_backup_track(l);
-            internal_smart_fade_math(l, start, end);
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            apply_nle_clear_math(i, start, end);
         }
     }
 
-    if (pristine_bt_buf && multitrack_tracks[0]) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
+    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2100,60 +2078,303 @@ void master_smart_fade(void) {
     clear_loop_points();
 }
 
-/**
- * @brief Master blend fade: applies a ripple crossfade across all active layers
- * synchronously under a single RT DSP lock.
- * @return void
- */
-void master_blend_fade(void) {
+void global_ripple_delete_selection(void) {
     if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
     size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
     size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
     if (start >= end || end > pristine_frames) return;
 
     if (!await_rt_thread_detach()) return;
+    uint32_t mask = 0xFFFFFFFF; // Target ALL active tracks universally
+    internal_backup_masked_tracks(mask);
 
-    int layers = atomic_load_explicit(&active_track_count, memory_order_acquire);
-    for (int l = 0; l < layers && l < MAX_TRACKS; l++) {
-        if (multitrack_tracks[l]) {
-            internal_backup_track(l);
-            internal_blend_fade_math(l, start, end);
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (master_tracks[i].active_buffer) {
+            apply_nle_cut_math(i, start, end);
         }
     }
 
-    if (pristine_bt_buf && multitrack_tracks[0]) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
+    if (pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
-
+    atomic_store_explicit(&playback_pos, start, memory_order_release);
     resume_rt_thread();
     clear_loop_points();
 }
 
-/**
- * @brief Master undo: restores all active layers from their undo snapshots
- * simultaneously under a single RT DSP lock.
- * @return void
- */
-void master_undo_edits(void) {
+void paste_selection(void) {
+    if (clipboard_frames == 0) return;
+    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+
+    if (current_pos + clipboard_frames > pristine_frames) {
+        int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+        int required_seconds = (int)((current_pos + clipboard_frames) / (rate > 0 ? rate : 48000)) + 1;
+        if (resize_loop_canvas_seconds(required_seconds) != 0) return;
+    }
+
     if (!await_rt_thread_detach()) return;
 
-    int layers = atomic_load_explicit(&active_track_count, memory_order_acquire);
-    for (int l = 0; l < layers && l < MAX_TRACKS; l++) {
-        if (multitrack_tracks[l] && undo_tracks[l]) {
-            if (atomic_load_explicit(&track_has_undo[l], memory_order_acquire)) {
-                internal_undo_math(l);
-                atomic_store_explicit(&track_has_undo[l], false, memory_order_release);
+    if (current_pos + clipboard_frames > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    internal_backup_masked_tracks(mask);
+
+    bool bt_updated = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && clipboard_buffers[i] && master_tracks[i].active_buffer) {
+            memcpy(&master_tracks[i].active_buffer[current_pos * 2], clipboard_buffers[i], clipboard_frames * 2 * sizeof(float));
+            atomic_store_explicit(&master_tracks[i].has_audio, true, memory_order_release);
+            if (i == 0) bt_updated = true;
+
+            int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
+            if (i >= active) atomic_store_explicit(&active_track_count, i + 1, memory_order_release);
+        }
+    }
+
+    if (bt_updated && pristine_bt_buf) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+
+    atomic_store_explicit(&playback_pos, current_pos + clipboard_frames, memory_order_release);
+    resume_rt_thread();
+}
+
+void global_paste_selection(void) {
+    if (clipboard_frames == 0) return;
+    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+
+    if (current_pos + clipboard_frames > pristine_frames) {
+        int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+        int required_seconds = (int)((current_pos + clipboard_frames) / (rate > 0 ? rate : 48000)) + 1;
+        if (resize_loop_canvas_seconds(required_seconds) != 0) return;
+    }
+
+    if (!await_rt_thread_detach()) return;
+
+    if (current_pos + clipboard_frames > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    uint32_t mask = 0xFFFFFFFF; // Target ALL active tracks universally
+    internal_backup_masked_tracks(mask);
+
+    bool bt_updated = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (clipboard_buffers[i] && master_tracks[i].active_buffer) {
+            memcpy(&master_tracks[i].active_buffer[current_pos * 2], clipboard_buffers[i], clipboard_frames * 2 * sizeof(float));
+            atomic_store_explicit(&master_tracks[i].has_audio, true, memory_order_release);
+            if (i == 0) bt_updated = true;
+
+            int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
+            if (i >= active) atomic_store_explicit(&active_track_count, i + 1, memory_order_release);
+        }
+    }
+
+    if (bt_updated && pristine_bt_buf) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+
+    atomic_store_explicit(&playback_pos, current_pos + clipboard_frames, memory_order_release);
+    resume_rt_thread();
+}
+
+void apply_smart_fade_selection(void) {
+    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
+    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+    if (start >= end || end > pristine_frames) return;
+
+    if (!await_rt_thread_detach()) return;
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    internal_backup_masked_tracks(mask);
+
+    size_t sel_len = end - start;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            bool touches_start = (start == 0 || master_tracks[i].active_buffer[(start - 1) * 2] == 0.0f);
+            bool touches_end = (end >= pristine_frames || master_tracks[i].active_buffer[end * 2] == 0.0f);
+
+            if (touches_start && !touches_end) {
+                for (size_t j = 0; j < sel_len; j++) {
+                    float mult = (float)j / (float)(sel_len - 1);
+                    master_tracks[i].active_buffer[(start + j) * 2] *= mult;
+                    master_tracks[i].active_buffer[(start + j) * 2 + 1] *= mult;
+                }
+            } else if (touches_end && !touches_start) {
+                for (size_t j = 0; j < sel_len; j++) {
+                    float mult = 1.0f - ((float)j / (float)(sel_len - 1));
+                    master_tracks[i].active_buffer[(start + j) * 2] *= mult;
+                    master_tracks[i].active_buffer[(start + j) * 2 + 1] *= mult;
+                }
+            } else {
+                size_t half_len = sel_len / 2;
+                for (size_t j = 0; j < half_len; j++) {
+                    float mult = 1.0f - ((float)j / (float)half_len);
+                    master_tracks[i].active_buffer[(start + j) * 2] *= mult;
+                    master_tracks[i].active_buffer[(start + j) * 2 + 1] *= mult;
+                }
+                master_tracks[i].active_buffer[(start + half_len) * 2] = 0.0f;
+                master_tracks[i].active_buffer[(start + half_len) * 2 + 1] = 0.0f;
+                for (size_t j = 1; j < (sel_len - half_len); j++) {
+                    float mult = (float)j / (float)(sel_len - half_len - 1);
+                    master_tracks[i].active_buffer[(start + half_len + j) * 2] *= mult;
+                    master_tracks[i].active_buffer[(start + half_len + j) * 2 + 1] *= mult;
+                }
             }
         }
     }
 
-    if (pristine_bt_buf && multitrack_tracks[0]) {
-        memcpy(pristine_bt_buf, multitrack_tracks[0], pristine_frames * 2 * sizeof(float));
+    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+    resume_rt_thread();
+    clear_loop_points();
+}
+
+void apply_blend_fade_selection(void) {
+    if (!atomic_load_explicit(&loop_active, memory_order_acquire)) return;
+    size_t start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+    size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+    if (start >= end || end > pristine_frames) return;
+
+    if (!await_rt_thread_detach()) return;
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    internal_backup_masked_tracks(mask);
+
+    size_t sel_len = end - start;
+    size_t half_len = sel_len / 2;
+    size_t remaining = pristine_frames - end;
+
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            for (size_t j = 0; j < half_len; j++) {
+                float mult = 1.0f - ((float)j / (float)half_len);
+                master_tracks[i].active_buffer[(start + j) * 2] *= mult;
+                master_tracks[i].active_buffer[(start + j) * 2 + 1] *= mult;
+            }
+            for (size_t j = 0; j < half_len; j++) {
+                float mult = ((float)j / (float)half_len);
+                master_tracks[i].active_buffer[(start + j) * 2] += master_tracks[i].active_buffer[(start + half_len + j) * 2] * mult;
+                master_tracks[i].active_buffer[(start + j) * 2 + 1] += master_tracks[i].active_buffer[(start + half_len + j) * 2 + 1] * mult;
+            }
+            if (remaining > 0) {
+                memmove(&master_tracks[i].active_buffer[(start + half_len) * 2],
+                        &master_tracks[i].active_buffer[end * 2],
+                        remaining * 2 * sizeof(float));
+            }
+            memset(&master_tracks[i].active_buffer[(pristine_frames - half_len) * 2], 0, half_len * 2 * sizeof(float));
+        }
+    }
+
+    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+    resume_rt_thread();
+    clear_loop_points();
+}
+
+void undo_selection(void) {
+    if (!await_rt_thread_detach()) return;
+    uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    bool bt_updated = false;
+
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer && master_tracks[i].undo_buffer) {
+            if (atomic_load_explicit(&master_tracks[i].has_undo, memory_order_acquire)) {
+                memcpy(master_tracks[i].active_buffer, master_tracks[i].undo_buffer, pristine_frames * 2 * sizeof(float));
+
+                bool prev_audio = atomic_load_explicit(&master_tracks[i].undo_has_audio, memory_order_acquire);
+                atomic_store_explicit(&master_tracks[i].has_audio, prev_audio, memory_order_release);
+                atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
+
+                if (i == 0) bt_updated = true;
+            }
+        }
+    }
+
+    // Dynamic UI Cleanup: Prune ghost layers if the track was erased
+    int highest = 0;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) highest = i;
+    }
+
+    int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    if (current_rec > highest && !atomic_load_explicit(&master_tracks[current_rec].has_audio, memory_order_acquire)) {
+        current_rec = highest;
+        atomic_store_explicit(&current_recording_track, current_rec, memory_order_release);
+        atomic_store_explicit(&selected_tracks_mask, (1 << current_rec), memory_order_release);
+    }
+
+    if (current_rec > highest) highest = current_rec;
+    atomic_store_explicit(&active_track_count, highest + 1, memory_order_release);
+
+    if (bt_updated && pristine_bt_buf && master_tracks[0].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
 
     resume_rt_thread();
+}
+
+/**
+ * @brief Renders a dynamically allocated, fully mixed stereo buffer of the requested region.
+ * Applies track gains, solo/mute states, and soft clipping identically to the RT playback engine.
+ * @warning Must be called while the RT thread is detached to prevent memory races.
+ * @param start The start frame.
+ * @param end The end frame.
+ * @return Allocated float array of the mixed audio, or NULL on failure.
+ */
+float* render_mixdown_region(size_t start, size_t end) {
+    if (start >= end || end > pristine_frames) return NULL;
+    size_t len = end - start;
+
+    float *mix_buf = calloc(len * 2, sizeof(float));
+    if (!mix_buf) return NULL;
+
+    // Pass 1: Global Solo Check
+    bool any_solo = false;
+    for (int l = 0; l < MAX_TRACKS; l++) {
+        if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
+            any_solo = true; break;
+        }
+    }
+
+    // Pass 2: Sum all audible layers
+    for (size_t i = 0; i < len; i++) {
+        float sum_l = 0.0f;
+        float sum_r = 0.0f;
+
+        for (int l = 0; l < MAX_TRACKS; l++) {
+            if (!master_tracks[l].active_buffer) continue;
+
+            bool is_audible = atomic_load_explicit(&master_tracks[l].has_audio, memory_order_relaxed) &&
+            (!any_solo || atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed));
+
+            if (is_audible) {
+                float gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
+                sum_l += master_tracks[l].active_buffer[(start + i) * 2] * gain;
+                sum_r += master_tracks[l].active_buffer[(start + i) * 2 + 1] * gain;
+            }
+        }
+
+        mix_buf[i * 2] = soft_clip(sum_l);
+        mix_buf[i * 2 + 1] = soft_clip(sum_r);
+    }
+
+    return mix_buf;
 }
