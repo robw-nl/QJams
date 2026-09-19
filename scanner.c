@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 
+#include "config.h"
 #include "scanner.h"
 
 /**
@@ -36,7 +37,7 @@ int scan_video_devices(VideoDevice *devices, int max_devices) {
                 strncpy(devices[count].device_name, (char *)cap.card, sizeof(devices[count].device_name) - 1);
                 devices[count].device_name[sizeof(devices[count].device_name) - 1] = '\0';
 
-                printf("Discovered Camera: %s at %s\n", devices[count].device_name, devices[count].device_path);
+                log_and_notify(0, "Discovered Camera: %s at %s\n", devices[count].device_name, devices[count].device_path);
                 count++;
             }
         }
@@ -172,4 +173,40 @@ int get_best_video_format(const char* device_path, uint32_t *out_pixelformat, in
 
     close(fd_temp);
     return 0;
+}
+
+/**
+ * @brief Executes lsusb to extract physical hardware identifiers present on the USB bus.
+ * @note Safety [Moderate]: Utilizes popen for system calls. Buffer sizes and string tokenization are strictly bounded to prevent memory leaks or buffer overruns.
+ * @param out_keywords Array to store the discovered USB descriptions.
+ * @param max_keywords Maximum number of devices to scan.
+ * @return The number of discovered physical USB devices.
+ */
+int get_physical_usb_hardware(char out_keywords[][128], int max_keywords) {
+    FILE *fp = popen("lsusb", "r");
+    if (!fp) return 0;
+
+    char line[256];
+    int count = 0;
+
+    while (fgets(line, sizeof(line), fp) && count < max_keywords) {
+        char *id_ptr = strstr(line, "ID ");
+        if (id_ptr) {
+            char *desc = strchr(id_ptr, ' ');
+            if (desc) {
+                desc = strchr(desc + 1, ' ');
+                if (desc) {
+                    desc++;
+                    char *nl = strchr(desc, '\n');
+                    if (nl) *nl = '\0';
+
+                    strncpy(out_keywords[count], desc, 127);
+                    out_keywords[count][127] = '\0';
+                    count++;
+                }
+            }
+        }
+    }
+    pclose(fp);
+    return count;
 }

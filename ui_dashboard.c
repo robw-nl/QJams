@@ -7,6 +7,7 @@
 #include "encoder.h"
 #include "scanner.h"
 #include "video_engine.h"
+#include "ringbuffer.h"
 #include <math.h>
 #include <string.h>
 #include <time.h>
@@ -20,24 +21,40 @@ extern jack_client_t *client;
 extern SPSC_Video_Queue video_queue;
 extern SPSC_Preview_Queue preview_queue;
 
-_Atomic bool is_mkv_mode = false;
 static pthread_t mkv_video_thread;
-static _Atomic bool mkv_video_keep_running = false;
+_Atomic bool mkv_video_keep_running = false;
+_Atomic bool suppress_video_overwrite = false;
+_Atomic bool is_loop_wrapping = false;
 static uint8_t* mkv_rgba_pool[32] = {NULL};
 
 char final_save_path[1024] = "";
 char current_raw_path[1024] = "";
+char stashed_raw_path[1024] = "";
+
+_Atomic bool is_mkv_mode = false;
+
+size_t video_start_frame = 0;
+size_t video_end_frame = 0;
 
 static guint speed_debounce_id = 0;
 static float pending_speed = 1.0f;
-
 static guint port_update_debounce_id = 0;
 
-static GtkWidget *lbl_hw_toast = NULL;
+static GtkWidget *btn_telemetry = NULL;
+static GtkWidget *telemetry_popover = NULL;
+GtkWidget *btn_record_video = NULL;
 
 static gboolean apply_port_update_deferred(gpointer user_data) {
     (void)user_data;
-    update_dashboard_cycler_ui();
+
+    // GUARD: Ignore port routing spam from PipeWire until the canvas is fully allocated
+    extern size_t pristine_frames;
+    if (pristine_frames == 0) {
+        port_update_debounce_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    update_dashboard_pref_ui();
     port_update_debounce_id = 0;
     return G_SOURCE_REMOVE;
 }
@@ -47,7 +64,6 @@ gboolean on_jack_port_registration_ui(gpointer data) {
     if (port_update_debounce_id != 0) {
         g_source_remove(port_update_debounce_id);
     }
-    // Wait 500ms for the device to fully register all its channels before reading the scanner
     port_update_debounce_id = g_timeout_add(500, apply_port_update_deferred, NULL);
     return G_SOURCE_REMOVE;
 }
@@ -57,16 +73,12 @@ static int countdown_val = 3;
 static GtkWidget *countdown_window = NULL;
 static GtkWidget *countdown_label = NULL;
 
-static GtkWidget *input_cycler_drop = NULL;
-static GtkStringList *cycler_model = NULL;
-static bool cycler_is_updating = false;
+static GtkWidget *input_pref_drop = NULL;
+static GtkStringList *pref_model = NULL;
+static bool pref_is_updating = false;
 
-static void on_input_gain_changed(GtkSpinButton *spin_button, gpointer user_data); // Forward declaration
+static void on_input_gain_changed(GtkSpinButton *spin_button, gpointer user_data);
 
-/**
- * @brief Refreshes the hardware connection status label.
- * Strictly shows only offline Primary and Fallback devices. Disappears when fully connected.
- */
 static void update_hardware_status_label(void) {
     AudioDevice active_devs[MAX_AUDIO_DEVICES];
     int online_count = scan_audio_devices(client, active_devs, MAX_AUDIO_DEVICES);
@@ -90,7 +102,6 @@ static void update_hardware_status_label(void) {
         const char *dev_name = devices_to_check[i];
         if (!dev_name || strlen(dev_name) == 0) continue;
 
-        // Prevent duplicate checks if primary == fallback
         if (i == 1 && primary_dev && strcmp(dev_name, primary_dev) == 0) continue;
 
         int is_online = 0;
@@ -111,46 +122,136 @@ static void update_hardware_status_label(void) {
     size_t len = strlen(toast_msg);
     if (len > 0) {
         if (toast_msg[len - 1] == '\n') toast_msg[len - 1] = '\0';
-        gtk_label_set_text(GTK_LABEL(lbl_hw_toast), toast_msg);
-        gtk_widget_set_visible(lbl_hw_toast, TRUE);
+        log_and_notify(2, "%s", toast_msg);
     } else {
         gtk_widget_set_visible(lbl_hw_toast, FALSE);
     }
 }
 
-void update_dashboard_cycler_ui(void) {
-    if (!input_cycler_drop) return;
-    cycler_is_updating = true;
+void update_dashboard_pref_ui(void) {
+    if (!input_pref_drop) return;
+    pref_is_updating = true;
 
-    if (cycler_model) {
-        g_object_unref(cycler_model);
+    if (pref_model) {
+        g_object_unref(pref_model);
     }
-    cycler_model = gtk_string_list_new(NULL);
+    pref_model = gtk_string_list_new(NULL);
 
-    int active_idx = 0;
+    int active_idx = -1;
     int count = 0;
 
-    // Perform a live hardware scan to verify which devices are currently powered on
     AudioDevice active_devs[MAX_AUDIO_DEVICES];
     int online_count = scan_audio_devices(client, active_devs, MAX_AUDIO_DEVICES);
 
     update_hardware_status_label();
 
+    // 1. Identify key profiles
+    const char *primary_dev = NULL;
+    const char *fallback_dev = NULL;
     for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
-        if (ui_state.config.audio_profiles[i].in_cycler) {
+        if (ui_state.config.audio_profiles[i].is_primary) primary_dev = ui_state.config.audio_profiles[i].device_name;
+        if (ui_state.config.audio_profiles[i].is_fallback) fallback_dev = ui_state.config.audio_profiles[i].device_name;
+    }
 
-            // Verify the profiled device exists in the live hardware pool
-            int is_online = 0;
+    // 2. Assess online state
+    bool current_is_online = false;
+    bool primary_is_online = false;
+    bool fallback_is_online = false;
+
+    for (int j = 0; j < online_count; j++) {
+        if (strcmp(ui_state.config.audio_device, active_devs[j].display_name) == 0) current_is_online = true;
+        if (primary_dev && strcmp(primary_dev, active_devs[j].display_name) == 0) primary_is_online = true;
+        if (fallback_dev && strcmp(fallback_dev, active_devs[j].display_name) == 0) fallback_is_online = true;
+    }
+
+    // 3. Autonomous Routing Decisions
+    const char *target_device = ui_state.config.audio_device;
+    bool did_dropout = false;
+
+    if (primary_is_online && strcmp(target_device, primary_dev) != 0) {
+        // Recovered: Cable moved to new port or device powered back on
+        target_device = primary_dev;
+    } else if (!current_is_online) {
+        did_dropout = true;
+        if (fallback_is_online) {
+            target_device = fallback_dev;
+        } else if (online_count > 0) {
+            target_device = active_devs[0].display_name;
+        } else {
+            target_device = ""; // Absolute failure, nothing online
+        }
+    }
+
+    // 4. Handle Catastrophic Failure (No devices available to switch to)
+    if (strlen(target_device) == 0) {
+        if (atomic_load_explicit(&engine_is_recording, memory_order_acquire) ||
+            atomic_load_explicit(&engine_is_playing, memory_order_acquire)) {
+            on_stop_clicked(NULL, NULL);
+            }
+            extern GtkWidget *lbl_status;
+        if (lbl_status) {
+            log_and_notify(1, "<span foreground='#ff4444'><b>Device cannot be recovered at the moment. Advise: Boot your PC and/or device.</b></span>");
+        }
+        gtk_drop_down_set_model(GTK_DROP_DOWN(input_pref_drop), G_LIST_MODEL(pref_model));
+        pref_is_updating = false;
+        return;
+    }
+
+    // 5. Handle Valid Switch (Dropout or Recovery)
+    if (strcmp(target_device, ui_state.config.audio_device) != 0) {
+
+        // If the old device dropped offline mid-session, halt transport safely
+        if (did_dropout && (atomic_load_explicit(&engine_is_recording, memory_order_acquire) ||
+            atomic_load_explicit(&engine_is_playing, memory_order_acquire))) {
+            on_stop_clicked(NULL, NULL);
+            }
+
+            extern int patch_audio_ports(const char*);
+        extern int patch_playback_ports(const char*);
+        patch_audio_ports(target_device);
+        patch_playback_ports(ui_state.config.playback_target);
+        strncpy(ui_state.config.audio_device, target_device, sizeof(ui_state.config.audio_device) - 1);
+        ui_state.config.audio_device[sizeof(ui_state.config.audio_device) - 1] = '\0';
+
+        float target_multiplier = 1.0f;
+        for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
+            if (strcmp(ui_state.config.audio_profiles[i].device_name, target_device) == 0) {
+                target_multiplier = ui_state.config.audio_profiles[i].gain_multiplier;
+                break;
+            }
+        }
+
+        extern void set_input_gain(float);
+        ui_state.config.input_gain_multiplier = target_multiplier;
+        set_input_gain(target_multiplier);
+
+        float loaded_db = (target_multiplier <= 0.001f) ? -24.0f : 20.0f * log10f(target_multiplier);
+        extern void on_input_gain_changed(GtkSpinButton*, gpointer);
+        g_signal_handlers_block_by_func(input_gain_spinner, G_CALLBACK(on_input_gain_changed), NULL);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(input_gain_spinner), loaded_db);
+        g_signal_handlers_unblock_by_func(input_gain_spinner, G_CALLBACK(on_input_gain_changed), NULL);
+
+        if (current_is_online) { // Only show recovery toast if it didn't just crash out of a session
+            log_and_notify(2, "Auto-Switched to: %s", target_device);
+        }
+
+        save_qjams_config(ui_state.config_path, &ui_state.config);
+    }
+
+    // 6. Build Dropdown
+    for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
+        if (ui_state.config.audio_profiles[i].in_pref) {
+            bool is_online = false;
             for (int j = 0; j < online_count; j++) {
                 if (strcmp(ui_state.config.audio_profiles[i].device_name, active_devs[j].display_name) == 0) {
-                    is_online = 1;
+                    is_online = true;
                     break;
                 }
             }
 
             if (is_online) {
-                gtk_string_list_append(cycler_model, ui_state.config.audio_profiles[i].device_name);
-                if (strcmp(ui_state.config.audio_profiles[i].device_name, ui_state.config.audio_device) == 0) {
+                gtk_string_list_append(pref_model, ui_state.config.audio_profiles[i].device_name);
+                if (strcmp(ui_state.config.audio_profiles[i].device_name, target_device) == 0) {
                     active_idx = count;
                 }
                 count++;
@@ -158,39 +259,30 @@ void update_dashboard_cycler_ui(void) {
         }
     }
 
-    // Fallback: If no cycler devices are online, just show the current active device
-    if (count == 0) {
-        gtk_string_list_append(cycler_model, ui_state.config.audio_device);
-        active_idx = 0;
+    if (count == 0 || active_idx == -1) {
+        gtk_string_list_append(pref_model, target_device);
+        active_idx = count;
     }
 
-    gtk_drop_down_set_model(GTK_DROP_DOWN(input_cycler_drop), G_LIST_MODEL(cycler_model));
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(input_cycler_drop), active_idx);
+    gtk_drop_down_set_model(GTK_DROP_DOWN(input_pref_drop), G_LIST_MODEL(pref_model));
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(input_pref_drop), active_idx);
 
-    cycler_is_updating = false;
+    pref_is_updating = false;
 }
 
-static void on_cycler_selection_changed(GObject *gobject, GParamSpec *pspec, gpointer user_data) {
+static void on_pref_selection_changed(GObject *gobject, GParamSpec *pspec, gpointer user_data) {
     (void)pspec; (void)user_data;
-    if (cycler_is_updating) return;
+    if (pref_is_updating) return;
 
     guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(gobject));
     if (selected == GTK_INVALID_LIST_POSITION) return;
 
-    const char *new_device = gtk_string_list_get_string(cycler_model, selected);
+    const char *new_device = gtk_string_list_get_string(pref_model, selected);
     if (!new_device) return;
 
-    // 1. Hot-Patch the audio engine instantly
     patch_audio_ports(new_device);
-
     strncpy(ui_state.config.audio_device, new_device, sizeof(ui_state.config.audio_device) - 1);
 
-    // 2. Update the Dashboard Text
-    char new_label[256];
-    snprintf(new_label, sizeof(new_label), "%s Gain (Pre-Buffer dB):", new_device);
-    gtk_label_set_text(GTK_LABEL(lbl_input_device), new_label);
-
-    // 3. Recall the saved gain profile for the new device
     float target_multiplier = 1.0f;
     for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
         if (strcmp(ui_state.config.audio_profiles[i].device_name, new_device) == 0) {
@@ -204,13 +296,11 @@ static void on_cycler_selection_changed(GObject *gobject, GParamSpec *pspec, gpo
 
     float loaded_db = (target_multiplier <= 0.001f) ? -24.0f : 20.0f * log10f(target_multiplier);
 
-    // Temporarily block the spinner signal so updating the UI doesn't trigger a redundant config save
     g_signal_handlers_block_by_func(input_gain_spinner, G_CALLBACK(on_input_gain_changed), NULL);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(input_gain_spinner), loaded_db);
     g_signal_handlers_unblock_by_func(input_gain_spinner, G_CALLBACK(on_input_gain_changed), NULL);
 
     save_qjams_config(ui_state.config_path, &ui_state.config);
-
     update_hardware_status_label();
 }
 
@@ -263,39 +353,83 @@ void on_speed_clicked(GtkButton *button, gpointer user_data) {
     speed_debounce_id = g_timeout_add(500, apply_speed_deferred, NULL);
 }
 
-static gboolean apply_zoom_deferred(gpointer user_data) {
-    (void)user_data;
-    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-    size_t total_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-
-    if (total_frames > 0 && waveform_area_bt) {
-        int width = gtk_widget_get_width(waveform_area_bt);
-        double virtual_width = width * zoom_multiplier;
-        double playhead_virtual_x = ((double)current_pos / (double)total_frames) * virtual_width;
-
-        gtk_adjustment_set_upper(waveform_adj, virtual_width);
-        gtk_adjustment_set_page_size(waveform_adj, width);
-        gtk_adjustment_set_step_increment(waveform_adj, 50.0);
-        gtk_adjustment_set_page_increment(waveform_adj, width * 0.9);
-
-        double new_scroll = playhead_virtual_x - (width / 2.0);
-        if (new_scroll < 0) new_scroll = 0;
-        if (new_scroll > virtual_width - width) new_scroll = virtual_width - width;
-
-        gtk_adjustment_set_value(waveform_adj, new_scroll);
-    }
-
-    invalidate_waveform_caches();
-    gtk_widget_queue_draw(waveform_area_bt);
-    gtk_widget_queue_draw(waveform_area_input);
-    return G_SOURCE_REMOVE;
+static void async_crop_thread(GTask *task, gpointer source, gpointer task_data, GCancellable *c) {
+    (void)source; (void)task_data; (void)c;
+    extern void crop_canvas(void);
+    crop_canvas();
+    g_task_return_boolean(task, TRUE);
 }
 
-static void on_zoom_clicked(GtkButton *button, gpointer user_data) {
-    (void)button; (void)user_data;
+static void async_crop_ready(GObject *source, GAsyncResult *res, gpointer data) {
+    (void)source; (void)data;
+    g_task_propagate_boolean(G_TASK(res), NULL);
+
+    extern void mark_session_dirty(void);
+    extern void invalidate_waveform_caches(void);
+    extern double zoom_multiplier;
+    extern void set_app_waiting_state(bool);
+
+    mark_session_dirty();
     zoom_multiplier = 1.0;
+
     update_zoom_button_label_to_length();
-    apply_zoom_deferred(NULL);
+    invalidate_waveform_caches();
+
+    extern GtkWidget *waveform_area_bt;
+    extern GtkWidget *waveform_area_input;
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner) gtk_spinner_stop(GTK_SPINNER(main_spinner));
+    set_app_waiting_state(false);
+
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, TRUE);
+    }
+
+    log_and_notify(1, "Status: Canvas cropped to recording length");
+}
+
+static void on_crop_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)user_data;
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+        if (win) {
+            GtkWidget *master_box = gtk_window_get_child(win);
+            if (master_box) gtk_widget_set_sensitive(master_box, FALSE);
+        }
+
+        extern GtkWidget *main_spinner;
+        if (main_spinner) gtk_spinner_start(GTK_SPINNER(main_spinner));
+
+        extern void set_app_waiting_state(bool);
+        set_app_waiting_state(true);
+
+        GTask *task = g_task_new(NULL, NULL, async_crop_ready, NULL);
+        g_task_run_in_thread(task, async_crop_thread);
+        g_object_unref(task);
+    }
+}
+
+static void on_crop_clicked(GtkButton *button, gpointer user_data) {
+    (void)user_data;
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) return;
+
+    GtkAlertDialog *alert = gtk_alert_dialog_new("Crop track to recording length?");
+    gtk_alert_dialog_set_detail(alert, "This will shrink the session length to fit your active audio (plus a 2-second reverb tail). Are you sure?");
+
+    const char *buttons[] = { "Crop Canvas", "Cancel", NULL };
+    gtk_alert_dialog_set_buttons(alert, buttons);
+    gtk_alert_dialog_set_cancel_button(alert, 1);
+    gtk_alert_dialog_set_default_button(alert, 0);
+
+    GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button)));
+    gtk_alert_dialog_choose(alert, parent, NULL, on_crop_confirm, NULL);
+    g_object_unref(alert);
 }
 
 void prepare_engine_for_new_track(void) {
@@ -313,11 +447,26 @@ void prepare_engine_for_new_track(void) {
     set_playback_speed(1.0f);
     if (btn_speed) gtk_button_set_label(GTK_BUTTON(btn_speed), "Speed: 1.0x");
 
-    // DO NOT set pristine_frames to 0 here. Let the DSP engine manage its own bounds.
-    atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
+    extern int resize_loop_canvas_seconds(int);
+    int limit_min = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
+    resize_loop_canvas_seconds(limit_min * 60);
+
+    // Maintain the synchronized backing track bounds
+    atomic_store_explicit(&current_recording_track, 0, memory_order_release);
+    atomic_store_explicit(&active_track_count, 1, memory_order_release);
+    atomic_store_explicit(&selected_tracks_mask, 1, memory_order_release);
+
     ui_state.is_existing_session = false;
-    ui_state.session_is_dirty = false;
+    mark_session_saved();
+
+    extern void update_zoom_button_label_to_length(void);
     update_zoom_button_label_to_length();
+
+    extern void invalidate_waveform_caches(void);
+    invalidate_waveform_caches();
+
+    extern GtkWidget *waveform_area_bt;
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
 }
 
 static void on_prev_track_clicked(GtkButton *button, gpointer user_data) {
@@ -333,7 +482,18 @@ static void on_next_track_clicked(GtkButton *button, gpointer user_data) {
 static void* mkv_video_loop(void *arg) {
     char *filepath = (char*)arg;
     AVFormatContext *fmt_ctx = NULL;
-    if (avformat_open_input(&fmt_ctx, filepath, NULL, NULL) != 0) { free(filepath); return NULL; }
+
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "probesize", "1048576", 0);       // 1MB max probe (down from 5MB)
+    av_dict_set(&opts, "analyzeduration", "1000000", 0); // 1 second max analysis
+
+    if (avformat_open_input(&fmt_ctx, filepath, NULL, &opts) != 0) {
+        av_dict_free(&opts);
+        free(filepath);
+        return NULL;
+    }
+    av_dict_free(&opts);
+
     avformat_find_stream_info(fmt_ctx, NULL);
 
     if (!mkv_rgba_pool[0]) {
@@ -345,6 +505,11 @@ static void* mkv_video_loop(void *arg) {
 
     AVCodecContext *v_ctx = avcodec_alloc_context3(NULL);
     avcodec_parameters_to_context(v_ctx, fmt_ctx->streams[v_idx]->codecpar);
+
+    // --- NEW: Enable CPU Multithreading ---
+    v_ctx->thread_count = 0; // 0 = Auto-detect maximum logical cores
+    v_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
     const AVCodec *v_codec = avcodec_find_decoder(v_ctx->codec_id);
     avcodec_open2(v_ctx, v_codec, NULL);
 
@@ -354,8 +519,16 @@ static void* mkv_video_loop(void *arg) {
     AVRational time_base = fmt_ctx->streams[v_idx]->time_base;
     double last_audio_time = -1.0;
 
-    int target_w = 676;
-    int target_h = 380;
+    // MATCH LIVE CAMERA PREVIEW DIMENSIONS
+    int target_w = 320;
+    int target_h = 180;
+
+    // --- DETECT LIVE TAKE OFFSET ---
+    bool is_live_take = false;
+    extern char current_raw_path[1024];
+    if (strcmp(filepath, current_raw_path) == 0) {
+        is_live_take = true;
+    }
 
     while (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
         int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
@@ -364,19 +537,55 @@ static void* mkv_video_loop(void *arg) {
         size_t pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
         double current_audio_time = (double)pos / current_rate;
 
-        // Synchronize the original MKV video time with the Stretched audio playback time
-        if (fabs(current_audio_time - last_audio_time) > 0.25 && last_audio_time >= 0.0) {
+        double offset_sec = 0.0;
+        if (is_live_take) {
+            extern size_t video_start_frame;
+            offset_sec = (double)video_start_frame / current_rate;
+        }
 
-            // SHOWSTOPPER 4 Drain the preview queue instantly to prevent stale frame tearing during scrub delay
+        double local_audio_time = current_audio_time - offset_sec;
+
+        // DYNAMIC V4L2 HANDOFF: Pure math, entirely decoupled from FFmpeg state
+        bool inside_video = false;
+        if (is_live_take) {
+            extern size_t video_start_frame;
+            extern size_t video_end_frame;
+            extern _Atomic bool video_is_armed;
+            size_t v_end = video_end_frame;
+            if (atomic_load_explicit(&engine_is_recording, memory_order_acquire) &&
+                atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+                v_end = pos; // Follow playhead while actively recording
+                }
+                if (pos >= video_start_frame && pos <= v_end) inside_video = true;
+        } else {
+            extern size_t get_last_audible_frame(void);
+            size_t last_f = get_last_audible_frame();
+            if (last_f == 0) last_f = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            if (pos <= last_f) inside_video = true;
+        }
+        atomic_store_explicit(&is_mkv_mode, inside_video, memory_order_release);
+
+        // Wait for the playhead to reach the video punch-in point
+        if (local_audio_time < 0.0) {
+            usleep(10000);
+            continue;
+        }
+
+        // --- Track speed changes to force immediate decoder flush ---
+        static float last_seen_speed = 1.0f;
+        float current_speed_check = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+        bool speed_changed = (current_speed_check != last_seen_speed);
+        last_seen_speed = current_speed_check;
+
+        if (last_audio_time < 0.0 || fabs(local_audio_time - last_audio_time) > 0.25 || speed_changed) {
             PreviewPayload stale_payload;
             while (pop_preview_frame(&preview_queue, &stale_payload)) {}
 
-            float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
-            double target_mkv_time = current_audio_time * (current_speed > 0.0f ? current_speed : 1.0f);
+            double target_mkv_time = local_audio_time * (current_speed_check > 0.0f ? current_speed_check : 1.0f);
             av_seek_frame(fmt_ctx, v_idx, (int64_t)(target_mkv_time / av_q2d(time_base)), AVSEEK_FLAG_BACKWARD);
             avcodec_flush_buffers(v_ctx);
         }
-        last_audio_time = current_audio_time;
+        last_audio_time = local_audio_time;
 
         if (av_read_frame(fmt_ctx, pkt) >= 0) {
             if (pkt->stream_index == v_idx) {
@@ -384,16 +593,18 @@ static void* mkv_video_loop(void *arg) {
                     while (avcodec_receive_frame(v_ctx, frame) == 0) {
                         double raw_frame_time = frame->pts * av_q2d(time_base);
                         double frame_time = 0.0;
-                        double sync_last_audio = current_audio_time;
+                        double sync_last_audio = local_audio_time;
 
                         while (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
                             float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
                             frame_time = raw_frame_time / (current_speed > 0.0f ? current_speed : 1.0f);
                             size_t pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-                            current_audio_time = (double)pos / current_rate;
-                            if (current_audio_time < sync_last_audio - 0.2) break;
-                            sync_last_audio = current_audio_time;
-                            double time_diff = frame_time - current_audio_time;
+                            double inner_audio_time = (double)pos / current_rate;
+                            double inner_local_time = inner_audio_time - offset_sec;
+
+                            if (inner_local_time < sync_last_audio - 0.2) break;
+                            sync_last_audio = inner_local_time;
+                            double time_diff = frame_time - inner_local_time;
                             if (time_diff <= 0.05) break;
                             long long delay_ns = (long long)((time_diff - 0.05) * 1000000000LL);
                             if (delay_ns > 10000000LL) delay_ns = 10000000LL;
@@ -405,7 +616,7 @@ static void* mkv_video_loop(void *arg) {
                             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
                         }
 
-                        if (frame_time < current_audio_time - 0.1) continue;
+                        if (frame_time < local_audio_time - 0.1) continue;
 
                         if (!sws_ctx) {
                             double src_aspect = (double)frame->width / (double)frame->height;
@@ -417,56 +628,78 @@ static void* mkv_video_loop(void *arg) {
                             sws_ctx = sws_getContext(frame->width, frame->height, frame->format, scaled_w, scaled_h, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
                         }
 
-                        size_t p_w_idx = atomic_load_explicit(&preview_queue.write_index, memory_order_relaxed);
-                        size_t p_r_idx = atomic_load_explicit(&preview_queue.read_index, memory_order_acquire);
-                        if (p_w_idx - p_r_idx >= preview_queue.capacity) continue;
+                        // Mutes MKV playback rendering during active recording to prevent UI frame collision
+                        // with the live V4L2 camera feed. The decoder remains synced silently in the background.
+                        if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+                            size_t p_w_idx = atomic_load_explicit(&preview_queue.write_index, memory_order_relaxed);
+                            size_t p_r_idx = atomic_load_explicit(&preview_queue.read_index, memory_order_acquire);
+                            if (p_w_idx - p_r_idx >= preview_queue.capacity) continue;
 
-                        uint8_t *rgba_buf = mkv_rgba_pool[p_w_idx & 31];
-                        memset(rgba_buf, 0, target_w * target_h * 4);
-                        double src_aspect = (double)frame->width / (double)frame->height;
-                        double target_aspect = (double)target_w / (double)target_h;
-                        int scaled_w = target_w;
-                        int scaled_h = target_h;
-                        if (src_aspect > target_aspect) scaled_h = (int)((double)target_w / src_aspect);
-                        else scaled_w = (int)((double)target_h * src_aspect);
-                        int x_offset = (target_w - scaled_w) / 2;
-                        int y_offset = (target_h - scaled_h) / 2;
-                        uint8_t *dest_data[4] = { rgba_buf + (y_offset * target_w + x_offset) * 4, NULL, NULL, NULL };
-                        int dest_linesize[4] = { target_w * 4, 0, 0, 0 };
+                            uint8_t *rgba_buf = mkv_rgba_pool[p_w_idx & 31];
+                            memset(rgba_buf, 0, target_w * target_h * 4);
+                            double src_aspect = (double)frame->width / (double)frame->height;
+                            double target_aspect = (double)target_w / (double)target_h;
+                            int scaled_w = target_w;
+                            int scaled_h = target_h;
+                            if (src_aspect > target_aspect) scaled_h = (int)((double)target_w / src_aspect);
+                            else scaled_w = (int)((double)target_h * src_aspect);
+                            int x_offset = (target_w - scaled_w) / 2;
+                            int y_offset = (target_h - scaled_h) / 2;
+                            uint8_t *dest_data[4] = { rgba_buf + (y_offset * target_w + x_offset) * 4, NULL, NULL, NULL };
+                            int dest_linesize[4] = { target_w * 4, 0, 0, 0 };
 
-                        sws_scale(sws_ctx, (const uint8_t * const *)frame->data, frame->linesize, 0, frame->height, dest_data, dest_linesize);
-                        push_preview_frame(&preview_queue, rgba_buf, target_w, target_h);
+                            sws_scale(sws_ctx, (const uint8_t * const *)frame->data, frame->linesize, 0, frame->height, dest_data, dest_linesize);
+                            push_preview_frame(&preview_queue, rgba_buf, target_w, target_h);
+                        }
                     }
                 }
             }
             av_packet_unref(pkt);
         } else {
-            double last_standby_time = current_audio_time;
+            size_t standby_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+
             while (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
-                size_t pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+                size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
                 int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-                float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
-                double new_audio_time = rate > 0 ? ((double)pos / rate) : 0.0;
+                if (rate <= 0) rate = 48000;
 
-                // Map standby loop seek target to original MKV video time
-                if (new_audio_time < last_standby_time - 0.5) {
+                // Dynamically maintain handoff while in standby
+                bool inside_video = false;
+                if (is_live_take) {
+                    extern size_t video_start_frame;
+                    extern size_t video_end_frame;
+                    if (current_pos >= video_start_frame && current_pos <= video_end_frame) inside_video = true;
+                } else {
+                    extern size_t get_last_audible_frame(void);
+                    size_t last_f = get_last_audible_frame();
+                    if (last_f == 0) last_f = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+                    if (current_pos <= last_f) inside_video = true;
+                }
+                atomic_store_explicit(&is_mkv_mode, inside_video, memory_order_release);
 
-                    // SHOWSTOPPER 4 Drain the preview queue on loop resets
+                // Detect seek by looking for playhead discontinuity (>100ms jump)
+                if (current_pos < standby_pos || current_pos > standby_pos + (rate / 2)) {
                     PreviewPayload stale_payload;
                     while (pop_preview_frame(&preview_queue, &stale_payload)) {}
 
-                    double target_mkv_time = new_audio_time * (current_speed > 0.0f ? current_speed : 1.0f);
+                    float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+                    double new_local_time = ((double)current_pos / rate) - offset_sec;
+                    double target_mkv_time = new_local_time * (current_speed > 0.0f ? current_speed : 1.0f);
+
                     int v_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
                     av_seek_frame(fmt_ctx, v_idx, (int64_t)(target_mkv_time / av_q2d(time_base)), AVSEEK_FLAG_BACKWARD);
                     avcodec_flush_buffers(v_ctx);
+
+                    last_audio_time = new_local_time;
                     break;
                 }
-                last_standby_time = new_audio_time;
+                standby_pos = current_pos;
                 usleep(10000);
             }
         }
     }
 
+    atomic_store_explicit(&is_mkv_mode, false, memory_order_release);
     avcodec_free_context(&v_ctx);
     avformat_close_input(&fmt_ctx);
 
@@ -478,158 +711,83 @@ static void* mkv_video_loop(void *arg) {
     return NULL;
 }
 
-static void load_track_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+/**
+ * @brief Background thread to safely allocate the canvas.
+ * @note Safety [Critical]: The RT thread must be alive and ticking before `init_empty_loop_canvas`
+ * is allowed to attempt the `await_rt_thread_detach` lock-free handshake.
+ */
+static void init_canvas_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
     (void)source_object; (void)cancellable;
-    char *filepath = (char *)task_data;
-    int result = load_backing_track(filepath, client);
-    g_task_return_int(task, result);
+    int duration_sec = GPOINTER_TO_INT(task_data);
+
+    // Give PipeWire an initial 500ms grace period to negotiate the hardware graph
+    usleep(500000);
+
+    int retries = 10;
+    int status = -1;
+    while (retries > 0) {
+        extern int init_empty_loop_canvas(int);
+        status = init_empty_loop_canvas(duration_sec);
+        if (status == 0 || status == -2) break; // Success or Hard RAM limit reached
+
+        usleep(500000); // Patiently wait 500ms and try again
+        retries--;
+    }
+    g_task_return_int(task, status);
 }
 
-static void load_track_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+static void init_canvas_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     (void)source_object; (void)user_data;
     GError *error = NULL;
-    int result = g_task_propagate_int(G_TASK(res), &error);
+    int status = g_task_propagate_int(G_TASK(res), &error);
 
-    ui_state.is_loading_track = false;
-    gtk_spinner_stop(GTK_SPINNER(main_spinner)); // Halt the spinner
-
-    if (result == 0) {
-        gchar *basename = g_path_get_basename(ui_state.selected_track_path);
-
-        // WIPE GHOST UI LAYERS AND SYNC BASE TRACK NAME ---
-        extern void reset_multitrack_ui_states(void);
-        reset_multitrack_ui_states();
-        char display_name[256];
-        strncpy(display_name, basename, sizeof(display_name) - 1);
-        char *dot = strrchr(display_name, '.');
-        if (dot) *dot = '\0';
-
-        extern void set_multitrack_track_name(int, const char *);
-        set_multitrack_track_name(0, display_name);
-        g_free(basename);
-
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Ready");
-        gtk_widget_set_sensitive(btn_play, TRUE);
-
-        bool is_mkv = g_str_has_suffix(ui_state.selected_track_path, ".mkv");
-        bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+    if (status == 0) {
+        extern void update_multitrack_status_ui(void);
+        update_multitrack_status_ui();
+        gtk_widget_set_sensitive(btn_play, FALSE);
         gtk_widget_set_sensitive(btn_record, TRUE);
 
-        if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
-            atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
-            pthread_join(mkv_video_thread, NULL);
-        }
-
-        if (is_mkv && !is_multitrack) {
-            atomic_store_explicit(&is_mkv_mode, true, memory_order_release);
-            atomic_store_explicit(&mkv_video_keep_running, true, memory_order_release);
-            pthread_create(&mkv_video_thread, NULL, mkv_video_loop, g_strdup(ui_state.selected_track_path));
-        } else {
-            atomic_store_explicit(&is_mkv_mode, false, memory_order_release);
-        }
-
-        update_playlist_toggle_state();
-        if (is_multitrack) update_multitrack_status_ui();
+        mark_session_saved();
+        extern void update_zoom_button_label_to_length(void);
         update_zoom_button_label_to_length();
-    } else if (result == -2) {
-        gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Track exceeds safe RAM limits</b></span>");
-        gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
-    } else if (result == -3) {
-        gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Track Load Failed (Corrupt or Empty Media)</b></span>");
-        gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
-        ui_state.selected_track_path[0] = '\0';
-        update_playlist_toggle_state();
+
+        extern void invalidate_waveform_caches(void);
+        invalidate_waveform_caches();
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+        if (lbl_status) log_and_notify(1, "Status: Ready");
+
     } else {
-        if (access(ui_state.selected_track_path, F_OK) != 0) {
-            gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Track not found, removed from playlist</b></span>");
-            remove_track_from_playlist(ui_state.selected_track_path);
-        } else {
-            gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Media Load Failed</b></span>");
+        if (lbl_status) {
+            if (status == -2) {
+                log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM for blank canvas</b></span>");
+            } else {
+                log_and_notify(1, "<span foreground='#ff4444'><b>Status: Audio Engine Timeout (Failed to allocate canvas)</b></span>");
+            }
         }
-        gtk_label_set_text(GTK_LABEL(lbl_track), "Track: None Selected");
-        ui_state.selected_track_path[0] = '\0';
-        update_playlist_toggle_state();
     }
-
-    gtk_widget_set_sensitive(btn_load, TRUE);
-    gtk_widget_set_sensitive(btn_prev, TRUE);
-    gtk_widget_set_sensitive(btn_next, TRUE);
-    gtk_widget_set_sensitive(btn_playlist_toggle, TRUE);
-
-    invalidate_waveform_caches();
-
-    gtk_widget_queue_draw(waveform_area_bt);
-    gtk_widget_queue_draw(waveform_area_input);
 }
 
-void trigger_track_load(void) {
-    prepare_engine_for_new_track();
-    ui_state.is_loading_track = true;
-    zoom_multiplier = 1.0;
+void adjust_blank_canvas(void) {
+    if (is_session_dirty()) return;
 
-    gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Loading track into memory...");
-    gtk_label_set_text(GTK_LABEL(lbl_track), "Track: Loading...");
-    gtk_spinner_start(GTK_SPINNER(main_spinner)); // Start the spinner
+    if (lbl_status) log_and_notify(1, "Status: Starting Audio Engine...");
 
-    gtk_widget_set_sensitive(btn_load, FALSE);
-    gtk_widget_set_sensitive(btn_prev, FALSE);
-    gtk_widget_set_sensitive(btn_next, FALSE);
-    gtk_widget_set_sensitive(btn_play, FALSE);
-    gtk_widget_set_sensitive(btn_record, FALSE);
-    gtk_widget_set_sensitive(btn_playlist_toggle, FALSE);
+    int canvas_limit_min = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
+    int duration_sec = canvas_limit_min * 60;
 
-    gtk_widget_queue_draw(waveform_area_bt);
-    gtk_widget_queue_draw(waveform_area_input);
-
-    GTask *task = g_task_new(NULL, NULL, load_track_ready, NULL);
-    g_task_set_task_data(task, g_strdup(ui_state.selected_track_path), g_free);
-    g_task_run_in_thread(task, load_track_thread);
+    // Launch the non-blocking background allocation
+    GTask *task = g_task_new(NULL, NULL, init_canvas_ready, NULL);
+    g_task_set_task_data(task, GINT_TO_POINTER(duration_sec), NULL);
+    g_task_run_in_thread(task, init_canvas_thread);
     g_object_unref(task);
-}
-
-/**
- * @brief Dynamically resizes an empty recording canvas when the application mode changes.
- * Prevents canvas length mismatches by verifying that no audio has been committed to the buffer before reallocating.
- * @param is_multitrack Current target state of the application mode.
- */
-void adjust_blank_canvas_for_mode(bool is_multitrack) {
-    if (strlen(ui_state.selected_track_path) > 0) return; // Track is loaded, leave it alone
-    if (ui_state.session_is_dirty) return; // Canvas has recorded audio, preserve it
-
-    int free_min = ui_state.config.freestyle_duration_min > 0 ? ui_state.config.freestyle_duration_min : 15;
-    int multitrack_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
-
-    if (is_multitrack) {
-        if (init_empty_loop_canvas(multitrack_min * 60) == 0) {
-            extern void update_multitrack_status_ui(void);
-            update_multitrack_status_ui();
-            gtk_widget_set_sensitive(btn_play, TRUE);
-            gtk_widget_set_sensitive(btn_record, TRUE);
-        }
-    } else {
-        if (init_empty_loop_canvas(free_min * 60) == 0) {
-            char track_lbl[128];
-            snprintf(track_lbl, sizeof(track_lbl), "Track: Freestyle Ready [%02d:00 limit]", free_min);
-            gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
-            gtk_widget_set_sensitive(btn_play, TRUE);
-            gtk_widget_set_sensitive(btn_record, TRUE);
-        }
-    }
-
-    ui_state.session_is_dirty = false;
-    update_zoom_button_label_to_length();
-    extern void invalidate_waveform_caches(void);
-    invalidate_waveform_caches();
-    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
 }
 
 static void start_recording_execution(void) {
     size_t current_bt_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
 
-    // Synchronously force the playhead to 0 if we are at the end.
-    // This prevents the UI tick from reading a stale end-of-track position and instantly aborting the recording.
     if (current_bt_frames > 0 && current_pos >= current_bt_frames) {
         atomic_store_explicit(&playback_pos, 0, memory_order_release);
         seek_backing_track(0.0);
@@ -638,31 +796,20 @@ static void start_recording_execution(void) {
     if (btn_save_mux) gtk_widget_remove_css_class(btn_save_mux, "needs-save");
     if (btn_save_session) gtk_widget_remove_css_class(btn_save_session, "needs-save");
 
-    if (ui_state.is_existing_session) {
-        ui_state.session_is_dirty = true;
-    }
+    mark_session_dirty();
 
     if (current_bt_frames == 0) {
-        bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
-        int free_min = ui_state.config.freestyle_duration_min > 0 ? ui_state.config.freestyle_duration_min : 15;
-        int multitrack_min = ui_state.config.multitrack_duration_min > 0 ? ui_state.config.multitrack_duration_min : 5;
-        int duration_sec = is_multitrack ? (multitrack_min * 60) : (free_min * 60);
+        int canvas_limit_min = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
 
-        if (init_empty_loop_canvas(duration_sec) != 0) {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Insufficient RAM for blank canvas.");
+        if (init_empty_loop_canvas(canvas_limit_min * 60) != 0) {
+            log_and_notify(1, "Status: Insufficient RAM for blank canvas.");
             return;
         }
 
-        if (is_multitrack) {
-            char track_lbl[128];
-            snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00 limit]", multitrack_min);
-            gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
-            update_multitrack_status_ui();
-        } else {
-            char track_lbl[128];
-            snprintf(track_lbl, sizeof(track_lbl), "Track: Freestyle Recording [%02d:00 limit]", free_min);
-            gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
-        }
+        char track_lbl[128];
+        snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00 limit]", canvas_limit_min);
+        gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
+        update_multitrack_status_ui();
         update_zoom_button_label_to_length();
     }
 
@@ -678,10 +825,11 @@ static void start_recording_execution(void) {
         g_free(tmp);
     }
 
-    // Delete the previous take's raw video file from disk before creating a new one
     if (strlen(current_raw_path) > 0) {
         remove(current_raw_path);
     }
+
+    clear_video_stash_async();
 
     snprintf(final_save_path, sizeof(final_save_path), "%s/%04d%02d%02d-%02d%02d%02d-%s-RAW.mkv",
              ui_state.config.recordings_dir, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -692,38 +840,64 @@ static void start_recording_execution(void) {
              tm.tm_hour, tm.tm_min, tm.tm_sec);
     int current_samplerate = client ? jack_get_sample_rate(client) : 48000;
 
-    // ALWAYS backup the undo buffer for the active layer, even if Video Mode is rendering a performance
     if (await_rt_thread_detach()) {
         int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-        if (rec_track >= 0 && rec_track < MAX_TRACKS && master_tracks[rec_track].active_buffer && master_tracks[rec_track].undo_buffer) {
-            memcpy(master_tracks[rec_track].undo_buffer, master_tracks[rec_track].active_buffer, pristine_frames * 2 * sizeof(float));
+        backup_track_to_ledger(rec_track);
 
-            bool prev_audio = atomic_load_explicit(&master_tracks[rec_track].has_audio, memory_order_acquire);
-            atomic_store_explicit(&master_tracks[rec_track].undo_has_audio, prev_audio, memory_order_release);
-            atomic_store_explicit(&master_tracks[rec_track].has_undo, true, memory_order_release);
+        extern size_t pristine_frames;
+        if (rec_track >= 0 && rec_track < MAX_TRACKS && master_tracks[rec_track].active_buffer && pristine_frames > 0) {
+            memset(master_tracks[rec_track].active_buffer, 0, pristine_frames * 2 * sizeof(float));
         }
+
         resume_rt_thread();
     }
 
-    // Start the Video encoder if we are in Video Mode
-    if (!atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+    // Unifed Encoder Gate: Only launch FFmpeg if the UI 'Arm Video' toggle is active
+    if (atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+        extern void mark_current_transaction_as_video(void);
+        mark_current_transaction_as_video();
+
+        video_start_frame = atomic_load_explicit(&playback_pos, memory_order_acquire);
+        video_end_frame = 0;
+
         if (init_and_start_encoder(current_raw_path, capture_width, capture_height, current_samplerate, &video_queue) != 0) {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Encoder Failed");
+            log_and_notify(1, "Status: Encoder Failed");
             return;
         }
     }
 
     atomic_store_explicit(&engine_is_armed, true, memory_order_release);
     atomic_store_explicit(&engine_is_recording, true, memory_order_release);
-    invalidate_waveform_caches();
+
+    extern void trigger_global_ui_refresh(void);
+    trigger_global_ui_refresh();
 
     if (!atomic_load_explicit(&engine_is_playing, memory_order_acquire)) {
         atomic_store_explicit(&engine_is_playing, true, memory_order_release);
     }
 
-    gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording");
-    gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-pause-symbolic");
-    gtk_widget_set_tooltip_text(btn_play, "Pause (Space / P)");
+    // IN start_recording_execution() replace the button setup with this:
+    log_and_notify(1, "Status: Recording");
+
+    bool is_video = atomic_load_explicit(&video_is_armed, memory_order_acquire);
+
+    if (is_video) {
+        gtk_button_set_label(GTK_BUTTON(btn_record), "🎜");
+        gtk_widget_set_sensitive(btn_record, FALSE);
+        if (btn_record_video) {
+            gtk_button_set_label(GTK_BUTTON(btn_record_video), "⏸");
+            gtk_widget_set_tooltip_text(btn_record_video, "Pause Video Recording");
+            gtk_widget_set_sensitive(btn_record_video, TRUE);
+        }
+    } else {
+        gtk_button_set_label(GTK_BUTTON(btn_record), "⏸");
+        gtk_widget_set_tooltip_text(btn_record, "Pause Audio Recording");
+        gtk_widget_set_sensitive(btn_record, TRUE);
+        if (btn_record_video) {
+            gtk_button_set_label(GTK_BUTTON(btn_record_video), "🖵");
+            gtk_widget_set_sensitive(btn_record_video, FALSE);
+        }
+    }
 
     gtk_widget_set_sensitive(btn_load, FALSE);
     gtk_widget_set_sensitive(btn_settings, FALSE);
@@ -731,31 +905,41 @@ static void start_recording_execution(void) {
     gtk_widget_set_sensitive(btn_next, FALSE);
     gtk_widget_set_sensitive(btn_speed, FALSE);
     gtk_widget_set_sensitive(btn_save_mux, FALSE);
-    gtk_widget_set_sensitive(btn_play, TRUE);
-    gtk_widget_set_sensitive(btn_record, FALSE);
+    gtk_widget_set_sensitive(btn_play, FALSE);
     gtk_widget_set_sensitive(btn_stop, TRUE);
 
     if (btn_play) gtk_widget_grab_focus(btn_play);
 }
 
+// countdown timer for inside canvas loop
+bool is_countdown_active(void) {
+    return countdown_timer_id != 0;
+}
+
 static gboolean countdown_tick(gpointer user_data) {
     (void)user_data;
+    EngineCommand cmd = { .type = CMD_PLAY_CLICK, .target_track = 0 };
+    extern SPSC_Command_Queue cmd_queue;
+    extern int push_command(SPSC_Command_Queue*, EngineCommand);
+
     if (countdown_val > 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "<span size='48000' weight='heavy'>%d</span>", countdown_val);
         gtk_label_set_markup(GTK_LABEL(countdown_label), buf);
+
+        push_command(&cmd_queue, cmd);
+
         countdown_val--;
         return G_SOURCE_CONTINUE;
     } else if (countdown_val == 0) {
         gtk_label_set_markup(GTK_LABEL(countdown_label), "<span size='48000' weight='heavy' foreground='#ff4444'>GO!</span>");
+
+        push_command(&cmd_queue, cmd);
+
         countdown_val--;
         return G_SOURCE_CONTINUE;
     } else {
-        // Start the recording engine FIRST, so that engine_is_playing becomes true.
-        // This prevents the on_countdown_destroyed failsafe from aborting the record sequence.
         start_recording_execution();
-
-        // Clear the timer ID so the destroy handler knows it completed naturally
         countdown_timer_id = 0;
 
         if (countdown_window) {
@@ -776,18 +960,51 @@ static void on_countdown_destroyed(GtkWidget *widget, gpointer user_data) {
     countdown_window = NULL;
     countdown_label = NULL;
 
-    // Failsafe: If the window was destroyed mid-countdown by the WM (Alt+F4), abort recording
     if (!atomic_load_explicit(&engine_is_playing, memory_order_acquire) && gtk_widget_is_sensitive(btn_stop)) {
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording Aborted");
+        log_and_notify(1, "Status: Recording Aborted");
         gtk_widget_set_sensitive(btn_record, TRUE);
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, TRUE); // FIX: Restore video button state
         gtk_widget_set_sensitive(btn_play, TRUE);
         gtk_widget_set_sensitive(btn_stop, FALSE);
     }
 }
 
+static gboolean on_countdown_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data) {
+    (void)controller; (void)keycode; (void)state; (void)user_data;
+    if (keyval == GDK_KEY_Escape) {
+        if (countdown_window) {
+            gtk_window_destroy(GTK_WINDOW(countdown_window));
+            countdown_window = NULL;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void on_start_clicked(GtkButton *button, gpointer user_data) {
     (void)button; (void)user_data;
     if (countdown_timer_id != 0) return;
+
+    // --- AUTO-ADVANCE REGRESSION FIX ---
+    // Prevent accidental overwrites of the foundational backing track (Track 1 / index 0).
+    // If Track 1 is armed and has audio, and Track 2 is empty, automatically advance to Track 2.
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    if (rec_track == 0) {
+        bool t0_has_audio = atomic_load_explicit(&master_tracks[0].has_audio, memory_order_acquire);
+        bool t1_has_audio = atomic_load_explicit(&master_tracks[1].has_audio, memory_order_acquire);
+
+        if (t0_has_audio && !t1_has_audio) {
+            atomic_store_explicit(&current_recording_track, 1, memory_order_release);
+            atomic_store_explicit(&selected_tracks_mask, (1 << 1), memory_order_release);
+
+            int active_count = atomic_load_explicit(&active_track_count, memory_order_acquire);
+            if (active_count < 2) {
+                atomic_store_explicit(&active_track_count, 2, memory_order_release);
+            }
+
+            update_multitrack_status_ui();
+        }
+    }
 
     if (atomic_load_explicit(&engine_is_playing, memory_order_acquire)) {
         start_recording_execution();
@@ -795,16 +1012,23 @@ void on_start_clicked(GtkButton *button, gpointer user_data) {
     }
 
     gtk_widget_set_sensitive(btn_record, FALSE);
+    extern GtkWidget *btn_record_video;
+    if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, FALSE);
     gtk_widget_set_sensitive(btn_play, FALSE);
+    gtk_widget_set_sensitive(btn_prev, FALSE);
+    gtk_widget_set_sensitive(btn_next, FALSE);
     gtk_widget_set_sensitive(btn_stop, TRUE);
-    gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Get Ready...");
+    log_and_notify(1, "Status: Get Ready...");
 
     countdown_window = gtk_window_new();
     gtk_window_set_transient_for(GTK_WINDOW(countdown_window), GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(btn_record))));
     gtk_window_set_decorated(GTK_WINDOW(countdown_window), FALSE);
     gtk_window_set_modal(GTK_WINDOW(countdown_window), TRUE);
 
-    // Bind the timer cleanup strictly to the window's destruction
+    GtkEventController *countdown_key_ctrl = gtk_event_controller_key_new();
+    g_signal_connect(countdown_key_ctrl, "key-pressed", G_CALLBACK(on_countdown_key_pressed), NULL);
+    gtk_widget_add_controller(countdown_window, countdown_key_ctrl);
+
     g_signal_connect(countdown_window, "destroy", G_CALLBACK(on_countdown_destroyed), NULL);
 
     countdown_label = gtk_label_new(NULL);
@@ -828,11 +1052,15 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
     (void)button; (void)user_data;
 
     bool was_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
+    extern _Atomic bool is_loop_wrapping;
+    bool wrapping = atomic_exchange_explicit(&is_loop_wrapping, false, memory_order_acquire);
 
     if (countdown_timer_id != 0) {
         if (countdown_window) gtk_window_destroy(GTK_WINDOW(countdown_window));
         gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording Aborted");
         gtk_widget_set_sensitive(btn_record, TRUE);
+        extern GtkWidget *btn_record_video;
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, TRUE);
         gtk_widget_set_sensitive(btn_play, TRUE);
         gtk_widget_set_sensitive(btn_stop, FALSE);
         atomic_store_explicit(&engine_is_playing, false, memory_order_release);
@@ -840,15 +1068,20 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
 
-    clear_loop_points();
-
-    // --- GLOBAL DSP BARRIER ---
+    if (!wrapping) {
+        clear_loop_points();
+    }
     bool detached = await_rt_thread_detach();
 
     atomic_store_explicit(&engine_is_playing, false, memory_order_release);
     atomic_store_explicit(&engine_is_recording, false, memory_order_release);
     atomic_store_explicit(&engine_is_armed, false, memory_order_release);
     atomic_store_explicit(&engine_is_paused, false, memory_order_release);
+
+    if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
+        atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
+        pthread_join(mkv_video_thread, NULL);
+    }
 
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
 
@@ -857,120 +1090,125 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
         atomic_store_explicit(&playback_pos, current_pos, memory_order_release);
     }
 
-    // SHOWSTOPPER 2 Only manipulate memory arrays if the RT thread safely detached
     if (detached) {
         if (was_recording && current_pos > 0) {
-            bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+            if (atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+                video_end_frame = current_pos;
+            }
+
             bool is_blank_canvas = (strlen(ui_state.selected_track_path) == 0);
             int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
             int active_tracks = atomic_load_explicit(&active_track_count, memory_order_acquire);
 
             atomic_store_explicit(&master_tracks[current_rec].has_audio, true, memory_order_release);
-            atomic_store_explicit(&master_tracks[current_rec].is_soloed, true, memory_order_release);
+
+            atomic_store_explicit(&selected_tracks_mask, (1 << current_rec), memory_order_release);
 
             if (current_rec == 0 && active_tracks <= 1 && is_blank_canvas) {
                 atomic_store_explicit(&backing_track_frames, current_pos, memory_order_release);
                 pristine_frames = current_pos;
-
-                char ui_text[128];
-                int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-                int total_secs = (current_rate > 0) ? (current_pos / current_rate) : 0;
-
-                if (is_multitrack) {
-                    seek_backing_track(0.0);
-                } else {
-                    snprintf(ui_text, sizeof(ui_text), "Track: Freestyle Take [%02d:%02d]", total_secs / 60, total_secs % 60);
-                    gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
-                }
+                seek_backing_track(0.0);
             }
 
             if (current_rec == 0 && pristine_bt_buf && master_tracks[0].active_buffer) {
                 memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
             }
 
-            int next_rec = current_rec + 1;
-            if (next_rec < MAX_TRACKS) {
-                atomic_store_explicit(&current_recording_track, next_rec, memory_order_release);
-                int new_active = atomic_load_explicit(&active_track_count, memory_order_acquire);
-                if (next_rec >= new_active) {
-                    atomic_store_explicit(&active_track_count, next_rec + 1, memory_order_release);
+            if (!wrapping) {
+                int next_rec = current_rec + 1;
+                if (next_rec < MAX_TRACKS) {
+                    atomic_store_explicit(&current_recording_track, next_rec, memory_order_release);
+                    int new_active = atomic_load_explicit(&active_track_count, memory_order_acquire);
+                    if (next_rec >= new_active) {
+                        atomic_store_explicit(&active_track_count, next_rec + 1, memory_order_release);
+                    }
                 }
             }
 
             size_t fade_len = (current_pos < 256) ? current_pos : 256;
             if (fade_len > 0) {
-                int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
                 for (size_t f = 0; f < fade_len; f++) {
                     float multiplier = (float)(fade_len - 1 - f) / (float)(fade_len - 1);
                     size_t idx = current_pos - fade_len + f;
 
-                    if (rec_track >= 0 && rec_track < MAX_TRACKS && master_tracks[rec_track].active_buffer) {
-                        master_tracks[rec_track].active_buffer[idx * 2] *= multiplier;
-                        master_tracks[rec_track].active_buffer[idx * 2 + 1] *= multiplier;
+                    if (current_rec >= 0 && current_rec < MAX_TRACKS && master_tracks[current_rec].active_buffer) {
+                        master_tracks[current_rec].active_buffer[idx * 2] *= multiplier;
+                        master_tracks[current_rec].active_buffer[idx * 2 + 1] *= multiplier;
                     }
                 }
             }
 
             update_zoom_button_label_to_length();
+            extern void invalidate_waveform_caches(void);
             invalidate_waveform_caches();
         }
         resume_rt_thread();
-    } else {
-        printf("CRITICAL: Skipped canvas crop and memory operations due to RT Detach Timeout.\n");
     }
 
-    if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-        update_multitrack_status_ui();
-        invalidate_waveform_caches();
-        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
-    }
+    update_multitrack_status_ui();
+    extern void invalidate_waveform_caches(void);
+    invalidate_waveform_caches();
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
 
     stop_encoder();
 
-    if (ui_state.session_is_dirty && !atomic_load_explicit(&is_multitrack_mode, memory_order_acquire) && !was_recording) {
+    if (is_session_dirty() && !was_recording) {
         if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
             atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
             pthread_join(mkv_video_thread, NULL);
         }
-        if (g_str_has_suffix(ui_state.selected_track_path, ".mkv")) {
-            atomic_store_explicit(&is_mkv_mode, true, memory_order_release);
+
+        // Launch dynamic video preview natively if an MKV was recorded into the temp directory
+        if (access(current_raw_path, F_OK) == 0) {
             atomic_store_explicit(&mkv_video_keep_running, true, memory_order_release);
-            pthread_create(&mkv_video_thread, NULL, mkv_video_loop, g_strdup(ui_state.selected_track_path));
-        } else {
-            atomic_store_explicit(&is_mkv_mode, false, memory_order_release);
+            pthread_create(&mkv_video_thread, NULL, mkv_video_loop, g_strdup(current_raw_path));
         }
     }
 
-    if (!atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
-            double l_start = (double)atomic_load_explicit(&loop_start_frame, memory_order_relaxed) / (double)backing_track_frames;
-            seek_backing_track(l_start);
-        } else {
-            seek_backing_track(0.0);
-        }
-    }
+    log_and_notify(1, "Status: Ready");
+    gtk_button_set_icon_name(GTK_BUTTON(btn_play), "");
+    gtk_button_set_label(GTK_BUTTON(btn_play), "▶");
+    gtk_widget_set_tooltip_text(btn_play, "Play (Space)");
 
-    gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Stopped & Ready to Mux");
-    gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-start-symbolic");
-    gtk_widget_set_tooltip_text(btn_play, "Play (Space / P)");
+    gtk_button_set_label(GTK_BUTTON(btn_record), "🎜 ");
+    gtk_widget_set_tooltip_text(btn_record, "Record Audio (R)");
+    if (btn_record_video) {
+        gtk_button_set_label(GTK_BUTTON(btn_record_video), "🖵");
+        gtk_widget_set_tooltip_text(btn_record_video, "Record Audio + Video");
+    }
 
     gtk_widget_set_sensitive(btn_load, TRUE);
     gtk_widget_set_sensitive(btn_settings, TRUE);
     gtk_widget_set_sensitive(btn_prev, TRUE);
     gtk_widget_set_sensitive(btn_next, TRUE);
     gtk_widget_set_sensitive(btn_speed, TRUE);
-    gtk_widget_set_sensitive(btn_play, TRUE);
+
+    bool any_audio = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) {
+            any_audio = true;
+            break;
+        }
+    }
+    gtk_widget_set_sensitive(btn_play, any_audio);
+
+    // RESTORE BOTH BUTTONS
     gtk_widget_set_sensitive(btn_record, TRUE);
+    if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, TRUE);
+
     gtk_widget_set_sensitive(btn_save_mux, TRUE);
     gtk_widget_set_sensitive(btn_stop, FALSE);
 
     if (was_recording) {
+        // SAFETY: Ensure new recordings trigger the quit-warning dialog
+        mark_session_dirty();
+
         if (btn_save_mux) {
             gtk_widget_remove_css_class(btn_save_mux, "needs-save");
             gtk_widget_add_css_class(btn_save_mux, "needs-save");
         }
-        if (btn_save_session && atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
+        if (btn_save_session) {
             gtk_widget_remove_css_class(btn_save_session, "needs-save");
             gtk_widget_add_css_class(btn_save_session, "needs-save");
         }
@@ -979,123 +1217,214 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
     if (btn_play) gtk_widget_grab_focus(btn_play);
 }
 
-/**
- * @brief Executes a full hard reset of the audio and video workspace, wiping all
- * engine memory buffers, resetting all UI layer states, and clearing Cairo canvas caches.
- */
-/**
- * @brief UI callback for the global reset button. Prompts the user before wiping the canvas.
- */
+static void clear_stash_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable; (void)task;
+    char *path = (char *)task_data;
+    remove(path);
+}
+
+void clear_video_stash_async(void) {
+    if (strlen(stashed_raw_path) > 0) {
+        GTask *task = g_task_new(NULL, NULL, NULL, NULL);
+        g_task_set_task_data(task, g_strdup(stashed_raw_path), g_free);
+        g_task_run_in_thread(task, clear_stash_thread);
+        g_object_unref(task);
+        stashed_raw_path[0] = '\0';
+    }
+}
+
+void abort_active_video_preview(bool stash) {
+    if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
+        atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
+        pthread_join(mkv_video_thread, NULL);
+    }
+
+    atomic_store_explicit(&is_mkv_mode, false, memory_order_release); // LET V4L2 RUN
+
+    extern SPSC_Preview_Queue preview_queue;
+    PreviewPayload stale_payload;
+    while (pop_preview_frame(&preview_queue, &stale_payload)) {}
+
+    if (strlen(current_raw_path) > 0) {
+        if (stash) {
+            snprintf(stashed_raw_path, sizeof(stashed_raw_path), "%s.stash", current_raw_path);
+            rename(current_raw_path, stashed_raw_path);
+        } else {
+            remove(current_raw_path);
+        }
+        current_raw_path[0] = '\0';
+    }
+}
+
+void restore_stashed_video_preview(void) {
+    if (strlen(stashed_raw_path) > 0 && access(stashed_raw_path, F_OK) == 0) {
+        char restored_path[1024];
+        strncpy(restored_path, stashed_raw_path, sizeof(restored_path) - 1);
+        char *ext = strstr(restored_path, ".stash");
+        if (ext) *ext = '\0';
+
+        rename(stashed_raw_path, restored_path);
+        strncpy(current_raw_path, restored_path, sizeof(current_raw_path) - 1);
+        stashed_raw_path[0] = '\0';
+
+        atomic_store_explicit(&mkv_video_keep_running, true, memory_order_release);
+        pthread_create(&mkv_video_thread, NULL, mkv_video_loop, g_strdup(current_raw_path));
+    }
+}
+
+void execute_global_canvas_reset(void) {
+    extern void purge_autosave_file(void);
+    purge_autosave_file();
+
+    on_stop_clicked(NULL, NULL);
+    clear_loop_points();
+
+    abort_active_video_preview(false);
+
+    ui_state.selected_track_path[0] = '\0';
+    extern void update_playlist_toggle_state(void);
+    update_playlist_toggle_state();
+
+    // Reset playback speed natively
+    extern guint speed_debounce_id;
+    extern float pending_speed;
+    if (speed_debounce_id != 0) {
+        g_source_remove(speed_debounce_id);
+        speed_debounce_id = 0;
+    }
+    pending_speed = 1.0f;
+    set_playback_speed(1.0f);
+    extern GtkWidget *btn_speed;
+    if (btn_speed) gtk_button_set_label(GTK_BUTTON(btn_speed), "Speed: 1.0x");
+
+    // Reset UI multipliers
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        set_multitrack_layer_gain(i, 1.0f);
+    }
+
+    // SYNCHRONOUS MEMORY WIPE: Bypasses the 500ms async boot delay for instant, 1-step clearing
+    int canvas_limit_min = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
+    extern int init_empty_loop_canvas(int);
+    init_empty_loop_canvas(canvas_limit_min * 60);
+
+    extern void reset_multitrack_ui_states(void);
+    reset_multitrack_ui_states();
+    extern void refresh_multitrack_tracks_ui(void);
+    refresh_multitrack_tracks_ui();
+
+    extern void trigger_global_ui_refresh(void);
+    trigger_global_ui_refresh();
+
+    extern GtkWidget *btn_play;
+    extern GtkWidget *btn_record;
+    if (btn_play) gtk_widget_set_sensitive(btn_play, FALSE);
+    if (btn_record) gtk_widget_set_sensitive(btn_record, TRUE);
+
+    // Apply clean session state after all UI and Engine metadata resets are complete
+    mark_session_saved();
+    ui_state.is_existing_session = false;
+}
+
+static void reset_canvas_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable;
+    int duration_sec = GPOINTER_TO_INT(task_data);
+
+    extern int init_empty_loop_canvas(int);
+    int status = init_empty_loop_canvas(duration_sec);
+
+    g_task_return_int(task, status);
+}
+
+static void reset_canvas_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GError *error = NULL;
+    int status = g_task_propagate_int(G_TASK(res), &error);
+
+    reset_multitrack_ui_states();
+    refresh_multitrack_tracks_ui();
+
+    extern void trigger_global_ui_refresh(void);
+    trigger_global_ui_refresh();
+
+    extern GtkWidget *btn_play;
+    extern GtkWidget *btn_record;
+    if (btn_play) gtk_widget_set_sensitive(btn_play, FALSE);
+    if (btn_record) gtk_widget_set_sensitive(btn_record, TRUE);
+
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, TRUE);
+    }
+
+    extern GtkWidget *main_spinner;
+    gtk_spinner_stop(GTK_SPINNER(main_spinner));
+    set_app_waiting_state(false);
+
+    if (status == 0) {
+        mark_session_saved();
+        ui_state.is_existing_session = false;
+        log_and_notify(1, "Status: Recording Canvas Reset");
+    } else if (status == -2) {
+        log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM for blank canvas</b></span>");
+    }
+}
+
 static void on_global_reset_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     (void)user_data;
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
 
     if (response == 0) { // Confirmed
+        GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+        if (win) {
+            GtkWidget *master_box = gtk_window_get_child(win);
+            if (master_box) gtk_widget_set_sensitive(master_box, FALSE);
+        }
+
+        extern GtkWidget *main_spinner;
+        gtk_spinner_start(GTK_SPINNER(main_spinner));
+        set_app_waiting_state(true);
+        log_and_notify(1, "Status: Wiping canvas memory...");
+
+        extern void purge_autosave_file(void);
+        purge_autosave_file();
+
         on_stop_clicked(NULL, NULL);
         clear_loop_points();
 
-        // 1. Kill any active MKV video thread from a loaded backing track or preview
-        if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
-            atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
-            pthread_join(mkv_video_thread, NULL);
-        }
-        atomic_store_explicit(&is_mkv_mode, false, memory_order_release);
+        abort_active_video_preview(false);
 
-        // 2. Eject the loaded track
         ui_state.selected_track_path[0] = '\0';
+        extern void update_playlist_toggle_state(void);
         update_playlist_toggle_state();
 
-        // 3. Clear global engine state and dirty flags
-        prepare_engine_for_new_track();
-        ui_state.session_is_dirty = false;
-
-        bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
-
-        // 4. HARD RESET: Force the multitrack engine to forget all overdubs before canvas allocation
-        if (is_multitrack) {
-            atomic_store_explicit(&active_track_count, 2, memory_order_release);
-            atomic_store_explicit(&current_recording_track, 1, memory_order_release);
+        // Reset playback speed natively
+        extern guint speed_debounce_id;
+        extern float pending_speed;
+        if (speed_debounce_id != 0) {
+            g_source_remove(speed_debounce_id);
+            speed_debounce_id = 0;
         }
+        pending_speed = 1.0f;
+        set_playback_speed(1.0f);
+        extern GtkWidget *btn_speed;
+        if (btn_speed) gtk_button_set_label(GTK_BUTTON(btn_speed), "Speed: 1.0x");
 
-        /** Reset all layer clip gains back to 0 dB (1.0 multiplier) on a fresh wipe */
+        // Reset UI multipliers
         for (int i = 0; i < MAX_TRACKS; i++) {
             set_multitrack_layer_gain(i, 1.0f);
         }
 
-        // 5. Deploy a fresh canvas based on the current mode (multitrack vs Freestyle)
-        adjust_blank_canvas_for_mode(is_multitrack);
-
-        // 6. HARD RESET: Force the UI to visually collapse back to Layer 1
-        reset_multitrack_ui_states();
-        if (is_multitrack) {
-            refresh_multitrack_tracks_ui();
-            update_multitrack_status_ui();
-        }
-
-        // 7. HARD RESET: Nuke Cairo caches and force a screen redraw to wipe old waveforms
-        invalidate_waveform_caches();
-        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
-
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording Canvas Reset");
+        // Launch the background allocation thread
+        int canvas_limit_min = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
+        GTask *task = g_task_new(NULL, NULL, reset_canvas_ready, NULL);
+        g_task_set_task_data(task, GINT_TO_POINTER(canvas_limit_min * 60), NULL);
+        g_task_run_in_thread(task, reset_canvas_thread);
+        g_object_unref(task);
     }
 }
 
-void on_play_clicked(GtkButton *button, gpointer user_data) {
-    (void)button; (void)user_data;
-
-    bool is_playing = atomic_load_explicit(&engine_is_playing, memory_order_acquire);
-    bool is_paused = atomic_load_explicit(&engine_is_paused, memory_order_acquire);
-    bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
-
-    if (!is_playing && !is_paused && !is_recording) {
-        size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-        size_t bt_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-        if (bt_frames > 0 && current_pos >= bt_frames) seek_backing_track(0.0);
-
-        // Preview the recorded video file during playback of a dirty session
-        if (ui_state.session_is_dirty && !atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-            if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
-                atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
-                pthread_join(mkv_video_thread, NULL);
-            }
-            if (access(current_raw_path, F_OK) == 0) {
-                atomic_store_explicit(&is_mkv_mode, true, memory_order_release);
-                atomic_store_explicit(&mkv_video_keep_running, true, memory_order_release);
-                pthread_create(&mkv_video_thread, NULL, mkv_video_loop, g_strdup(current_raw_path));
-            }
-        }
-
-        atomic_store_explicit(&engine_is_playing, true, memory_order_release);
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: PLAYING");
-        gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-pause-symbolic");
-        gtk_widget_set_tooltip_text(btn_play, "Pause");
-
-        gtk_widget_set_sensitive(btn_load, FALSE);
-        gtk_widget_set_sensitive(btn_record, FALSE);
-        gtk_widget_set_sensitive(btn_stop, TRUE);
-        gtk_widget_set_sensitive(btn_save_mux, FALSE);
-    } else if (is_playing || is_recording) {
-        bool new_pause_state = !is_paused;
-        atomic_store_explicit(&engine_is_paused, new_pause_state, memory_order_release);
-
-        if (new_pause_state) {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: PAUSED");
-            gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-start-symbolic");
-            gtk_widget_set_tooltip_text(btn_play, "Resume (Space / P)");
-        } else {
-            if (is_playing) gtk_label_set_text(GTK_LABEL(lbl_status), "Status: PLAYING");
-            else gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Recording");
-            gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-pause-symbolic");
-            gtk_widget_set_tooltip_text(btn_play, "Pause (Space / P)");
-        }
-    }
-}
-
-/**
- * @brief UI callback for the global reset button. Prompts the user before wiping the canvas.
- */
 void on_global_reset_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
     if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) return;
@@ -1112,7 +1441,78 @@ void on_global_reset_clicked(GtkButton *button, gpointer user_data) {
     g_object_unref(alert);
 }
 
+void on_play_clicked(GtkButton *button, gpointer user_data) {
+    (void)button; (void)user_data;
+
+    bool is_playing = atomic_load_explicit(&engine_is_playing, memory_order_acquire);
+    bool is_paused = atomic_load_explicit(&engine_is_paused, memory_order_acquire);
+    bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
+
+    // Trap: The play button does nothing if we are actively recording
+    if (is_recording) return;
+
+    bool any_audio = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) {
+            any_audio = true;
+            break;
+        }
+    }
+    if (!any_audio && !is_playing && !is_paused) return;
+
+    if (!is_playing && !is_paused) {
+        size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+        size_t bt_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+        if (bt_frames > 0 && current_pos >= bt_frames) seek_backing_track(0.0);
+
+        // Route either the active temp recording, or the imported MKV track
+        char *video_to_play = NULL;
+        if (access(current_raw_path, F_OK) == 0) {
+            video_to_play = g_strdup(current_raw_path);
+        } else if (g_str_has_suffix(ui_state.selected_track_path, ".mkv") && access(ui_state.selected_track_path, F_OK) == 0) {
+            video_to_play = g_strdup(ui_state.selected_track_path);
+        }
+
+        if (video_to_play) {
+            if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
+                atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
+                pthread_join(mkv_video_thread, NULL);
+            }
+            atomic_store_explicit(&mkv_video_keep_running, true, memory_order_release);
+            pthread_create(&mkv_video_thread, NULL, mkv_video_loop, video_to_play);
+        }
+
+        atomic_store_explicit(&engine_is_playing, true, memory_order_release);
+        log_and_notify(1, "Status: PLAYING");
+        gtk_button_set_icon_name(GTK_BUTTON(btn_play), "");
+        gtk_button_set_label(GTK_BUTTON(btn_play), "⏸");
+        gtk_widget_set_tooltip_text(btn_play, "Pause");
+
+        gtk_widget_set_sensitive(btn_load, FALSE);
+        gtk_widget_set_sensitive(btn_record, FALSE);
+        extern GtkWidget *btn_record_video;
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, FALSE);
+        gtk_widget_set_sensitive(btn_stop, TRUE);
+        gtk_widget_set_sensitive(btn_save_mux, FALSE);
+    } else if (is_playing) {
+        bool new_pause_state = !is_paused;
+        atomic_store_explicit(&engine_is_paused, new_pause_state, memory_order_release);
+
+        if (new_pause_state) {
+            log_and_notify(1, "Status: PAUSED");
+            gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-start-symbolic");
+            gtk_widget_set_tooltip_text(btn_play, "Resume (Space)");
+        } else {
+            log_and_notify(1, "Status: PLAYING");
+            gtk_button_set_icon_name(GTK_BUTTON(btn_play), "media-playback-pause-symbolic");
+            gtk_widget_set_tooltip_text(btn_play, "Pause (Space)");
+        }
+    }
+}
+
 static void bind_meter(GtkWidget *meter, gpointer peak_var_ptr) {
+    extern void on_draw_vu_meter(GtkDrawingArea*, cairo_t*, int, int, gpointer);
+    extern gboolean on_waveform_tick(GtkWidget*, GdkFrameClock*, gpointer);
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(meter), on_draw_vu_meter, peak_var_ptr, NULL);
     gtk_widget_add_tick_callback(meter, (GtkTickCallback)on_waveform_tick, NULL, NULL);
 }
@@ -1137,7 +1537,7 @@ static void on_input_gain_changed(GtkSpinButton *spin_button, gpointer user_data
         ui_state.config.audio_profiles[ui_state.config.num_audio_profiles].gain_multiplier = multiplier;
         ui_state.config.audio_profiles[ui_state.config.num_audio_profiles].is_primary = 0;
         ui_state.config.audio_profiles[ui_state.config.num_audio_profiles].is_fallback = 0;
-        ui_state.config.audio_profiles[ui_state.config.num_audio_profiles].in_cycler = 0;
+        ui_state.config.audio_profiles[ui_state.config.num_audio_profiles].in_pref = 0;
         ui_state.config.num_audio_profiles++;
     }
 
@@ -1150,6 +1550,7 @@ static void on_bt_gain_changed(GtkSpinButton *spin_button, gpointer user_data) {
     float multiplier = (db <= -24.0) ? 0.0f : powf(10.0f, (float)(db / 20.0));
     set_bt_gain(multiplier);
     ui_state.config.bt_gain_multiplier = multiplier;
+
     save_qjams_config(ui_state.config_path, &ui_state.config);
 }
 
@@ -1162,44 +1563,39 @@ void refresh_track_time_display(void) {
     if (rate <= 0) rate = 48000;
 
     int cur_secs = pos / rate;
-    int total_secs = frames / rate;
-    bool is_multi = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
-    bool is_blank = (strlen(ui_state.selected_track_path) == 0);
+
+    static int cached_total_secs = 0;
+    static time_t last_scan_time = 0;
+    time_t now = time(NULL);
+
+    if (frames > 0 && now != last_scan_time) {
+        extern void trigger_audible_scan_async(void);
+        trigger_audible_scan_async();
+        last_scan_time = now;
+    }
+
+    extern _Atomic size_t cached_audible_frames;
+    size_t audible_frames = atomic_load_explicit(&cached_audible_frames, memory_order_acquire);
+    cached_total_secs = (audible_frames > 0) ? (audible_frames / rate) : (frames / rate);
+
+    int total_secs = (frames > 0) ? cached_total_secs : 0;
+    if (cur_secs > total_secs) total_secs = cur_secs; // Prevent time-travel text while actively recording
 
     char base_name[128] = "None Selected";
 
-    if (is_multi) {
-        int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-        extern void get_multitrack_track_name(int, char*);
-        get_multitrack_track_name(rec_track, base_name);
-    } else {
-        if (!is_blank) {
-            char *bname = g_path_get_basename(ui_state.selected_track_path);
-            char *dot = strrchr(bname, '.');
-            if (dot) *dot = '\0';
-            strncpy(base_name, bname, sizeof(base_name) - 1);
-            base_name[sizeof(base_name) - 1] = '\0';
-            g_free(bname);
-        } else {
-            strncpy(base_name, "Freestyle Recording", sizeof(base_name) - 1);
-        }
-    }
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    extern void get_multitrack_track_name(int, char*);
+    get_multitrack_track_name(rec_track, base_name);
 
     char lbl_buf[256];
     if (frames > 0) {
         snprintf(lbl_buf, sizeof(lbl_buf), "Track: %s [%02d:%02d / %02d:%02d]",
                  base_name, cur_secs / 60, cur_secs % 60, total_secs / 60, total_secs % 60);
     } else {
-        int limit = is_multi ? ui_state.config.multitrack_duration_min : ui_state.config.freestyle_duration_min;
-        if (limit <= 0) limit = 5;
-        if (is_multi && is_blank) {
-            snprintf(lbl_buf, sizeof(lbl_buf), "Track: Blank Loop Canvas [%02d:00 limit]", limit);
-        } else {
-            snprintf(lbl_buf, sizeof(lbl_buf), "Track: %s [%02d:00 limit]", base_name, limit);
-        }
+        int limit = ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5;
+        snprintf(lbl_buf, sizeof(lbl_buf), "Track: Blank Loop Canvas [%02d:00 limit]", limit);
     }
 
-    // Gatekeeper: Only force GTK to redraw the label if the string actually changed
     const char *current_text = gtk_label_get_text(GTK_LABEL(lbl_track));
     if (g_strcmp0(current_text, lbl_buf) != 0) {
         gtk_label_set_text(GTK_LABEL(lbl_track), lbl_buf);
@@ -1223,7 +1619,7 @@ static void on_shortcuts_clicked(GtkButton *button, gpointer user_data) {
 
     help_window = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(help_window), "Keyboard Shortcuts");
-    gtk_window_set_default_size(GTK_WINDOW(help_window), 270, 575);
+    gtk_window_set_default_size(GTK_WINDOW(help_window), 290, 660);
     g_signal_connect(help_window, "close-request", G_CALLBACK(on_help_close), NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -1243,8 +1639,10 @@ static void on_shortcuts_clicked(GtkButton *button, gpointer user_data) {
     gtk_widget_set_halign(lbl_text, GTK_ALIGN_START);
     gtk_label_set_markup(GTK_LABEL(lbl_text),
                          "<span foreground='#888888' size='small' weight='bold'>PLAYBACK &amp; RECORDING</span>\n"
-                         "<b>Space / P</b> : Play / Pause\n"
+                         "<b>Space</b> : Play / Pause\n"
                          "<b>R / S</b> : Record / Stop\n"
+                         "<b>V</b> : Record Video\n"
+                         "<b>P / N</b> (or <b>PgUp/PgDn</b>) : Prev / Next Track\n"
                          "<b>Left / Right</b> : Seek Timeline\n"
                          "<b>Home / End</b> : Seek Start / End\n"
                          "<b>C</b> : Toggle Speed\n\n"
@@ -1269,6 +1667,8 @@ static void on_shortcuts_clicked(GtkButton *button, gpointer user_data) {
                          "<b>F</b> : Smart V-Fade Selection\n"
                          "<b>X</b> : Ripple Crossfade (Blend)\n"
                          "<b>Ctrl+Z</b> : Undo Edit\n"
+                         "<b>Ctrl+Shift+Z / Ctrl+Y</b> : Redo Edit\n"
+                         "<b>Right-Click Red Dot</b> : Remove Video Take\n"
     );
 
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), lbl_text);
@@ -1278,11 +1678,166 @@ static void on_shortcuts_clicked(GtkButton *button, gpointer user_data) {
     gtk_window_present(GTK_WINDOW(help_window));
 }
 
+static void on_telemetry_clicked(GtkButton *button, gpointer user_data) {
+    (void)user_data;
+    if (telemetry_popover) {
+        gtk_widget_unparent(telemetry_popover);
+    }
+
+    EngineTelemetry stats = {0};
+    get_engine_telemetry(&stats);
+
+    size_t v_write = atomic_load_explicit(&video_queue.write_index, memory_order_relaxed);
+    size_t v_read = atomic_load_explicit(&video_queue.read_index, memory_order_acquire);
+    size_t v_delta = v_write - v_read;
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 15);
+    gtk_widget_set_margin_start(grid, 15);
+    gtk_widget_set_margin_end(grid, 15);
+    gtk_widget_set_margin_top(grid, 15);
+    gtk_widget_set_margin_bottom(grid, 15);
+
+    int row = 0;
+
+    GtkWidget *lbl_header1 = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(lbl_header1), "<span foreground='#888888' size='small' weight='bold'>AUDIO DSP</span>");
+    gtk_widget_set_halign(lbl_header1, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), lbl_header1, 0, row++, 2, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Hardware Rate:"), 0, row, 1, 1);
+    char sr_buf[32]; snprintf(sr_buf, sizeof(sr_buf), "<b>%d Hz</b>", stats.sample_rate);
+    GtkWidget *lbl_sr = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_sr), sr_buf);
+    gtk_widget_set_halign(lbl_sr, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_sr, 1, row++, 1, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("RT Dropouts:"), 0, row, 1, 1);
+    char drop_buf[32]; snprintf(drop_buf, sizeof(drop_buf), "<b>%u</b>", stats.dropped_frames);
+    GtkWidget *lbl_drop = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_drop), drop_buf);
+    gtk_widget_set_halign(lbl_drop, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_drop, 1, row++, 1, 1);
+
+    GtkWidget *lbl_header2 = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(lbl_header2), "\n<span foreground='#888888' size='small' weight='bold'>MEMORY &amp; VIDEO</span>");
+    gtk_widget_set_halign(lbl_header2, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), lbl_header2, 0, row++, 2, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Undo Ledger:"), 0, row, 1, 1);
+    char ledger_buf[64]; snprintf(ledger_buf, sizeof(ledger_buf), "<b>%d undos, %d redos</b> (Max: %d)", stats.ledger_undos, stats.ledger_redos, stats.ledger_capacity);
+    GtkWidget *lbl_ledger = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_ledger), ledger_buf);
+    gtk_widget_set_halign(lbl_ledger, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_ledger, 1, row++, 1, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("System RAM:"), 0, row, 1, 1);
+    char total_buf[32]; snprintf(total_buf, sizeof(total_buf), "<b>%.1f GB</b>", (double)stats.total_ram_bytes / (1024.0 * 1024.0 * 1024.0));
+    GtkWidget *lbl_total = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_total), total_buf);
+    gtk_widget_set_halign(lbl_total, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_total, 1, row++, 1, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("QJams Allocated:"), 0, row, 1, 1);
+    char qj_buf[32]; snprintf(qj_buf, sizeof(qj_buf), "<b>%.1f GB</b>", (double)stats.qjams_rss_bytes / (1024.0 * 1024.0 * 1024.0));
+    GtkWidget *lbl_qj = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_qj), qj_buf);
+    gtk_widget_set_halign(lbl_qj, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_qj, 1, row++, 1, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Available RAM:"), 0, row, 1, 1);
+    char avail_buf[32]; snprintf(avail_buf, sizeof(avail_buf), "<b>%.1f GB</b>", (double)stats.available_ram_bytes / (1024.0 * 1024.0 * 1024.0));
+    GtkWidget *lbl_avail = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_avail), avail_buf);
+    gtk_widget_set_halign(lbl_avail, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_avail, 1, row++, 1, 1);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Video Queue Delta:"), 0, row, 1, 1);
+    char vq_buf[32]; snprintf(vq_buf, sizeof(vq_buf), "<b>%zu frames</b>", v_delta);
+    GtkWidget *lbl_vq = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(lbl_vq), vq_buf);
+    gtk_widget_set_halign(lbl_vq, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl_vq, 1, row++, 1, 1);
+
+    telemetry_popover = gtk_popover_new();
+    gtk_popover_set_child(GTK_POPOVER(telemetry_popover), grid);
+    gtk_widget_set_parent(telemetry_popover, GTK_WIDGET(button));
+    gtk_popover_popup(GTK_POPOVER(telemetry_popover));
+}
+
+static void toggle_recording_pause(void) {
+    bool is_paused = atomic_load_explicit(&engine_is_paused, memory_order_acquire);
+    bool new_pause_state = !is_paused;
+    atomic_store_explicit(&engine_is_paused, new_pause_state, memory_order_release);
+    bool is_video = atomic_load_explicit(&video_is_armed, memory_order_acquire);
+
+    if (new_pause_state) {
+        log_and_notify(1, "Status: RECORDING PAUSED");
+        if (is_video) {
+            if (btn_record_video) gtk_button_set_label(GTK_BUTTON(btn_record_video), "🖵");
+        } else {
+            gtk_button_set_label(GTK_BUTTON(btn_record), "🎜");
+        }
+    } else {
+        log_and_notify(1, "Status: Recording");
+        if (is_video) {
+            if (btn_record_video) gtk_button_set_label(GTK_BUTTON(btn_record_video), "⏸");
+        } else {
+            gtk_button_set_label(GTK_BUTTON(btn_record), "⏸");
+        }
+    }
+}
+
+static void on_record_audio_clicked(GtkButton *button, gpointer user_data) {
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+        toggle_recording_pause();
+        return;
+    }
+    atomic_store_explicit(&video_is_armed, false, memory_order_release);
+    on_start_clicked(button, user_data);
+}
+
+static void on_video_overwrite_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
+
+    if (response == 0) { // Confirmed Overwrite
+        atomic_store_explicit(&video_is_armed, true, memory_order_release);
+        on_start_clicked(GTK_BUTTON(user_data), NULL);
+    }
+}
+
+static void on_record_video_clicked(GtkButton *button, gpointer user_data) {
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+        toggle_recording_pause();
+        return;
+    }
+
+    extern _Atomic bool suppress_video_overwrite;
+    if (!atomic_load_explicit(&suppress_video_overwrite, memory_order_acquire)) {
+        extern char current_raw_path[1024];
+        if (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0) {
+            GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Existing Video Take?");
+            gtk_alert_dialog_set_detail(alert, "A video take already exists in this session. Recording video again will discard your previous video take.\n\nDo you want to overwrite it, or cancel to Export/Mux your current mix first?");
+
+            const char *buttons[] = { "Overwrite", "Cancel", NULL };
+            gtk_alert_dialog_set_buttons(alert, buttons);
+            gtk_alert_dialog_set_cancel_button(alert, 1);
+            gtk_alert_dialog_set_default_button(alert, 1);
+
+            GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button)));
+            gtk_alert_dialog_choose(alert, parent, NULL, on_video_overwrite_response, button);
+            g_object_unref(alert);
+            return;
+        }
+    }
+
+    atomic_store_explicit(&video_is_armed, true, memory_order_release);
+    atomic_store_explicit(&suppress_video_overwrite, false, memory_order_release);
+    on_start_clicked(button, user_data);
+}
+
 void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
+    // SAFETY [Critical]: Initialize status widgets first so the hardware routing logic can safely emit toasts
+    lbl_status = GTK_WIDGET(gtk_builder_get_object(b_dash, "lbl_status"));
+    lbl_hw_toast = GTK_WIDGET(gtk_builder_get_object(b_dash, "lbl_hw_toast"));
+    main_spinner = GTK_WIDGET(gtk_builder_get_object(b_dash, "main_spinner"));
+
     lbl_input_device = GTK_WIDGET(gtk_builder_get_object(b_dash, "lbl_input_device"));
-    char input_label_text[256];
-    snprintf(input_label_text, sizeof(input_label_text), "%s Gain (Pre-Buffer dB):", ui_state.config.audio_device[0] ? ui_state.config.audio_device : "Input");
-    gtk_label_set_text(GTK_LABEL(lbl_input_device), input_label_text);
 
     input_gain_spinner = GTK_WIDGET(gtk_builder_get_object(b_dash, "input_gain_spinner"));
     float loaded_db = (ui_state.config.input_gain_multiplier <= 0.001f) ? -24.0f : 20.0f * log10f(ui_state.config.input_gain_multiplier);
@@ -1316,10 +1871,14 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
     g_signal_connect(btn_play, "clicked", G_CALLBACK(on_play_clicked), NULL);
 
     btn_record = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_record"));
-    g_signal_connect(btn_record, "clicked", G_CALLBACK(on_start_clicked), NULL);
+    g_signal_connect(btn_record, "clicked", G_CALLBACK(on_record_audio_clicked), NULL);
+
+    btn_record_video = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_record_video"));
+    g_signal_connect(btn_record_video, "clicked", G_CALLBACK(on_record_video_clicked), NULL);
 
     btn_stop = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_stop"));
     g_signal_connect(btn_stop, "clicked", G_CALLBACK(on_stop_clicked), NULL);
+    gtk_widget_set_sensitive(btn_stop, FALSE);
 
     btn_reset = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_reset"));
     g_signal_connect(btn_reset, "clicked", G_CALLBACK(on_global_reset_clicked), NULL);
@@ -1333,7 +1892,8 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
     g_signal_connect(btn_speed, "clicked", G_CALLBACK(on_speed_clicked), NULL);
 
     btn_zoom = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_zoom"));
-    g_signal_connect(btn_zoom, "clicked", G_CALLBACK(on_zoom_clicked), NULL);
+    gtk_widget_set_tooltip_text(btn_zoom, "Set track to recording length");
+    g_signal_connect(btn_zoom, "clicked", G_CALLBACK(on_crop_clicked), NULL);
 
     btn_playlist_toggle = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_playlist_toggle"));
     g_signal_connect(btn_playlist_toggle, "clicked", G_CALLBACK(on_playlist_toggle_clicked), NULL);
@@ -1343,15 +1903,15 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
         g_signal_connect(btn_shortcuts, "clicked", G_CALLBACK(on_shortcuts_clicked), NULL);
     }
 
-    lbl_hw_toast = GTK_WIDGET(gtk_builder_get_object(b_dash, "lbl_hw_toast"));
-    if (lbl_hw_toast) {
-        gtk_widget_set_valign(lbl_hw_toast, GTK_ALIGN_START);
+    input_pref_drop = GTK_WIDGET(gtk_builder_get_object(b_dash, "input_pref_drop"));
+    if (input_pref_drop) {
+        g_signal_connect(input_pref_drop, "notify::selected", G_CALLBACK(on_pref_selection_changed), NULL);
+        update_dashboard_pref_ui();
     }
 
-    input_cycler_drop = GTK_WIDGET(gtk_builder_get_object(b_dash, "input_cycler_drop"));
-    if (input_cycler_drop) {
-        g_signal_connect(input_cycler_drop, "notify::selected", G_CALLBACK(on_cycler_selection_changed), NULL);
-        update_dashboard_cycler_ui();
+    btn_telemetry = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_telemetry"));
+    if (btn_telemetry) {
+        g_signal_connect(btn_telemetry, "clicked", G_CALLBACK(on_telemetry_clicked), NULL);
     }
 
     waveform_area_bt = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveform_area_bt"));
@@ -1363,4 +1923,21 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
     GtkEventController *scroll_ctrl_in = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
     g_signal_connect(scroll_ctrl_in, "scroll", G_CALLBACK(on_waveform_scroll), NULL);
     gtk_widget_add_controller(waveform_area_input, scroll_ctrl_in);
+}
+
+/**
+ * @brief Cleans up globally allocated dashboard memory pools during application teardown.
+ */
+void ui_dashboard_shutdown(void) {
+    if (atomic_load_explicit(&mkv_video_keep_running, memory_order_acquire)) {
+        atomic_store_explicit(&mkv_video_keep_running, false, memory_order_release);
+        pthread_join(mkv_video_thread, NULL);
+    }
+
+    for (int i = 0; i < 32; i++) {
+        if (mkv_rgba_pool[i]) {
+            free(mkv_rgba_pool[i]);
+            mkv_rgba_pool[i] = NULL;
+        }
+    }
 }

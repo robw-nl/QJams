@@ -11,7 +11,7 @@ typedef struct {
     float gain_multiplier;
     int is_primary;
     int is_fallback;
-    int in_cycler;
+    int in_pref;
 } AudioDeviceProfile;
 
 typedef struct {
@@ -27,9 +27,9 @@ typedef struct {
     char audio_device[128];
     int multitrack_blank_canvas;
     int multitrack_mode_active; // Persist multitrack mode state
-    int freestyle_duration_min;
-    int multitrack_duration_min;
+    int default_canvas_limit_min;
     int export_format; // 0 = FLAC, 1 = WAV, 2 = BOTH
+    int enable_logging;
 
     char playlist_slots[10][1024]; // Expanded to 10 Car Radio Presets
 
@@ -44,6 +44,7 @@ typedef struct {
  * @return A populated QJamsConfig structure.
  */
 QJamsConfig load_qjams_config(const char* filepath);
+
 /**
  * @brief Saves the current QJams configuration to the specified file.
  * @param filepath The path to the configuration file.
@@ -52,4 +53,8 @@ QJamsConfig load_qjams_config(const char* filepath);
  */
 void save_qjams_config(const char* filepath, const QJamsConfig* config);
 
-#endif
+void init_qjams_logger(const char *qjams_dir, int enable_logging);
+void close_qjams_logger(void);
+void log_and_notify(int notify_target, const char *fmt, ...);
+
+#endif // CONFIG_H

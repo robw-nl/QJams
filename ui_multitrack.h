@@ -11,8 +11,9 @@ void set_multitrack_track_name(int idx, const char *name);
 void update_multitrack_status_ui(void);
 void reset_multitrack_ui_states(void);
 void on_blank_canvas_toggled(GObject *gobject, GParamSpec *pspec, gpointer user_data);
-void ui_multitrack_init(GtkBuilder *b_multi, GtkBuilder *b_stack);
+void ui_multitrack_init(GtkBuilder *b_multi);
 
-void multitrack_import_file_async(const char *filepath, int track_idx); // ADD THIS
+void multitrack_import_file_async(const char *filepath, int track_idx);
+gboolean handle_track_drop_payload(const GValue *value, int start_track_idx);
 
 #endif // UI_MULTITRACK_H

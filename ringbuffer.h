@@ -5,15 +5,20 @@
 #include <stdatomic.h>
 #include <stdalign.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // Align structures to 64 bytes to match the typical L1 cache line size
 // This physically separates the read and write indices in the CPU cache,
 // eliminating false-sharing latency when the encoder thread reads from the buffer.
 #define CACHE_LINE_SIZE 64
+#define QJ_MAX_TRACKS 12
 
 typedef struct {
     float mix_l;
     float mix_r;
+    float tracks_l[QJ_MAX_TRACKS];
+    float tracks_r[QJ_MAX_TRACKS];
+    int active_count; // Informs the encoder how many streams to mux
     int64_t pts;
 } AudioFrame;
 
@@ -25,13 +30,14 @@ typedef struct {
     alignas(CACHE_LINE_SIZE) atomic_size_t read_index;
 } SPSC_Audio_Queue;
 
-/**cjoice
+/**
  * @brief Opcodes for lock-free commands dispatched from the GTK UI thread to the JACK RT thread.
  * Legacy O(N) array mutation commands have been purged to enforce strict RT safety.
  */
 typedef enum {
     CMD_NONE = 0,
-    CMD_NEXT_TRACK
+    CMD_NEXT_TRACK,
+    CMD_PLAY_CLICK
 } EngineCommandType;
 
 // Initialize the queue (called once during setup, before RT thread starts)
@@ -45,6 +51,7 @@ static inline void init_spsc_queue(SPSC_Audio_Queue* q, size_t capacity) {
     q->buffer = (AudioFrame*)calloc(capacity, sizeof(AudioFrame));
     q->capacity = capacity;
     atomic_init(&q->write_index, 0);
+    atomic_init(&q->read_index, 0);
 }
 
 // Producer (Called strictly by the JACK process() callback)

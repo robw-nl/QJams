@@ -77,6 +77,14 @@ void clear_waveform_anchor(void);
  */
 void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 
+void on_waveform_right_click(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
+gboolean on_waveform_query_tooltip(GtkWidget *widget, gint x, gint y, gboolean keyboard_mode, GtkTooltip *tooltip, gpointer user_data);
+
+/**
+ * @brief Gesture callback triggered when a multitrack drag starts.
+ */
+void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
+
 /**
  * @brief Gesture callback triggered when a multitrack drag starts.
  * @param gesture The drag gesture object.

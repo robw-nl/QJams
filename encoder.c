@@ -10,20 +10,25 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 
+#include "config.h"
 #include "ringbuffer.h"
 #include "encoder.h"
 
 extern SPSC_Audio_Queue audio_queue;
+extern _Atomic int active_track_count;
 
 static pthread_t encoder_thread;
 static volatile int keep_running = 0;
 static int thread_is_active = 0;
 
 static AVFormatContext *fmt_ctx = NULL;
-static AVCodecContext *codec_ctx_mix = NULL;
 static SPSC_Video_Queue* video_queue_ptr = NULL;
 
-static AVStream *audio_stream_mix = NULL;
+#define MAX_ENC_STREAMS (QJ_MAX_TRACKS + 1)
+static AVCodecContext *codec_ctx_tracks[MAX_ENC_STREAMS] = {NULL};
+static AVStream *audio_streams[MAX_ENC_STREAMS] = {NULL};
+static int active_encoder_tracks = 1;
+
 static AVStream *video_stream = NULL;
 
 static pthread_mutex_t enc_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -83,6 +88,8 @@ static int set_hwframe_ctx(AVCodecContext *ctx, AVBufferRef *hw_device_ctx, int 
 int init_and_start_encoder(const char* output_filename, int width, int height, int sample_rate, SPSC_Video_Queue* queue) {
     video_queue_ptr = queue;
 
+    atomic_store_explicit(&video_queue_ptr->read_index, atomic_load_explicit(&video_queue_ptr->write_index, memory_order_relaxed), memory_order_release);
+
     // --- 1. FORMAT CONTEXT ---
     avformat_alloc_output_context2(&fmt_ctx, NULL, NULL, output_filename);
 
@@ -94,7 +101,7 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
         v_codec = avcodec_find_encoder_by_name("h264_vaapi");
         if (v_codec) {
             hw_accel_type = 1;
-            printf("[Encoder] Selected VAAPI Hardware Acceleration.\n");
+            log_and_notify(0, "[Encoder] Selected VAAPI Hardware Acceleration.\n");
         } else {
             av_buffer_unref(&hw_device_ctx);
             hw_device_ctx = NULL;
@@ -105,23 +112,23 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
         v_codec = avcodec_find_encoder_by_name("h264_nvenc");
         if (v_codec) {
             hw_accel_type = 2;
-            printf("[Encoder] Selected NVENC Hardware Acceleration.\n");
+            log_and_notify(0, "[Encoder] Selected NVENC Hardware Acceleration.\n");
         }
     }
 
     if (!v_codec) {
         v_codec = avcodec_find_encoder_by_name("libx264");
         if (v_codec) {
-            printf("[Encoder] Warning: Hardware acceleration failed. Falling back to CPU libx264.\n");
+            log_and_notify(0, "[Encoder] Warning: Hardware acceleration failed. Falling back to CPU libx264.\n");
         } else {
-            printf("[Encoder] Error: No suitable h264 encoder found.\n");
+            log_and_notify(0, "[Encoder] Error: No suitable h264 encoder found.\n");
             goto encoder_cleanup;
         }
     }
 
     video_enc_ctx = avcodec_alloc_context3(v_codec);
     if (!video_enc_ctx) {
-        printf("[Encoder] Error: Could not allocate video encoder context.\n");
+        log_and_notify(0, "[Encoder] Error: Could not allocate video encoder context.\n");
         goto encoder_cleanup;
     }
 
@@ -147,7 +154,7 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
         video_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
     if (avcodec_open2(video_enc_ctx, v_codec, NULL) < 0) {
-        printf("[Encoder] Error: Could not open video codec.\n");
+        log_and_notify(0, "[Encoder] Error: Could not open video codec.\n");
         goto encoder_cleanup;
     }
 
@@ -156,31 +163,44 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     avcodec_parameters_from_context(video_stream->codecpar, video_enc_ctx);
     video_stream->codecpar->format = AV_PIX_FMT_NV12; // Muxer expects NV12
 
-    // --- 3. AUDIO STREAMS (PCM 16-BIT INTERLEAVED) ---
-    // PCM is extremely CPU efficient for raw capture and natively guarantees S16 interleaved support
+    // --- 3. AUDIO STREAMS (MULTI-TRACK 16-BIT PCM) ---
     const AVCodec *a_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
 
-    // STREAM 0: Master Mix (Hardware Input + Multitrack Matrix)
-    codec_ctx_mix = avcodec_alloc_context3(a_codec);
-    codec_ctx_mix->sample_rate = sample_rate;
-    av_channel_layout_default(&codec_ctx_mix->ch_layout, 2);
-    codec_ctx_mix->sample_fmt = AV_SAMPLE_FMT_S16;
-    codec_ctx_mix->time_base = (AVRational){1, sample_rate};
-    if (avcodec_open2(codec_ctx_mix, a_codec, NULL) < 0) {
-        printf("[Encoder] Error: Could not open audio codec.\n");
-        goto encoder_cleanup;
+    active_encoder_tracks = atomic_load_explicit(&active_track_count, memory_order_acquire);
+    if (active_encoder_tracks < 1) active_encoder_tracks = 1;
+    if (active_encoder_tracks > QJ_MAX_TRACKS) active_encoder_tracks = QJ_MAX_TRACKS;
+
+    int total_streams = active_encoder_tracks + 1; // +1 for the Master Mix
+
+    for (int i = 0; i < total_streams; i++) {
+        codec_ctx_tracks[i] = avcodec_alloc_context3(a_codec);
+        codec_ctx_tracks[i]->sample_rate = sample_rate;
+        av_channel_layout_default(&codec_ctx_tracks[i]->ch_layout, 2);
+        codec_ctx_tracks[i]->sample_fmt = AV_SAMPLE_FMT_S16;
+        codec_ctx_tracks[i]->time_base = (AVRational){1, sample_rate};
+
+        // CRITICAL FIX: Ensure the MKV container writes the CodecPrivate extradata header!
+        if (fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+            codec_ctx_tracks[i]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        if (avcodec_open2(codec_ctx_tracks[i], a_codec, NULL) < 0) {
+            log_and_notify(0, "[Encoder] Error: Could not open audio codec for track %d.\n", i);
+            goto encoder_cleanup;
+        }
+
+        audio_streams[i] = avformat_new_stream(fmt_ctx, a_codec);
+        avcodec_parameters_from_context(audio_streams[i]->codecpar, codec_ctx_tracks[i]);
     }
-    audio_stream_mix = avformat_new_stream(fmt_ctx, a_codec);
-    avcodec_parameters_from_context(audio_stream_mix->codecpar, codec_ctx_mix);
 
     // --- 4. OPEN FILE & START THREAD ---
     if (avio_open(&fmt_ctx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
-        printf("[Encoder] Error: Could not open output file.\n");
+        log_and_notify(0, "[Encoder] Error: Could not open output file.\n");
         goto encoder_cleanup;
     }
 
     if (avformat_write_header(fmt_ctx, NULL) < 0) {
-        printf("[Encoder] Error: Could not write header.\n");
+        log_and_notify(0, "[Encoder] Error: Could not write header.\n");
         goto encoder_cleanup;
     }
 
@@ -190,13 +210,15 @@ int init_and_start_encoder(const char* output_filename, int width, int height, i
     thread_is_active = 1;
     pthread_create(&encoder_thread, NULL, encoder_loop, NULL);
 
-    printf("[Encoder] Pipeline Initialized and Running at %d Hz.\n", sample_rate);
+    log_and_notify(0, "[Encoder] Pipeline Initialized and Running at %d Hz.\n", sample_rate);
     return 0;
 
     encoder_cleanup:
     if (fmt_ctx && fmt_ctx->pb) avio_closep(&fmt_ctx->pb);
     if (fmt_ctx) { avformat_free_context(fmt_ctx); fmt_ctx = NULL; }
-    if (codec_ctx_mix) { avcodec_free_context(&codec_ctx_mix); codec_ctx_mix = NULL; }
+    for (int i = 0; i < MAX_ENC_STREAMS; i++) {
+        if (codec_ctx_tracks[i]) { avcodec_free_context(&codec_ctx_tracks[i]); codec_ctx_tracks[i] = NULL; }
+    }
     if (video_enc_ctx) { avcodec_free_context(&video_enc_ctx); video_enc_ctx = NULL; }
     if (hw_device_ctx) { av_buffer_unref(&hw_device_ctx); hw_device_ctx = NULL; }
     return -1;
@@ -219,41 +241,51 @@ static void safe_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt) {
  * @param first_a_pts Pointer to the baseline presentation timestamp.
  * @return 1 if frames were encoded, 0 if the queue lacked sufficient frames.
  */
-static int process_audio_batch(AVFrame *a_frame_mix, AVPacket *pkt, int64_t *first_a_pts) {
+static int process_audio_batch(AVFrame **a_frames, AVPacket *pkt, int64_t *current_audio_samples) {
     size_t a_write = atomic_load_explicit(&audio_queue.write_index, memory_order_acquire);
     size_t a_read = atomic_load_explicit(&audio_queue.read_index, memory_order_relaxed);
 
-    if ((a_write - a_read) < (size_t)a_frame_mix->nb_samples) return 0;
+    int nb_samples = a_frames[0]->nb_samples;
+    if ((a_write - a_read) < (size_t)nb_samples) return 0;
 
-    av_frame_make_writable(a_frame_mix);
-    int16_t *out_mix = (int16_t*)a_frame_mix->data[0];
+    int total_streams = active_encoder_tracks + 1;
+    for (int t = 0; t < total_streams; t++) {
+        av_frame_make_writable(a_frames[t]);
+    }
 
-    int64_t block_pts = 0;
-
-    for (int i = 0; i < a_frame_mix->nb_samples; i++) {
+    for (int i = 0; i < nb_samples; i++) {
         AudioFrame f = {0};
         pop_audio_frame(&audio_queue, &f);
 
-        // Anchor the MKV audio timebase perfectly to the first received hardware cycle
-        if (i == 0) {
-            if (*first_a_pts == -1) *first_a_pts = f.pts;
-            block_pts = f.pts - *first_a_pts;
-        }
-
+        // Stream 0: Master Mix
+        int16_t *out_mix = (int16_t*)a_frames[0]->data[0];
         out_mix[i * 2]     = (int16_t)(f.mix_l * 32767.0f);
         out_mix[i * 2 + 1] = (int16_t)(f.mix_r * 32767.0f);
-    }
 
-    a_frame_mix->pts = block_pts;
-
-    if (avcodec_send_frame(codec_ctx_mix, a_frame_mix) == 0) {
-        while (avcodec_receive_packet(codec_ctx_mix, pkt) == 0) {
-            av_packet_rescale_ts(pkt, codec_ctx_mix->time_base, audio_stream_mix->time_base);
-            pkt->stream_index = audio_stream_mix->index;
-            safe_interleaved_write_frame(fmt_ctx, pkt);
-            av_packet_unref(pkt);
+        // Streams 1 to N: Isolated Tracks
+        for (int t = 0; t < active_encoder_tracks; t++) {
+            int16_t *out = (int16_t*)a_frames[t + 1]->data[0];
+            out[i * 2]     = (int16_t)(f.tracks_l[t] * 32767.0f);
+            out[i * 2 + 1] = (int16_t)(f.tracks_r[t] * 32767.0f);
         }
     }
+
+    for (int t = 0; t < total_streams; t++) {
+        // ASSIGN STRICT CONTIGUOUS TIMESTAMPS
+        a_frames[t]->pts = *current_audio_samples;
+
+        if (avcodec_send_frame(codec_ctx_tracks[t], a_frames[t]) == 0) {
+            while (avcodec_receive_packet(codec_ctx_tracks[t], pkt) == 0) {
+                av_packet_rescale_ts(pkt, codec_ctx_tracks[t]->time_base, audio_streams[t]->time_base);
+                pkt->stream_index = audio_streams[t]->index;
+                safe_interleaved_write_frame(fmt_ctx, pkt);
+                av_packet_unref(pkt);
+            }
+        }
+    }
+
+    // Increment the sample counter by the exact number of processed samples
+    *current_audio_samples += nb_samples;
     return 1;
 }
 
@@ -330,11 +362,15 @@ static void flush_encoder_context(AVCodecContext *ctx, AVStream *stream, AVPacke
 static void* encoder_loop(void* arg) {
     (void)arg;
 
-    AVFrame *a_frame_mix = av_frame_alloc();
-    a_frame_mix->nb_samples = codec_ctx_mix->frame_size == 0 ? 1024 : codec_ctx_mix->frame_size;
-    a_frame_mix->format = codec_ctx_mix->sample_fmt;
-    av_channel_layout_copy(&a_frame_mix->ch_layout, &codec_ctx_mix->ch_layout);
-    av_frame_get_buffer(a_frame_mix, 0);
+    int total_streams = active_encoder_tracks + 1;
+    AVFrame *a_frames[MAX_ENC_STREAMS] = {NULL};
+    for (int t = 0; t < total_streams; t++) {
+        a_frames[t] = av_frame_alloc();
+        a_frames[t]->nb_samples = codec_ctx_tracks[t]->frame_size == 0 ? 1024 : codec_ctx_tracks[t]->frame_size;
+        a_frames[t]->format = codec_ctx_tracks[t]->sample_fmt;
+        av_channel_layout_copy(&a_frames[t]->ch_layout, &codec_ctx_tracks[t]->ch_layout);
+        av_frame_get_buffer(a_frames[t], 0);
+    }
 
     AVFrame *v_frame_enc = av_frame_alloc();
     AVFrame *sw_frame = av_frame_alloc();
@@ -344,13 +380,14 @@ static void* encoder_loop(void* arg) {
 
     AVPacket *shared_pkt = av_packet_alloc();
 
-    int64_t first_a_pts = -1;
+    int64_t current_audio_samples = 0; // REPLACES first_a_pts
     int64_t first_v_pts = -1;
 
     while (keep_running) {
         int activity = 0;
 
-        while (process_audio_batch(a_frame_mix, shared_pkt, &first_a_pts)) {
+        // PASS THE CONTIGUOUS COUNTER
+        while (process_audio_batch(a_frames, shared_pkt, &current_audio_samples)) {
             activity = 1;
         }
 
@@ -369,7 +406,9 @@ static void* encoder_loop(void* arg) {
         }
     }
 
-    flush_encoder_context(codec_ctx_mix, audio_stream_mix, shared_pkt);
+    for (int t = 0; t < total_streams; t++) {
+        flush_encoder_context(codec_ctx_tracks[t], audio_streams[t], shared_pkt);
+    }
 
     if (first_v_pts != -1) {
         flush_encoder_context(video_enc_ctx, video_stream, shared_pkt);
@@ -377,7 +416,9 @@ static void* encoder_loop(void* arg) {
 
     av_write_trailer(fmt_ctx);
 
-    av_frame_free(&a_frame_mix);
+    for (int t = 0; t < total_streams; t++) {
+        av_frame_free(&a_frames[t]);
+    }
     av_frame_free(&v_frame_enc);
     av_packet_free(&shared_pkt);
 
@@ -414,7 +455,9 @@ void stop_encoder() {
         fmt_ctx = NULL;
     }
 
-    if (codec_ctx_mix) { avcodec_free_context(&codec_ctx_mix); codec_ctx_mix = NULL; }
+    for (int i = 0; i < MAX_ENC_STREAMS; i++) {
+        if (codec_ctx_tracks[i]) { avcodec_free_context(&codec_ctx_tracks[i]); codec_ctx_tracks[i] = NULL; }
+    }
     if (video_enc_ctx) { avcodec_free_context(&video_enc_ctx); video_enc_ctx = NULL; }
     if (hw_device_ctx) { av_buffer_unref(&hw_device_ctx); hw_device_ctx = NULL; }
 }

@@ -53,4 +53,12 @@ int scan_playback_devices(jack_client_t *client, AudioDevice *devices, int max_d
  */
 int get_best_video_format(const char* device_path, uint32_t *out_pixelformat, int *out_width, int *out_height);
 
+/**
+ * @brief Executes lsusb to extract physical hardware identifiers present on the USB bus.
+ * @param out_keywords Array to store the discovered USB descriptions.
+ * @param max_keywords Maximum number of devices to scan.
+ * @return The number of discovered physical USB devices.
+ */
+int get_physical_usb_hardware(char out_keywords[][128], int max_keywords);
+
 #endif // QJAMS_SCANNER_H

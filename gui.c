@@ -1,4 +1,5 @@
 #include <gtk/gtk.h>
+#include <glib-unix.h>   // For g_unix_fd_add
 #include <jack/jack.h>
 #include <math.h>
 #include <stdbool.h>
@@ -20,15 +21,13 @@ extern jack_client_t *client;
 extern SPSC_Video_Queue video_queue;
 SPSC_Preview_Queue preview_queue;
 
-_Atomic bool is_multitrack_mode = false; // Decoupled UI state flag
-
-// --- INSTANTIATE UI GLOBALS ---
-QJamsUIState ui_state = { .is_loading_track = false, .selected_track_path = "", .freestyle_duration_min = 15, .multitrack_duration_min = 5, .session_is_dirty = false };
+QJamsUIState ui_state = { .is_loading_track = false, .selected_track_path = "", .default_canvas_limit_min = 5, .is_existing_session = false };
 
 GtkWidget *lbl_input_device;
 GtkWidget *input_gain_spinner;
 GtkWidget *lbl_track;
 GtkWidget *lbl_status;
+GtkWidget *lbl_hw_toast;
 GtkWidget *lbl_roadmap;
 GtkWidget *main_spinner;
 GtkWidget *btn_play;
@@ -47,12 +46,9 @@ GtkWidget *right_vbox;
 GtkWidget *command_post_box;
 GtkWidget *settings_dialog;
 
-GtkWidget *mode_stack;
-GtkWidget *btn_multitrack_mode;
 GtkWidget *lbl_multitrack_status;
 GtkWidget *btn_multitrack_undo;
 GtkWidget *btn_multitrack_next;
-GtkWidget *sw_blank_canvas;
 
 GtkWidget *btn_load;
 GtkWidget *btn_save_mux;
@@ -65,40 +61,127 @@ GtkWidget *btn_speed;
 GtkWidget *btn_reset;
 
 static GtkWidget *video_preview;
+GtkWidget *video_preview_frame = NULL;
 
-gboolean on_jack_shutdown_ui(gpointer data) {
-    (void)data;
-    on_stop_clicked(NULL, NULL);
+static guint routing_timeout_id = 0;
+static guint daemon_retry_id = 0;
 
-    gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: Audio Engine Offline (Hardware Disconnected)</b></span>");
-    gtk_widget_set_sensitive(btn_play, FALSE);
-    gtk_widget_set_sensitive(btn_record, FALSE);
+static gboolean delayed_routing_cb(gpointer user_data) {
+    (void)user_data;
+    routing_timeout_id = 0;
+    log_and_notify(0, "[GTK TIMER] Port debounce finished. Executing graph validation...\n");
 
-    GtkAlertDialog *alert = gtk_alert_dialog_new("Hardware Disconnected");
-    gtk_alert_dialog_set_detail(alert, "The JACK audio server has forcefully disconnected. If a recording was active, the video file has been safely preserved on disk.\n\nPlease reconnect your hardware and restart QJams.");
-    gtk_alert_dialog_show(alert, NULL);
-    g_object_unref(alert);
+    // 1. Recover Audio Graph
+    extern void update_dashboard_pref_ui(void);
+    update_dashboard_pref_ui();
+
+    // 2. Recover Video Graph (V4L2 Zombie Node Pruning)
+    VideoDevice v_devs[MAX_CAMERAS];
+    int v_count = scan_video_devices(v_devs, MAX_CAMERAS);
+
+    if (v_count > 0) {
+        bool video_online = false;
+        for (int i = 0; i < v_count; i++) {
+            if (strcmp(ui_state.config.video_device, v_devs[i].device_path) == 0) {
+                video_online = true;
+                break;
+            }
+        }
+
+        if (!video_online) {
+            log_and_notify(0, "[HW-HEAL] Video capture lost. Auto-recovering to %s\n", v_devs[0].device_path);
+            strncpy(ui_state.config.video_device, v_devs[0].device_path, sizeof(ui_state.config.video_device) - 1);
+            ui_state.config.video_device[sizeof(ui_state.config.video_device) - 1] = '\0';
+
+            stop_video_engine();
+            init_and_start_video_engine(ui_state.config.video_device, &video_queue);
+            save_qjams_config(ui_state.config_path, &ui_state.config);
+        }
+        if (video_preview_frame) gtk_widget_set_visible(video_preview_frame, TRUE);
+        extern GtkWidget *btn_record_video;
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, TRUE);
+    } else {
+        if (video_preview_frame) gtk_widget_set_visible(video_preview_frame, FALSE);
+        extern GtkWidget *btn_record_video;
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, FALSE);
+        extern _Atomic bool video_is_armed;
+        atomic_store_explicit(&video_is_armed, false, memory_order_release);
+    }
 
     return G_SOURCE_REMOVE;
+}
+
+static gboolean daemon_retry_cb(gpointer user_data) {
+    (void)user_data;
+    extern int reboot_audio_engine(const char*, const char*, float);
+    int status = reboot_audio_engine(ui_state.config.audio_device, ui_state.config.playback_target, ui_state.config.input_gain_multiplier);
+    if (status != -1) {
+        log_and_notify(0, "[DAEMON] Audio Daemon Restored.\n");
+        daemon_retry_id = 0;
+        extern void update_dashboard_pref_ui(void);
+        update_dashboard_pref_ui();
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+gboolean on_jack_pipe_event(gint fd, GIOCondition condition, gpointer user_data) {
+    (void)condition; (void)user_data;
+    uint8_t event;
+    while (read(fd, &event, sizeof(event)) > 0) {
+        if (event == 1) {
+            log_and_notify(0, "[IPC] Daemon crash detected.\n");
+            if (routing_timeout_id > 0) g_source_remove(routing_timeout_id);
+            routing_timeout_id = 0;
+            on_stop_clicked(NULL, NULL);
+            log_and_notify(1, "<span foreground='#ff4444'><b>Status: FATAL - Audio Daemon Offline. Retrying...</b></span>");
+            if (daemon_retry_id == 0) daemon_retry_id = g_timeout_add(1000, daemon_retry_cb, NULL);
+        } else if (event == 2 || event == 3) {
+            log_and_notify(0, "[IPC] Topology change detected (%s).\n", event == 2 ? "ADDED" : "REMOVED");
+            if (daemon_retry_id == 0) {
+                if (routing_timeout_id > 0) g_source_remove(routing_timeout_id);
+
+                bool device_missing = false;
+                if (event == 3) {
+                    AudioDevice active_devs[MAX_AUDIO_DEVICES];
+                    int online_count = scan_audio_devices(client, active_devs, MAX_AUDIO_DEVICES);
+                    bool found = false;
+                    for (int i = 0; i < online_count; i++) {
+                        if (strcmp(ui_state.config.audio_device, active_devs[i].display_name) == 0) {
+                            found = true; break;
+                        }
+                    }
+                    if (!found) device_missing = true;
+                }
+
+                if (event == 3 && device_missing) {
+                    // SAFETY [Critical]: Drop connections immediately ONLY if our active hardware vanished
+                    extern void qjams_drop_connections(void);
+                    qjams_drop_connections();
+                }
+                routing_timeout_id = g_timeout_add(300, delayed_routing_cb, NULL);
+            }
+        }
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 static void on_force_quit_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
 
-    if (response == 0) { // Force Quit Confirmed
+    if (response == 0) {
         if (active_muxer_pid != 0) {
             kill(active_muxer_pid, SIGKILL);
             active_muxer_pid = 0;
         }
-        // Muxer is dead, safe to close window now
         GtkWidget *win = GTK_WIDGET(user_data);
         gtk_window_destroy(GTK_WINDOW(win));
     }
 }
 
-// New global flag to allow the window to close after user confirmation
 static bool force_quit_approved = false;
+bool pending_quit_after_save = false;
 
 static void on_unsaved_quit_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
@@ -106,30 +189,92 @@ static void on_unsaved_quit_response(GObject *source_object, GAsyncResult *res, 
     GtkWidget *win = GTK_WIDGET(user_data);
 
     if (response == 0) {
-        // Route to the appropriate save pipeline natively
+        pending_quit_after_save = true;
         extern GtkWidget *btn_save_session;
-        extern GtkWidget *btn_save_mux;
-        if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-            if (btn_save_session) g_signal_emit_by_name(btn_save_session, "clicked");
-        } else {
-            if (btn_save_mux) g_signal_emit_by_name(btn_save_mux, "clicked");
-        }
+        if (btn_save_session) g_signal_emit_by_name(btn_save_session, "clicked");
     } else if (response == 1) {
-        // Discard selected: Approve the quit and re-trigger destruction
+        char autosave_path[1024];
+        snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
+        remove(autosave_path);
+        mark_session_saved();
+
+        // Explicitly wipe un-exported video since the session is abandoned
+        extern void abort_active_video_preview(bool stash);
+        abort_active_video_preview(false);
+
         force_quit_approved = true;
         gtk_window_destroy(GTK_WINDOW(win));
+    }
+}
+
+static void on_recording_quit_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
+    GtkWidget *win = GTK_WIDGET(user_data);
+
+    if (response == 0) {
+        on_stop_clicked(NULL, NULL);
+        force_quit_approved = true;
+        gtk_window_destroy(GTK_WINDOW(win));
+    }
+}
+
+void purge_autosave_file(void) {
+    char autosave_path[1024];
+    snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
+    remove(autosave_path);
+}
+
+void trigger_global_ui_refresh(void) {
+    extern void update_multitrack_status_ui(void);
+    update_multitrack_status_ui();
+
+    extern void update_zoom_button_label_to_length(void);
+    update_zoom_button_label_to_length();
+
+    extern void invalidate_waveform_caches(void);
+    invalidate_waveform_caches();
+
+    extern GtkWidget *waveform_area_bt;
+    extern GtkWidget *waveform_area_input;
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+}
+
+void set_app_waiting_state(bool waiting) {
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (!win) return;
+
+    if (waiting) {
+        GdkCursor *cursor = gdk_cursor_new_from_name("wait", NULL);
+        gtk_widget_set_cursor(GTK_WIDGET(win), cursor);
+        g_object_unref(cursor);
+    } else {
+        gtk_widget_set_cursor(GTK_WIDGET(win), NULL);
     }
 }
 
 static gboolean on_window_close(GtkWindow *window, gpointer user_data) {
     (void)user_data;
 
-    // If the user already authorized the data wipe, bypass the checks and allow destruction
     if (force_quit_approved) {
         ui_state.config.window_width = gtk_widget_get_width(GTK_WIDGET(window));
         ui_state.config.window_height = gtk_widget_get_height(GTK_WIDGET(window));
         save_qjams_config(ui_state.config_path, &ui_state.config);
         return FALSE;
+    }
+
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Recording in Progress");
+        gtk_alert_dialog_set_detail(alert, "A recording is currently active. Do you want to stop recording and quit, or cancel?");
+        const char *buttons[] = { "Stop & Quit", "Cancel", NULL };
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 1);
+        gtk_alert_dialog_set_default_button(alert, 1);
+
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(window), NULL, on_recording_quit_response, window);
+        g_object_unref(alert);
+        return TRUE;
     }
 
     if (active_muxer_pid != 0) {
@@ -142,30 +287,27 @@ static gboolean on_window_close(GtkWindow *window, gpointer user_data) {
 
         gtk_alert_dialog_choose(alert, GTK_WINDOW(window), NULL, on_force_quit_response, window);
         g_object_unref(alert);
-        return TRUE; // Block immediate close
+        return TRUE;
     }
 
-    bool has_raw_video = (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0);
-    bool is_dirty = (ui_state.session_is_dirty && pristine_frames > 0);
+    // Safely blocks the UI thread until the encoder pipeline flushes remaining chunks to disk
+    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+        on_stop_clicked(NULL, NULL);
+        mark_session_dirty();
+    }
 
-    if (is_dirty || has_raw_video) {
+    if (is_session_dirty() && pristine_frames > 0) {
         GtkAlertDialog *alert = gtk_alert_dialog_new("Unsaved Changes");
-        bool is_multitrack = atomic_load_explicit(&is_multitrack_mode, memory_order_acquire);
+        gtk_alert_dialog_set_detail(alert, "You have unsaved audio overdubs on the canvas. If you quit now, your progress will be permanently lost.");
 
-        if (is_multitrack) {
-            gtk_alert_dialog_set_detail(alert, "You have unsaved audio overdubs on the canvas. If you quit now, your progress will be permanently lost.");
-        } else {
-            gtk_alert_dialog_set_detail(alert, "You have an un-exported video recording. If you quit now, the temporary video file will be permanently deleted.");
-        }
-
-        const char *buttons[] = { is_multitrack ? "Save Session" : "Export Mix", "Discard & Quit", "Cancel", NULL };
+        const char *buttons[] = { "Save Session", "Discard & Quit", "Cancel", NULL };
         gtk_alert_dialog_set_buttons(alert, buttons);
         gtk_alert_dialog_set_cancel_button(alert, 2);
         gtk_alert_dialog_set_default_button(alert, 0);
 
         gtk_alert_dialog_choose(alert, GTK_WINDOW(window), NULL, on_unsaved_quit_response, window);
         g_object_unref(alert);
-        return TRUE; // Block immediate close
+        return TRUE;
     }
 
     ui_state.config.window_width = gtk_widget_get_width(GTK_WIDGET(window));
@@ -174,38 +316,78 @@ static gboolean on_window_close(GtkWindow *window, gpointer user_data) {
     return FALSE;
 }
 
-static void apply_keyboard_seek(double step_sign) {
+static void apply_keyboard_seek(double step_sign, GdkModifierType state) {
     if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) return;
 
     size_t frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
     if (frames > 0) {
-        int current_rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
-        double step = (5.0 * current_rate) / (double)frames;
-        double current;
+        extern double zoom_multiplier;
 
-        // STRICT: Eliminate race conditions during rapid key repeats.
-        // If a seek is pending in the RT queue, build the next step on top of it.
+        // DYNAMIC ZOOM PROPORTIONALITY
+        // Jumps exactly 1% of the currently visible timeline width (100 steps per screen)
+        double step_fraction = 0.01 / zoom_multiplier;
+
+        double current;
         if (atomic_load_explicit(&seek_flag, memory_order_acquire)) {
             current = atomic_load_explicit(&seek_target, memory_order_relaxed);
         } else {
             current = (double)atomic_load_explicit(&playback_pos, memory_order_acquire) / (double)frames;
         }
 
-        double target = current + (step * step_sign);
+        double target = current + (step_fraction * step_sign);
 
-        if (step_sign < 0.0) {
-            target = fmax(0.0, target);
+        if (state & GDK_SHIFT_MASK) {
+            // --- REGION SELECTION MODE ---
+            double anchor;
+            extern _Atomic bool loop_active;
             if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                extern _Atomic size_t loop_start_frame;
+                extern _Atomic size_t loop_end_frame;
                 double l_start = (double)atomic_load_explicit(&loop_start_frame, memory_order_relaxed) / (double)frames;
-                target = fmax(l_start, target);
-            }
-        } else {
-            target = fmin(1.0, target);
-            if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
                 double l_end = (double)atomic_load_explicit(&loop_end_frame, memory_order_relaxed) / (double)frames;
-                target = fmin(l_end, target);
+
+                // Anchor to the edge furthest from the current playhead
+                if (fabs(current - l_start) < fabs(current - l_end)) {
+                    anchor = l_end;
+                } else {
+                    anchor = l_start;
+                }
+            } else {
+                anchor = current;
+            }
+
+            target = fmax(0.0, fmin(1.0, target));
+
+            extern void set_loop_points(double, double);
+            set_loop_points(anchor, target);
+
+            // Force redraw to visually update the blue loop region
+            extern GtkWidget *waveform_area_bt;
+            extern GtkWidget *waveform_area_input;
+            if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+            if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+        } else {
+            // --- STANDARD SEEK MODE ---
+            if (step_sign < 0.0) {
+                target = fmax(0.0, target);
+                extern _Atomic bool loop_active;
+                if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                    extern _Atomic size_t loop_start_frame;
+                    double l_start = (double)atomic_load_explicit(&loop_start_frame, memory_order_relaxed) / (double)frames;
+                    target = fmax(l_start, target);
+                }
+            } else {
+                target = fmin(1.0, target);
+                extern _Atomic bool loop_active;
+                if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                    extern _Atomic size_t loop_end_frame;
+                    double l_end = (double)atomic_load_explicit(&loop_end_frame, memory_order_relaxed) / (double)frames;
+                    target = fmin(l_end, target);
+                }
             }
         }
+
+        extern void seek_backing_track(double);
         seek_backing_track(target);
     }
 }
@@ -232,13 +414,97 @@ static gboolean update_video_preview(GtkWidget *widget, GdkFrameClock *frame_clo
     return G_SOURCE_CONTINUE;
 }
 
+static bool is_time_shift_safe(uint32_t mask, bool is_global_edit) {
+    extern char current_raw_path[1024];
+    bool has_video = false;
+    if (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0) has_video = true;
+    if (g_str_has_suffix(ui_state.selected_track_path, ".mkv") || g_str_has_suffix(ui_state.selected_track_path, ".MKV")) has_video = true;
+
+    if (!has_video) return true;
+    if (is_global_edit) return false;
+
+    int total_audio_tracks = 0;
+    int selected_audio_tracks = 0;
+
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) {
+            total_audio_tracks++;
+            if (mask & (1 << i)) {
+                selected_audio_tracks++;
+            }
+        }
+    }
+
+    if (total_audio_tracks == 0) return true;
+    return (selected_audio_tracks < total_audio_tracks);
+}
+
+typedef void (*NLE_Func)(void);
+
+static void async_nle_thread(GTask *task, gpointer source, gpointer task_data, GCancellable *c) {
+    (void)source; (void)c;
+    NLE_Func func = (NLE_Func)task_data;
+    if (func) func();
+    g_task_return_boolean(task, TRUE);
+}
+
+static void async_nle_ready(GObject *source, GAsyncResult *res, gpointer data) {
+    (void)source; (void)data;
+    g_task_propagate_boolean(G_TASK(res), NULL);
+
+    extern void trigger_global_ui_refresh(void);
+    trigger_global_ui_refresh();
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner) gtk_spinner_stop(GTK_SPINNER(main_spinner));
+
+    extern void set_app_waiting_state(bool);
+    set_app_waiting_state(false);
+
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, TRUE);
+    }
+}
+
+static void dispatch_nle_operation(NLE_Func op) {
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, FALSE);
+    }
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner) gtk_spinner_start(GTK_SPINNER(main_spinner));
+
+    extern void set_app_waiting_state(bool);
+    set_app_waiting_state(true);
+
+    GTask *task = g_task_new(NULL, NULL, async_nle_ready, NULL);
+    g_task_set_task_data(task, op, NULL);
+    g_task_run_in_thread(task, async_nle_thread);
+    g_object_unref(task);
+}
+
+static void execute_delete_active_layer(void) {
+    extern void delete_multitrack_layer(int);
+    extern _Atomic int current_recording_track;
+    int trk = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    delete_multitrack_layer(trk);
+}
+
 gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data) {
-    (void)keycode; (void)user_data; (void)state;
+    (void)keycode; (void)user_data;
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner && gtk_spinner_get_spinning(GTK_SPINNER(main_spinner))) {
+        return TRUE;
+    }
+
     GtkWidget *window = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(window));
 
-    // SMART FOCUS: Ignore global shortcuts if a true text entry (like Track Rename) is active.
-    // SpinButtons (like Clip Gain) are strictly overridden so Space/Home always work.
     bool in_text_entry = false;
     if (focus && GTK_IS_EDITABLE(focus)) {
         in_text_entry = true;
@@ -249,89 +515,181 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
     }
     if (in_text_entry) return FALSE;
 
+    bool has_ctrl = (state & GDK_CONTROL_MASK) != 0;
+    bool has_shift = (state & GDK_SHIFT_MASK) != 0;
+
     switch (keyval) {
+        case GDK_KEY_space:
+            if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
+                extern _Atomic bool video_is_armed;
+                extern GtkWidget *btn_record_video;
+                if (atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+                    if (btn_record_video && gtk_widget_is_sensitive(btn_record_video)) {
+                        g_signal_emit_by_name(btn_record_video, "clicked");
+                    }
+                } else {
+                    if (btn_record && gtk_widget_is_sensitive(btn_record)) {
+                        g_signal_emit_by_name(btn_record, "clicked");
+                    }
+                }
+            } else {
+                if (btn_play && gtk_widget_is_sensitive(btn_play)) {
+                    g_signal_emit_by_name(btn_play, "clicked");
+                }
+            }
+            return TRUE;
+
         case GDK_KEY_p:
         case GDK_KEY_P:
-        case GDK_KEY_space:
-            if (btn_play && gtk_widget_is_sensitive(btn_play)) {
-                g_signal_emit_by_name(btn_play, "clicked");
+        case GDK_KEY_Page_Up:
+            if (!has_ctrl && btn_prev && gtk_widget_is_sensitive(btn_prev)) {
+                g_signal_emit_by_name(btn_prev, "clicked");
+            }
+            return TRUE;
+
+        case GDK_KEY_n:
+        case GDK_KEY_N:
+        case GDK_KEY_Page_Down:
+            if (!has_ctrl && btn_next && gtk_widget_is_sensitive(btn_next)) {
+                g_signal_emit_by_name(btn_next, "clicked");
             }
             return TRUE;
 
         case GDK_KEY_r:
         case GDK_KEY_R:
-            if (!(state & GDK_CONTROL_MASK) && btn_record && gtk_widget_is_sensitive(btn_record)) {
-                g_signal_emit_by_name(btn_record, "clicked");
+            if (!has_ctrl && !has_shift) {
+                if (btn_record && gtk_widget_is_sensitive(btn_record)) {
+                    g_signal_emit_by_name(btn_record, "clicked");
+                }
+                return TRUE;
             }
-            return TRUE;
+            return FALSE;
+
+        case GDK_KEY_y:
+        case GDK_KEY_Y:
+            if (has_ctrl && !has_shift) {
+                if (global_undo_ledger.head >= global_undo_ledger.count) return TRUE;
+
+                static gint64 last_redo_time_y = 0;
+                gint64 now = g_get_monotonic_time();
+                if (now - last_redo_time_y < 250000) return TRUE;
+                last_redo_time_y = now;
+
+                extern void redo_selection(void);
+                dispatch_nle_operation(redo_selection);
+                return TRUE;
+            }
+            return FALSE;
 
         case GDK_KEY_s:
         case GDK_KEY_S:
-            if (!(state & GDK_CONTROL_MASK) && btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+            if (!has_ctrl && !has_shift && btn_stop && gtk_widget_is_sensitive(btn_stop)) {
                 g_signal_emit_by_name(btn_stop, "clicked");
             }
             return TRUE;
 
+        case GDK_KEY_a:
+        case GDK_KEY_A:
+            if (has_ctrl && !has_shift) {
+                GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(window));
+                extern GtkWidget *right_vbox;
+                extern GtkWidget *command_post_box;
+                extern GtkWidget *left_column_box;
+
+                bool in_playlist = focus && (focus == right_vbox || gtk_widget_is_ancestor(focus, right_vbox));
+                bool in_cmd = focus && (focus == command_post_box || gtk_widget_is_ancestor(focus, command_post_box));
+                bool in_left = focus && (focus == left_column_box || gtk_widget_is_ancestor(focus, left_column_box));
+                bool in_multi = in_left && !in_playlist && !in_cmd;
+
+                if (in_playlist) {
+                    extern bool playlist_handle_ctrl_a(void);
+                    return playlist_handle_ctrl_a();
+                } else if (in_multi) {
+                    extern void multitrack_select_all_active(void);
+                    multitrack_select_all_active();
+                    return TRUE;
+                } else {
+                    extern size_t get_last_audible_frame(void);
+                    size_t last_f = get_last_audible_frame();
+                    size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+                    if (last_f > 0 && total > 0) {
+                        extern void set_loop_points(double, double);
+                        set_loop_points(0.0, (double)last_f / (double)total);
+                        extern void seek_backing_track(double);
+                        seek_backing_track(0.0);
+                        extern GtkWidget *waveform_area_bt;
+                        extern GtkWidget *waveform_area_input;
+                        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+                        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+                    }
+                    return TRUE;
+                }
+            }
+            return FALSE;
+
         case GDK_KEY_c:
         case GDK_KEY_C:
-            if (state & GDK_CONTROL_MASK) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    extern void copy_selection(void);
-                    copy_selection();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
+            if (has_ctrl && !has_shift) {
+                extern void copy_selection(void);
+                dispatch_nle_operation(copy_selection);
+                return TRUE;
+            } else if (!has_ctrl && !has_shift) {
+                if (btn_speed && gtk_widget_is_sensitive(btn_speed)) {
+                    g_signal_emit_by_name(btn_speed, "clicked");
                 }
                 return TRUE;
             }
-            if (btn_speed && gtk_widget_is_sensitive(btn_speed)) {
-                g_signal_emit_by_name(btn_speed, "clicked");
-            }
-            return TRUE;
+            return FALSE;
 
         case GDK_KEY_x:
         case GDK_KEY_X:
-            if (state & GDK_CONTROL_MASK) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    extern void cut_selection(void);
-                    cut_selection();
-                    ui_state.session_is_dirty = true;
-                    extern void invalidate_waveform_caches(void);
-                    invalidate_waveform_caches();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
+        {
+            extern _Atomic uint32_t selected_tracks_mask;
+            uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+
+            if (has_ctrl && !has_shift) {
+                if (!is_time_shift_safe(mask, false)) {
+                    log_and_notify(1, "Status: Time shifting edits disabled to protect video sync");
+                    return TRUE;
                 }
+                extern void cut_selection(void);
+                dispatch_nle_operation(cut_selection);
                 return TRUE;
-            } else {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    extern void apply_blend_fade_selection(void);
-                    apply_blend_fade_selection();
-                    ui_state.session_is_dirty = true;
-                    extern void invalidate_waveform_caches(void);
-                    invalidate_waveform_caches();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
+            } else if (!has_ctrl && !has_shift) {
+                if (!is_time_shift_safe(mask, false)) {
+                    log_and_notify(1, "Status: Time shifting edits disabled to protect video sync");
+                    return TRUE;
                 }
+                extern void apply_blend_fade_selection(void);
+                dispatch_nle_operation(apply_blend_fade_selection);
                 return TRUE;
             }
+            return FALSE;
+        }
 
         case GDK_KEY_v:
         case GDK_KEY_V:
-            if (state & GDK_CONTROL_MASK) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    if (state & GDK_SHIFT_MASK) {
-                        extern void global_paste_selection(void);
-                        global_paste_selection();
-                    } else {
-                        extern void paste_selection(void);
-                        paste_selection();
-                    }
-                    ui_state.session_is_dirty = true;
-                    extern void update_zoom_button_label_to_length(void);
-                    update_zoom_button_label_to_length();
-                    extern void invalidate_waveform_caches(void);
-                    invalidate_waveform_caches();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
+            if (has_ctrl) {
+                extern _Atomic uint32_t selected_tracks_mask;
+                uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+
+                if (!is_time_shift_safe(mask, has_shift)) {
+                    log_and_notify(1, "Status: Time shifting edits disabled to protect video sync");
+                    return TRUE;
+                }
+
+                if (has_shift) {
+                    extern void global_paste_selection(void);
+                    dispatch_nle_operation(global_paste_selection);
+                } else {
+                    extern void paste_selection(void);
+                    dispatch_nle_operation(paste_selection);
+                }
+                return TRUE;
+            } else if (!has_ctrl && !has_shift) {
+                extern GtkWidget *btn_record_video;
+                if (btn_record_video && gtk_widget_is_sensitive(btn_record_video)) {
+                    g_signal_emit_by_name(btn_record_video, "clicked");
                 }
                 return TRUE;
             }
@@ -339,81 +697,105 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
 
         case GDK_KEY_z:
         case GDK_KEY_Z:
-            if (state & GDK_CONTROL_MASK) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    extern void undo_selection(void);
-                    undo_selection();
+            if (has_ctrl && !has_shift) {
+                if (global_undo_ledger.head <= 0 || global_undo_ledger.count <= 0) return TRUE;
 
-                    ui_state.session_is_dirty = true; // Wake up the safety guardrails
+                static gint64 last_undo_time = 0;
+                gint64 now = g_get_monotonic_time();
+                if (now - last_undo_time < 250000) return TRUE;
+                last_undo_time = now;
 
-                    extern void refresh_multitrack_tracks_ui(void);
-                    refresh_multitrack_tracks_ui();
-                    extern void update_multitrack_status_ui(void);
-                    update_multitrack_status_ui();
+                extern void undo_selection(void);
+                dispatch_nle_operation(undo_selection);
+                return TRUE;
+            } else if (has_ctrl && has_shift) {
+                if (global_undo_ledger.head >= global_undo_ledger.count) return TRUE;
 
-                    extern void invalidate_waveform_caches(void);
-                    invalidate_waveform_caches();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
-                }
+                static gint64 last_redo_time_z = 0;
+                gint64 now = g_get_monotonic_time();
+                if (now - last_redo_time_z < 250000) return TRUE;
+                last_redo_time_z = now;
+
+                extern void redo_selection(void);
+                dispatch_nle_operation(redo_selection);
                 return TRUE;
             }
             return FALSE;
 
         case GDK_KEY_f:
         case GDK_KEY_F:
-            if (!(state & GDK_CONTROL_MASK)) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    extern void apply_smart_fade_selection(void);
-                    apply_smart_fade_selection();
-                    ui_state.session_is_dirty = true;
-                    extern void invalidate_waveform_caches(void);
-                    invalidate_waveform_caches();
-                    gtk_widget_queue_draw(waveform_area_bt);
-                    gtk_widget_queue_draw(waveform_area_input);
-                }
+            if (!has_ctrl && !has_shift) {
+                extern void apply_smart_fade_selection(void);
+                dispatch_nle_operation(apply_smart_fade_selection);
                 return TRUE;
             }
             return FALSE;
 
         case GDK_KEY_Delete:
-            if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                if (state & GDK_SHIFT_MASK) {
-                    extern void global_ripple_delete_selection(void);
-                    global_ripple_delete_selection();
-                } else {
-                    extern void delete_selection(void);
-                    delete_selection();
+        {
+            if (has_ctrl && !has_shift) {
+                static gint64 last_ctrl_del_time = 0;
+                gint64 now = g_get_monotonic_time();
+                if (now - last_ctrl_del_time < 250000) return TRUE;
+                last_ctrl_del_time = now;
+
+                dispatch_nle_operation(execute_delete_active_layer);
+                return TRUE;
+            } else if (!has_ctrl && has_shift) {
+                if (!is_time_shift_safe(0xFFFFFFFF, true)) {
+                    log_and_notify(1, "Status: Time shifting edits disabled to protect video sync");
+                    return TRUE;
                 }
-                ui_state.session_is_dirty = true;
-                extern void invalidate_waveform_caches(void);
-                invalidate_waveform_caches();
-                gtk_widget_queue_draw(waveform_area_bt);
-                gtk_widget_queue_draw(waveform_area_input);
+                extern void clear_video_stash_async(void);
+                clear_video_stash_async();
+
+                extern void global_ripple_delete_selection(void);
+                dispatch_nle_operation(global_ripple_delete_selection);
+                return TRUE;
+            } else if (!has_ctrl && !has_shift) {
+                extern void delete_selection(void);
+                dispatch_nle_operation(delete_selection);
                 return TRUE;
             }
             return FALSE;
-
+        }
         case GDK_KEY_Escape:
+            extern bool is_countdown_active(void);
+            if (atomic_load_explicit(&engine_is_recording, memory_order_acquire) || is_countdown_active()) {
+                extern GtkWidget *btn_stop;
+                if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+                    g_signal_emit_by_name(btn_stop, "clicked");
+                }
+                return TRUE;
+            }
+
             if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
-                extern void clear_loop_points(void);
-                clear_loop_points();
-                gtk_widget_queue_draw(waveform_area_bt);
-                gtk_widget_queue_draw(waveform_area_input);
+                extern _Atomic bool loop_active;
+                if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+                    extern void clear_loop_points(void);
+                    clear_loop_points();
+                    gtk_widget_queue_draw(waveform_area_bt);
+                    gtk_widget_queue_draw(waveform_area_input);
+                } else {
+                    extern GtkWidget *btn_reset;
+                    if (btn_reset && gtk_widget_is_sensitive(btn_reset)) {
+                        g_signal_emit_by_name(btn_reset, "clicked");
+                    }
+                }
             }
             return TRUE;
 
         case GDK_KEY_Left:
-            apply_keyboard_seek(-1.0);
+            apply_keyboard_seek(-1.0, state);
             return TRUE;
 
         case GDK_KEY_Right:
-            apply_keyboard_seek(1.0);
+            apply_keyboard_seek(1.0, state);
             return TRUE;
 
         case GDK_KEY_Home:
             if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
-                if (state & GDK_SHIFT_MASK) {
+                if (has_shift) {
                     size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
                     if (total > 0) {
                         double end_frac = 1.0;
@@ -437,24 +819,30 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
 
         case GDK_KEY_End:
             if (!atomic_load_explicit(&engine_is_recording, memory_order_acquire)) {
-                if (state & GDK_SHIFT_MASK) {
-                    size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-                    if (total > 0) {
+                size_t total = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+                if (total > 0) {
+                    extern size_t get_last_audible_frame(void);
+                    size_t last_f = get_last_audible_frame();
+                    double target_frac = 1.0;
+                    if (!has_ctrl && last_f > 0) {
+                        target_frac = (double)last_f / (double)total;
+                    }
+                    if (has_shift) {
                         double start_frac = 0.0;
                         if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
                             start_frac = (double)atomic_load_explicit(&loop_start_frame, memory_order_acquire) / (double)total;
                         } else {
                             start_frac = (double)atomic_load_explicit(&playback_pos, memory_order_acquire) / (double)total;
                         }
-                        set_loop_points(start_frac, 1.0);
+                        set_loop_points(start_frac, target_frac);
                         seek_backing_track(start_frac);
                         gtk_widget_queue_draw(waveform_area_bt);
                         gtk_widget_queue_draw(waveform_area_input);
+                    } else {
+                        extern void clear_loop_points(void);
+                        clear_loop_points();
+                        seek_backing_track(target_frac);
                     }
-                } else {
-                    extern void clear_loop_points(void);
-                    clear_loop_points();
-                    seek_backing_track(1.0);
                 }
             }
             return TRUE;
@@ -472,7 +860,6 @@ gboolean on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, 
             } else if (keyval == GDK_KEY_0) {
                 slot = 9;
             }
-
             if (slot != -1) {
                 activate_playlist_preset(slot);
                 return TRUE;
@@ -490,81 +877,45 @@ static void on_scrollbar_changed(GtkAdjustment *adjustment, gpointer user_data) 
     if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
 }
 
-// PHASE 3 WAVEFORM DROP CALLBACK ---
 static gboolean on_waveform_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
     (void)target; (void)x; (void)y; (void)user_data;
 
-    // 1. Handle external drops from OS file manager (Dolphin/Plasma)
-    if (G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST)) {
-        GdkFileList *file_list = g_value_get_boxed(value);
-        if (file_list) {
-            GSList *files = gdk_file_list_get_files(file_list);
-            if (files) {
-                if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-                    // Iterate through all dropped files and assign them to sequential layers
-                    for (GSList *l = files; l != NULL; l = l->next) {
-                        if (rec_track >= MAX_TRACKS) break; // Prevent out-of-bounds layer assignment
-                        GFile *file = G_FILE(l->data);
-                        char *path = g_file_get_path(file);
-                        if (path) {
-                            multitrack_import_file_async(path, rec_track);
-                            g_free(path);
-                            rec_track++; // Auto-increment to the next track for the next stem
-                        }
-                    }
-                } else {
-                    // Video Mode: Safely preserve legacy single-file load behavior
-                    if (files->data) {
-                        GFile *file = G_FILE(files->data);
-                        char *path = g_file_get_path(file);
-                        if (path) {
-                            strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
-                            ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
-                            trigger_track_load();
-                            g_free(path);
-                        }
-                    }
-                }
-                g_slist_free(files); // Safely release the GTK file list container
-                return TRUE;
-            }
-        }
-    }
-    // 2. Handle internal drops directly from the QJams playlist
-    else if (G_VALUE_HOLDS(value, QJ_TYPE_TRACK)) {
-        QjTrack *track = g_value_get_object(value);
-        if (track && track->filepath) {
-            if (atomic_load_explicit(&is_multitrack_mode, memory_order_acquire)) {
-                int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-                multitrack_import_file_async(track->filepath, rec_track);
-            } else {
-                strncpy(ui_state.selected_track_path, track->filepath, sizeof(ui_state.selected_track_path) - 1);
-                trigger_track_load();
-            }
-            return TRUE;
-        }
-    }
-    return FALSE;
+    extern _Atomic int current_recording_track;
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+
+    return handle_track_drop_payload(value, rec_track);
 }
 
 static void on_open(GtkApplication *app, GFile **files, gint n_files, const gchar *hint, gpointer user_data) {
     (void)hint; (void)user_data;
+    GList *windows = gtk_application_get_windows(app);
+    bool is_running = (windows != NULL);
+
     if (n_files > 0) {
         char *path = g_file_get_path(files[0]);
         if (path) {
             if (g_str_has_suffix(path, ".m3u")) {
                 strncpy(ui_state.config.last_playlist_path, path, sizeof(ui_state.config.last_playlist_path) - 1);
+                if (is_running) load_playlist_from_file(path);
             } else {
                 strncpy(ui_state.selected_track_path, path, sizeof(ui_state.selected_track_path) - 1);
+                if (is_running) {
+                    extern atomic_int current_recording_track;
+                    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+                    multitrack_import_file_async(path, rec_track);
+                }
             }
             g_free(path);
         }
     }
-    g_application_activate(G_APPLICATION(app));
+
+    if (!is_running) {
+        g_application_activate(G_APPLICATION(app));
+    } else {
+        gtk_window_present(GTK_WINDOW(windows->data));
+    }
 }
 
-// --- BOOT RECOVERY LOGIC ---
 static void on_audio_recovery_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     int response = gtk_alert_dialog_choose_finish(alert, res, NULL);
@@ -588,12 +939,8 @@ static void on_video_recovery_response(GObject *source_object, GAsyncResult *res
         strncpy(current_raw_path, raw_path, sizeof(current_raw_path) - 1);
         strncpy(ui_state.selected_track_path, raw_path, sizeof(ui_state.selected_track_path) - 1);
 
-        extern GtkWidget *btn_multitrack_mode;
-        if (btn_multitrack_mode) {
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_multitrack_mode), FALSE);
-        }
-
-        trigger_track_load();
+        int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+        multitrack_import_file_async(raw_path, rec_track);
 
         extern GtkWidget *btn_save_mux;
         if (btn_save_mux) {
@@ -609,11 +956,11 @@ static void on_video_recovery_response(GObject *source_object, GAsyncResult *res
 static gboolean check_for_crash_recovery(gpointer user_data) {
     GtkWindow *window = GTK_WINDOW(user_data);
 
-    // 1. Check for Audio Autosave
     char autosave_path[1024];
     snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
 
     if (access(autosave_path, F_OK) == 0) {
+        log_and_notify(0, "[RECOVERY] Orphaned autosave detected. Prompting user for session restore.\n");
         GtkAlertDialog *alert = gtk_alert_dialog_new("Recover Unsaved Session?");
         gtk_alert_dialog_set_detail(alert, "QJams recovered an unsaved multitrack session from a previous crash. Would you like to restore it?");
         const char *buttons[] = { "Restore Session", "Discard", NULL };
@@ -625,7 +972,6 @@ static gboolean check_for_crash_recovery(gpointer user_data) {
         return G_SOURCE_REMOVE;
     }
 
-    // 2. Check for Video Raw MKV in /tmp (Keep the newest, purge the rest)
     GDir *dir = g_dir_open("/tmp", 0, NULL);
     if (dir) {
         const char *filename;
@@ -640,11 +986,11 @@ static gboolean check_for_crash_recovery(gpointer user_data) {
                 struct stat st;
                 if (stat(full_path, &st) == 0) {
                     if (st.st_mtime > latest_time) {
-                        if (strlen(latest_raw) > 0) remove(latest_raw); // Delete older orphaned file
+                        if (strlen(latest_raw) > 0) remove(latest_raw);
                         latest_time = st.st_mtime;
                         strncpy(latest_raw, full_path, sizeof(latest_raw) - 1);
                     } else {
-                        remove(full_path); // Delete older orphaned file
+                        remove(full_path);
                     }
                 }
             }
@@ -652,10 +998,10 @@ static gboolean check_for_crash_recovery(gpointer user_data) {
         g_dir_close(dir);
 
         if (strlen(latest_raw) > 0) {
+            log_and_notify(0, "[RECOVERY] Orphaned un-exported video detected. Prompting user for recovery.\n");
             GtkAlertDialog *alert = gtk_alert_dialog_new("Recover Un-Exported Video?");
             gtk_alert_dialog_set_detail(alert, "QJams recovered an un-exported video recording. Would you like to load it for export?");
 
-            // Use clear, accurate terminology
             const char *buttons[] = { "Restore Recording", "Discard", NULL };
 
             gtk_alert_dialog_set_buttons(alert, buttons);
@@ -668,31 +1014,82 @@ static gboolean check_for_crash_recovery(gpointer user_data) {
 
     return G_SOURCE_REMOVE;
 }
-// --- 5-MINUTE IDLE AUTO-SAVE ---
+
+static void autosave_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable;
+    char *path = (char *)task_data;
+
+    extern int save_qjams_session(const char* filepath);
+    int result = save_qjams_session(path);
+
+    g_task_return_int(task, result);
+}
+
+static void autosave_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GError *error = NULL;
+    int status = g_task_propagate_int(G_TASK(res), &error);
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner) gtk_spinner_stop(GTK_SPINNER(main_spinner));
+
+    // Unlock the UI's master container, leaving the window itself untouched
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, TRUE);
+    }
+
+    set_app_waiting_state(false);
+
+    // Communicate status without stealing focus
+    if (status == 0) {
+        log_and_notify(1, "Status: Autosave Complete");
+    } else {
+        log_and_notify(1, "Status: Autosave Failed");
+    }
+}
+
 static gboolean idle_autosave_tick(gpointer user_data) {
     (void)user_data;
-    static bool has_autosaved = false;
+    static int last_autosave_head = -1;
 
     bool is_playing = atomic_load_explicit(&engine_is_playing, memory_order_acquire);
     bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
 
-    // Reset the lock whenever the transport is active so new takes get saved
     if (is_recording || is_playing) {
-        has_autosaved = false;
         return G_SOURCE_CONTINUE;
     }
 
-    if (has_autosaved || !ui_state.session_is_dirty || pristine_frames == 0) {
+    if (!is_session_dirty() || pristine_frames == 0) {
         return G_SOURCE_CONTINUE;
     }
+
+    extern UndoLedger global_undo_ledger;
+    if (global_undo_ledger.head == last_autosave_head) {
+        return G_SOURCE_CONTINUE;
+    }
+    last_autosave_head = global_undo_ledger.head;
 
     char autosave_path[1024];
     snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
 
-    extern int save_qjams_session(const char* filepath);
-    if (save_qjams_session(autosave_path) == 0) {
-        has_autosaved = true;
+    // Lock the master container so the frame clock stays alive for the spinner
+    GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box) gtk_widget_set_sensitive(master_box, FALSE);
     }
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner) gtk_spinner_start(GTK_SPINNER(main_spinner));
+    set_app_waiting_state(true);
+    log_and_notify(1, "Status: Autosaving in background...");
+
+    GTask *task = g_task_new(NULL, NULL, autosave_ready, NULL);
+    g_task_set_task_data(task, g_strdup(autosave_path), g_free);
+    g_task_run_in_thread(task, autosave_thread);
+    g_object_unref(task);
 
     return G_SOURCE_CONTINUE;
 }
@@ -703,25 +1100,32 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkCssProvider *css_provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(css_provider,
                                       "scrollbar slider { min-width: 8px; min-height: 8px; }\n"
+                                      ".subpixel-label { font-size: 10.5pt; }\n"
                                       ".btn-record { background: #ffb3b3; color: black; }\n"
-                                      ".btn-record:disabled { background: #5e272a; color: rgba(0,0,0,0.4); }\n"
                                       ".btn-play { background: #b3ffc6; color: black; }\n"
                                       ".btn-play:disabled { background: #265740; color: rgba(0,0,0,0.4); }\n"
-                                      ".btn-reset { color: #ff4444; font-weight: bold; }\n"
+                                      ".btn-reset { color: #ff4444; font-weight: 600; }\n"
+                                      ".btn-reset label { margin-top: 4px; }\n"
+                                      ".btn-eject label { font-weight: 200; }\n"
+                                      ".symbol-btn { padding: 0px 0px; min-width: 32px; min-height: 32px; }\n"
+                                      ".symbol-btn label { font-size: 14px; }\n"
                                       ".multitrack-canvas { background-color: #ffffff; border-radius: 4px; }\n"
                                       ".multitrack-row { background-color: #ffffff; border-bottom: 1px solid #eeeeee; padding: 4px; }\n"
-                                      ".multitrack-row.selected { background-color: #dbf0ff; }\n"
+                                      ".multitrack-row.active-row { background-color: #dbf0ff; }\n"
                                       "editablelabel.editing { background: #ffffff; border: 1px solid #3584e4; border-radius: 4px; padding: 2px 6px; }\n"
-                                      "editablelabel.editing text { color: #000000; caret-color: #000000; font-weight: 900; }\n"
+                                      "editablelabel.editing text { color: #000000; caret-color: #000000; font-weight: 600; }\n"
                                       "editablelabel.editing text selection { background: #3584e4; color: #ffffff; }\n"
                                       "frame { border: 1px solid rgba(128, 128, 128, 0.4); border-radius: 6px; }\n"
+                                      ".header-title { font-weight: 800; padding: 2px 2px; }\n"
                                       ".needs-save { background: #b3ffc6; color: black; font-weight: bold; transition: background 0.3s ease; }\n"
                                       ".active-preset { background: #b3ffc6; color: black; font-weight: bold; border-color: #265740; }\n"
                                       "spinbutton.compact-spin { min-width: 40px; }\n"
                                       "spinbutton.compact-spin text { min-width: 25px; padding-left: 2px; padding-right: 2px; }\n");
     gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(css_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     ui_state.config = load_qjams_config(ui_state.config_path);
+
+    // UNIFIED CANVAS LIMIT
+    ui_state.default_canvas_limit_min = ui_state.config.default_canvas_limit_min;
 
     bool expected_is_offline = false;
     char expected_audio[128] = "";
@@ -734,44 +1138,98 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     jack_status_t status;
     client = jack_client_open("QJams_Engine", JackNullOption, &status);
 
-    printf("\n=== QJAMS HARDWARE DISCOVERY TEST ===\n");
+    log_and_notify(0, "\n=== QJAMS HARDWARE DISCOVERY TEST ===\n");
+
+    const char *session_type = getenv("XDG_SESSION_TYPE");
+    log_and_notify(0, "[SYSTEM] Display Server: %s\n", session_type ? session_type : "Unknown");
+    if (client) {
+        log_and_notify(0, "[JACK DSP] Daemon Version: %s\n", jack_get_version_string());
+        log_and_notify(0, "[JACK DSP] Buffer Size: %d frames\n", jack_get_buffer_size(client));
+    }
+
     VideoDevice v_devices[MAX_CAMERAS];
     int v_count = scan_video_devices(v_devices, MAX_CAMERAS);
-    printf("[Video] Found %d capture devices:\n", v_count);
-    for (int i = 0; i < v_count; i++) printf("  %d: %s (%s)\n", i+1, v_devices[i].device_name, v_devices[i].device_path);
+    log_and_notify(0, "[Video] Found %d capture devices:\n", v_count);
+    for (int i = 0; i < v_count; i++) log_and_notify(0, "  %d: %s (%s)\n", i+1, v_devices[i].device_name, v_devices[i].device_path);
 
     if (client) {
         AudioDevice a_devices[MAX_AUDIO_DEVICES];
         int a_count = scan_audio_devices(client, a_devices, MAX_AUDIO_DEVICES);
-        printf("\n[Audio] Found %d physical capture devices:\n", a_count);
-        for (int i = 0; i < a_count; i++) printf("  %d: %s [%d channels]\n", i+1, a_devices[i].display_name, a_devices[i].channel_count);
+        log_and_notify(0, "\n[Audio] Found %d physical capture devices:\n", a_count);
+        for (int i = 0; i < a_count; i++) log_and_notify(0, "  %d: %s [%d channels]\n", i+1, a_devices[i].display_name, a_devices[i].channel_count);
+
+        char usb_hardware[32][128] = {0};
+        int usb_count = get_physical_usb_hardware(usb_hardware, 32);
+        bool config_healed = false;
+
+        for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
+            char *stale_name = ui_state.config.audio_profiles[p].device_name;
+            bool exact_match = false;
+
+            for (int i = 0; i < a_count; i++) {
+                if (strcmp(stale_name, a_devices[i].display_name) == 0) {
+                    exact_match = true;
+                    break;
+                }
+            }
+            if (exact_match) continue;
+
+            for (int k = 0; k < usb_count; k++) {
+                if ((strstr(stale_name, "Cortex") && strstr(usb_hardware[k], "Cortex")) ||
+                    (strstr(stale_name, "SA9226") && strstr(usb_hardware[k], "SA9226")) ||
+                    (strstr(stale_name, "Logitech") && strstr(usb_hardware[k], "Logitech"))) {
+
+                    for (int i = 0; i < a_count; i++) {
+                        if ((strstr(a_devices[i].display_name, "Cortex") && strstr(usb_hardware[k], "Cortex")) ||
+                            (strstr(a_devices[i].display_name, "SA9226") && strstr(usb_hardware[k], "SA9226")) ||
+                            (strstr(a_devices[i].display_name, "Logitech") && strstr(usb_hardware[k], "Logitech"))) {
+
+                            log_and_notify(0, "[HW-HEAL] USB topology changed. Re-mapping stale profile '%s' to active port '%s'\n", stale_name, a_devices[i].display_name);
+
+                        if (strcmp(ui_state.config.audio_device, stale_name) == 0) {
+                            strncpy(ui_state.config.audio_device, a_devices[i].display_name, 127);
+                            ui_state.config.audio_device[127] = '\0';
+                        }
+
+                        strncpy(ui_state.config.audio_profiles[p].device_name, a_devices[i].display_name, 127);
+                        ui_state.config.audio_profiles[p].device_name[127] = '\0';
+                        config_healed = true;
+                        break;
+                            }
+                    }
+                    }
+            }
+        }
+
+        if (config_healed) {
+            save_qjams_config(ui_state.config_path, &ui_state.config);
+        }
 
         char target_audio[128] = "";
 
-        // 1. Enforce Settings Order: Find the designated Primary device
         for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
             if (ui_state.config.audio_profiles[p].is_primary) {
                 strncpy(expected_audio, ui_state.config.audio_profiles[p].device_name, 127);
+                expected_audio[127] = '\0';
                 break;
             }
         }
 
-        // If no Primary is configured, the "expected" device is whatever the cycler was last left on
         if (strlen(expected_audio) == 0) {
             strncpy(expected_audio, ui_state.config.audio_device, 127);
+            expected_audio[127] = '\0';
         }
 
-        // 2. Check if the expected device is online
         if (strlen(expected_audio) > 0) {
             for (int i = 0; i < a_count; i++) {
                 if (strcmp(expected_audio, a_devices[i].display_name) == 0) {
                     strncpy(target_audio, expected_audio, 127);
+                    target_audio[127] = '\0';
                     break;
                 }
             }
         }
 
-        // 3. If offline, hunt for the designated Fallback
         if (strlen(target_audio) == 0 && a_count > 0 && strlen(expected_audio) > 0) {
             expected_is_offline = true;
             for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
@@ -779,15 +1237,21 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                     for (int i = 0; i < a_count; i++) {
                         if (strcmp(ui_state.config.audio_profiles[p].device_name, a_devices[i].display_name) == 0) {
                             strncpy(target_audio, a_devices[i].display_name, 127);
+                            target_audio[127] = '\0';
                             break;
                         }
                     }
                     break;
                 }
             }
+
+            if (strlen(target_audio) == 0) {
+                strncpy(target_audio, a_devices[0].display_name, 127);
+                target_audio[127] = '\0';
+                log_and_notify(0, "-> Pre-Boot Routing: Expected devices missing. Ultimate fallback to %s\n", target_audio);
+            }
         }
 
-        // 4. Overwrite the config memory BEFORE the engine initializes to guarantee successful connection
         if (strlen(target_audio) > 0) {
             strncpy(ui_state.config.audio_device, target_audio, 127);
             ui_state.config.audio_device[127] = '\0';
@@ -797,16 +1261,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                     break;
                 }
             }
-            printf("-> Pre-Boot Routing: Target explicitly forced to %s\n", target_audio);
+            log_and_notify(0, "-> Pre-Boot Routing: Target explicitly forced to %s\n", target_audio);
         }
     }
-    printf("======================================\n\n");
+    log_and_notify(0, "======================================\n\n");
 
     init_preview_queue(&preview_queue, 32);
 
-    // 1. Load the 7 isolated UI Builders natively from the compiled GResource
     GtkBuilder *b_main  = gtk_builder_new_from_resource("/com/rob/qjams/ui/main_window.ui");
-    GtkBuilder *b_stack = gtk_builder_new_from_resource("/com/rob/qjams/ui/mode_stack.ui");
     GtkBuilder *b_multi = gtk_builder_new_from_resource("/com/rob/qjams/ui/multitrack.ui");
     GtkBuilder *b_play  = gtk_builder_new_from_resource("/com/rob/qjams/ui/playlist.ui");
     GtkBuilder *b_cmd   = gtk_builder_new_from_resource("/com/rob/qjams/ui/command_post.ui");
@@ -823,53 +1285,43 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(key_ctrl, "key-pressed", G_CALLBACK(on_window_key_pressed), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), key_ctrl);
 
-    // 2. Extract host containers from the main skeleton
-    GtkBox *host_stack = GTK_BOX(gtk_builder_get_object(b_main, "mode_stack_host"));
+    GtkBox *host_multi = GTK_BOX(gtk_builder_get_object(b_main, "multitrack_host"));
     GtkBox *host_play  = GTK_BOX(gtk_builder_get_object(b_main, "playlist_host"));
     GtkBox *host_cmd   = GTK_BOX(gtk_builder_get_object(b_main, "command_post_host"));
     GtkBox *host_dash  = GTK_BOX(gtk_builder_get_object(b_main, "dashboard_host"));
     GtkBox *host_wave  = GTK_BOX(gtk_builder_get_object(b_main, "waveforms_host"));
 
-    // 3. Extract module roots
-    GtkStack  *mode_stack_obj = GTK_STACK(gtk_builder_get_object(b_stack, "mode_stack"));
     GtkWidget *multi_page     = GTK_WIDGET(gtk_builder_get_object(b_multi, "multitrack_page_root"));
     GtkWidget *play_root      = GTK_WIDGET(gtk_builder_get_object(b_play, "playlist_root"));
     GtkWidget *cmd_root       = GTK_WIDGET(gtk_builder_get_object(b_cmd, "command_post_root"));
     GtkWidget *dash_root      = GTK_WIDGET(gtk_builder_get_object(b_dash, "dashboard_root"));
     GtkWidget *wave_root      = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveforms_root"));
 
-    // 4. Assemble the UI mechanically
-    gtk_box_append(host_stack, GTK_WIDGET(mode_stack_obj));
-    gtk_stack_add_named(mode_stack_obj, multi_page, "multitrack_page");
-
+    gtk_box_append(host_multi, multi_page);
     gtk_box_append(host_play, play_root);
     gtk_box_append(host_cmd, cmd_root);
     gtk_box_append(host_dash, dash_root);
     gtk_box_append(host_wave, wave_root);
 
-    // Map legacy UI globals to the new layout blocks
     left_column_box = GTK_WIDGET(gtk_builder_get_object(b_main, "left_column_box"));
     command_post_box = cmd_root;
     right_vbox = play_root;
 
-    video_preview = GTK_WIDGET(gtk_builder_get_object(b_stack, "video_preview"));
+    video_preview_frame = GTK_WIDGET(gtk_builder_get_object(b_dash, "video_preview_frame"));
+    video_preview = GTK_WIDGET(gtk_builder_get_object(b_dash, "video_preview"));
     gtk_widget_add_tick_callback(video_preview, update_video_preview, NULL, NULL);
 
-    // Provide specific builders to subsystem initializers
     ui_dashboard_init(b_dash, b_wave);
-    ui_command_post_init(b_cmd, b_stack, window);
-    ui_multitrack_init(b_multi, b_stack);
+    ui_command_post_init(b_cmd, window);
+    ui_multitrack_init(b_multi);
 
-    // Map dynamic playlist components into the XML playlist root
     GtkWidget *playlist_widget = create_playlist_widget();
     gtk_box_append(GTK_BOX(play_root), playlist_widget);
 
-    // Map multitrack logic to the XML multitrack scroll window
     GtkWidget *multitrack_scroll = GTK_WIDGET(gtk_builder_get_object(b_multi, "multitrack_tracks_scroll"));
     GtkWidget *multitrack_list = create_multitrack_tracks_widget();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(multitrack_scroll), multitrack_list);
 
-    // Setup waveform drawing handlers through the extracted b_wave pointers
     waveform_area_bt = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveform_area_bt"));
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(waveform_area_bt), on_draw_bt_waveform, NULL, NULL);
     gtk_widget_add_tick_callback(waveform_area_bt, (GtkTickCallback)on_waveform_tick, NULL, NULL);
@@ -880,11 +1332,18 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(drag_gesture_bt, "drag-end", G_CALLBACK(on_drag_end), NULL);
     gtk_widget_add_controller(waveform_area_bt, GTK_EVENT_CONTROLLER(drag_gesture_bt));
 
-    // Anchor Selection Click Gesture
     GtkGesture *click_gesture_bt = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture_bt), GDK_BUTTON_PRIMARY);
     g_signal_connect(click_gesture_bt, "pressed", G_CALLBACK(on_waveform_click_pressed), NULL);
     gtk_widget_add_controller(waveform_area_bt, GTK_EVENT_CONTROLLER(click_gesture_bt));
+
+    GtkGesture *right_click_bt = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(right_click_bt), GDK_BUTTON_SECONDARY);
+    g_signal_connect(right_click_bt, "pressed", G_CALLBACK(on_waveform_right_click), NULL);
+    gtk_widget_add_controller(waveform_area_bt, GTK_EVENT_CONTROLLER(right_click_bt));
+
+    gtk_widget_set_has_tooltip(waveform_area_bt, TRUE);
+    g_signal_connect(waveform_area_bt, "query-tooltip", G_CALLBACK(on_waveform_query_tooltip), NULL);
 
     GType drop_types[] = { GDK_TYPE_FILE_LIST, QJ_TYPE_TRACK };
     GtkDropTarget *drop_target = gtk_drop_target_new(G_TYPE_INVALID, GDK_ACTION_COPY | GDK_ACTION_MOVE);
@@ -907,14 +1366,20 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(click_gesture_in, "pressed", G_CALLBACK(on_waveform_click_pressed), NULL);
     gtk_widget_add_controller(waveform_area_input, GTK_EVENT_CONTROLLER(click_gesture_in));
 
+    GtkGesture *right_click_in = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(right_click_in), GDK_BUTTON_SECONDARY);
+    g_signal_connect(right_click_in, "pressed", G_CALLBACK(on_waveform_right_click), NULL);
+    gtk_widget_add_controller(waveform_area_input, GTK_EVENT_CONTROLLER(right_click_in));
+
+    gtk_widget_set_has_tooltip(waveform_area_input, TRUE);
+    g_signal_connect(waveform_area_input, "query-tooltip", G_CALLBACK(on_waveform_query_tooltip), NULL);
+
     waveform_scrollbar = GTK_WIDGET(gtk_builder_get_object(b_wave, "waveform_scrollbar"));
     waveform_adj = gtk_adjustment_new(0.0, 0.0, 1.0, 0.01, 0.1, 1.0);
     gtk_scrollbar_set_adjustment(GTK_SCROLLBAR(waveform_scrollbar), waveform_adj);
     g_signal_connect(waveform_adj, "value-changed", G_CALLBACK(on_scrollbar_changed), NULL);
 
-    // Unref modular builders
     g_object_unref(b_main);
-    g_object_unref(b_stack);
     g_object_unref(b_multi);
     g_object_unref(b_play);
     g_object_unref(b_cmd);
@@ -925,56 +1390,100 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     int audio_status = 0;
     if (client) {
-        audio_status = init_audio_engine(1048576, ui_state.config.input_gain_multiplier, client, ui_state.config.audio_device, ui_state.config.playback_target);
+        audio_status = init_audio_engine(16384, ui_state.config.input_gain_multiplier, client, ui_state.config.audio_device, ui_state.config.playback_target);
         set_bt_gain(ui_state.config.bt_gain_multiplier);
     }
+
+    extern int get_jack_event_fd(void);
+    extern gboolean on_jack_pipe_event(gint fd, GIOCondition condition, gpointer user_data);
+    g_unix_fd_add(get_jack_event_fd(), G_IO_IN, on_jack_pipe_event, NULL);
 
     init_video_queue(&video_queue, 64);
     int video_status = init_and_start_video_engine(ui_state.config.video_device, &video_queue);
 
-    adjust_blank_canvas_for_mode(ui_state.config.multitrack_mode_active != 0);
+    if (v_count == 0) {
+        if (video_preview_frame) gtk_widget_set_visible(video_preview_frame, FALSE);
+        extern GtkWidget *btn_record_video;
+        if (btn_record_video) gtk_widget_set_sensitive(btn_record_video, FALSE);
+        extern _Atomic bool video_is_armed;
+        atomic_store_explicit(&video_is_armed, false, memory_order_release);
+    }
+
+    adjust_blank_canvas();
 
     if (!client) {
-        gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>FATAL ERROR: JACK Audio Server is not running.</b></span>");
+        log_and_notify(1, "<span foreground='#ff4444'><b>FATAL ERROR: JACK Audio Server is not running.</b></span>");
         gtk_widget_set_sensitive(btn_play, FALSE);
         gtk_widget_set_sensitive(btn_record, FALSE);
     } else if (audio_status == 2 || video_status != 0 || expected_is_offline) {
         if (audio_status == 2 || video_status != 0) {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Running with missing hardware");
+            log_and_notify(1, "Status: Running with missing hardware");
         } else {
-            gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Ready");
+            log_and_notify(1, "Status: Ready");
         }
     } else {
-        gtk_label_set_text(GTK_LABEL(lbl_status), "Status: Ready");
+        log_and_notify(1, "Status: Ready");
     }
 
-    // Trigger CLI injected files
     if (strlen(ui_state.selected_track_path) > 0) {
         if (g_str_has_suffix(ui_state.selected_track_path, ".qjams")) {
             extern void command_post_load_session(const char *path);
             command_post_load_session(ui_state.selected_track_path);
         } else {
-            trigger_track_load();
+            int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+            multitrack_import_file_async(ui_state.selected_track_path, rec_track);
         }
     }
 
-    // Scan for recovering crashed files after the UI is fully drawn
     g_idle_add(check_for_crash_recovery, window);
+    g_timeout_add(300000, idle_autosave_tick, NULL); //300000 = 5 minutes autosave interval
+}
 
-    // Start the 5-minute (300000 milliseconds) silent autosave loop
-    g_timeout_add(300000, idle_autosave_tick, NULL);
+static gboolean on_posix_signal(gpointer user_data) {
+    GtkApplication *app = GTK_APPLICATION(user_data);
+    log_and_notify(0, "\n[SYSTEM] Intercepted POSIX kill signal. Executing clean teardown...\n");
+
+    extern bool is_session_dirty(void);
+    if (!is_session_dirty()) {
+        purge_autosave_file();
+    }
+
+    g_application_quit(G_APPLICATION(app));
+    return G_SOURCE_REMOVE;
 }
 
 int main(int argc, char **argv) {
-    // Use standard writable XDG paths (~/.config/qjams) ---
     const char *config_dir = g_get_user_config_dir();
     char qjams_dir[1024];
     snprintf(qjams_dir, sizeof(qjams_dir), "%s/qjams", config_dir);
-
-    // Explicitly create the configuration directory
     g_mkdir_with_parents(qjams_dir, 0755);
 
-    // Explicitly create the default user recordings directory
+    snprintf(ui_state.config_path, sizeof(ui_state.config_path), "%s/qjams.config", qjams_dir);
+    snprintf(ui_state.playlist_path, sizeof(ui_state.playlist_path), "%s/qjams.m3u", qjams_dir);
+
+    // Bootstrap config early to read logging preferences before GTK/JACK boot
+    QJamsConfig boot_config = load_qjams_config(ui_state.config_path);
+
+    // Boot-Time Janitor: Sweep for orphaned .stash files using standardized GDir
+    if (strlen(boot_config.recordings_dir) > 0) {
+        GDir *dir = g_dir_open(boot_config.recordings_dir, 0, NULL);
+        if (dir) {
+            const char *filename;
+            while ((filename = g_dir_read_name(dir)) != NULL) {
+                if (g_str_has_suffix(filename, ".stash")) {
+                    char stash_path[1024];
+                    snprintf(stash_path, sizeof(stash_path), "%s/%s", boot_config.recordings_dir, filename);
+                    remove(stash_path);
+                }
+            }
+            g_dir_close(dir);
+        }
+    }
+
+    remove("/tmp/qjams_session_video.mkv");
+
+    init_qjams_logger(qjams_dir, boot_config.enable_logging);
+
     const char *music_dir = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
     if (!music_dir) music_dir = g_get_home_dir();
     char default_rec_dir[1024];
@@ -985,31 +1494,33 @@ int main(int argc, char **argv) {
     snprintf(ui_state.playlist_path, sizeof(ui_state.playlist_path), "%s/qjams.m3u", qjams_dir);
 
     GtkApplication *app = gtk_application_new("com.rob.qjams", G_APPLICATION_HANDLES_OPEN);
+
+    g_unix_signal_add(SIGINT, on_posix_signal, app);
+    g_unix_signal_add(SIGTERM, on_posix_signal, app);
+
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     g_signal_connect(app, "open", G_CALLBACK(on_open), NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
 
-    // --- STRICT SHUTDOWN SEQUENCE ---
-    stop_video_engine();     // Explicitly release the V4L2 camera lock
-    shutdown_audio_engine(); // Free the JACK audio buffers
+    stop_video_engine();
+    shutdown_audio_engine();
 
-    // Free the UI preview queue memory leak
     if (preview_queue.buffer) {
         free(preview_queue.buffer);
         preview_queue.buffer = NULL;
     }
 
-    // Wipe the final raw MKV file from the /tmp partition
-    extern char current_raw_path[1024];
+    ui_dashboard_shutdown();
+
     if (strlen(current_raw_path) > 0) {
         remove(current_raw_path);
     }
 
-    // Wipe the hidden audio autosave file on a clean exit
     char autosave_path[1024];
     snprintf(autosave_path, sizeof(autosave_path), "%s/.qjams_autosave.qjams", ui_state.config.recordings_dir);
     remove(autosave_path);
 
+    close_qjams_logger();
     return status;
 }

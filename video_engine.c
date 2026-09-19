@@ -12,13 +12,11 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include "encoder.h"
-
+#include "config.h"
 #include "video_engine.h"
 #include "audio_engine.h"
 #include "scanner.h"
 #include "ui_globals.h"
-
-extern _Atomic bool is_mkv_mode;
 
 #define REQ_BUFFERS 4
 
@@ -34,25 +32,22 @@ static volatile int keep_running = 0;
 static SPSC_Video_Queue* target_queue = NULL;
 
 extern SPSC_Preview_Queue preview_queue;
+extern _Atomic bool mkv_video_keep_running;
 static AVCodecContext *preview_dec_ctx = NULL;
 static struct SwsContext *preview_sws_ctx = NULL;
 static struct SwsContext *encode_sws_ctx = NULL;
+
+static int cached_preview_w = 0, cached_preview_h = 0, cached_preview_fmt = -1;
+static int cached_encode_w = 0, cached_encode_h = 0, cached_encode_fmt = -1;
 
 static uint8_t* nv12_pool[64] = {0};
 static uint8_t* rgba_pool[32] = {0};
 static uint8_t* yuyv_cpu_cache = NULL;
 
-// Active Hardware Format State
 static uint32_t capture_v4l2_fmt = 0;
 int capture_width = 1280;
 int capture_height = 720;
 
-/**
- * @brief Background thread loop for memory-mapped V4L2 capture and scaling.
- * Supports dynamic stream handling for both MJPEG (decoded) and YUYV (raw mapped).
- * @param arg Unused thread argument.
- * @return NULL upon completion.
- */
 static void* video_capture_loop(void* arg) {
     (void)arg;
     struct v4l2_buffer buf;
@@ -63,7 +58,6 @@ static void* video_capture_loop(void* arg) {
     int64_t pause_start_time_us = 0;
     bool was_paused = false;
 
-    // OPTIMIZATION: Lift FFmpeg allocations outside the 30FPS loop
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
 
@@ -73,10 +67,9 @@ static void* video_capture_loop(void* arg) {
         tv.tv_sec = 1;
         tv.tv_usec = 0;
 
-        // select() allows us to cleanly exit the thread instead of hard-blocking on DQBUF
         int r = select(fd + 1, &fds, NULL, NULL, &tv);
         if (r == -1) continue;
-        if (r == 0) continue; // Timeout
+        if (r == 0) continue;
 
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -84,18 +77,14 @@ static void* video_capture_loop(void* arg) {
 
         if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) continue;
 
-        // 1. Extract exact hardware timestamp from the V4L2 buffer
         int64_t pts = (int64_t)buf.timestamp.tv_sec * 1000000 + buf.timestamp.tv_usec;
 
-        // 2. Zero-Copy: Feed V4L2 memory directly to the payload
         pkt->data = buffers[buf.index].start;
         pkt->size = buf.bytesused;
 
-        // GUARD CLAUSES: Flatten the logic based on dynamically discovered format
         if (capture_v4l2_fmt == V4L2_PIX_FMT_MJPEG) {
             if (avcodec_send_packet(preview_dec_ctx, pkt) != 0) goto frame_cleanup;
             if (avcodec_receive_frame(preview_dec_ctx, frame) != 0) goto frame_cleanup;
-            // Force hardware format override to silence SWS scaler deprecation warnings globally
             switch (frame->format) {
                 case AV_PIX_FMT_YUVJ420P: frame->format = AV_PIX_FMT_YUV420P; break;
                 case AV_PIX_FMT_YUVJ422P: frame->format = AV_PIX_FMT_YUV422P; break;
@@ -103,43 +92,69 @@ static void* video_capture_loop(void* arg) {
                 default: break;
             }
         } else if (capture_v4l2_fmt == V4L2_PIX_FMT_YUYV) {
-            // Fast block copy from V4L2 mmap to CPU RAM to avoid PIO thrashing in sws_scale
             if (yuyv_cpu_cache) memcpy(yuyv_cpu_cache, pkt->data, pkt->size);
             av_image_fill_arrays(frame->data, frame->linesize, yuyv_cpu_cache ? yuyv_cpu_cache : pkt->data, AV_PIX_FMT_YUYV422, capture_width, capture_height, 1);
             frame->width = capture_width;
             frame->height = capture_height;
             frame->format = AV_PIX_FMT_YUYV422;
         } else {
-            goto frame_cleanup; // Unknown format bailout
+            goto frame_cleanup;
         }
 
-        if (!atomic_load_explicit(&is_mkv_mode, memory_order_relaxed)) {
+        // --- CONTINUOUS PREVIEW MAPPING ---
+        bool is_playing = atomic_load_explicit(&engine_is_playing, memory_order_acquire);
+        bool is_recording = atomic_load_explicit(&engine_is_recording, memory_order_acquire);
+
+        // Listen to the mathematical boundary flag, not the thread-alive flag
+        bool mkv_is_rendering = atomic_load_explicit(&is_mkv_mode, memory_order_acquire);
+
+        // Pause live camera preview ONLY if an MKV video is actively monopolizing the UI bounds
+        if (!(is_playing && !is_recording && mkv_is_rendering)) {
             size_t p_w_idx = atomic_load_explicit(&preview_queue.write_index, memory_order_relaxed);
             size_t p_r_idx = atomic_load_explicit(&preview_queue.read_index, memory_order_acquire);
             if (p_w_idx - p_r_idx < preview_queue.capacity) {
 
-                // Dynamically calculate proper height preserving aspect ratio for a locked 640px width
-                int target_height = (int)(640.0 * ((double)frame->height / (double)frame->width));
+                // Hard-lock the UI preview dimensions to prevent GTK layout expansion
+                int target_w = 320;
+                int target_h = (frame->width > 0) ? (int)((double)target_w * ((double)frame->height / (double)frame->width)) : 180;
+
+                if (preview_sws_ctx && (frame->width != cached_preview_w || frame->height != cached_preview_h || frame->format != cached_preview_fmt)) {
+                    sws_freeContext(preview_sws_ctx);
+                    preview_sws_ctx = NULL;
+                }
 
                 if (!preview_sws_ctx) {
                     preview_sws_ctx = sws_getContext(frame->width, frame->height, frame->format,
-                                                     640, target_height, AV_PIX_FMT_RGBA,
+                                                     target_w, target_h, AV_PIX_FMT_RGBA,
                                                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                    cached_preview_w = frame->width;
+                    cached_preview_h = frame->height;
+                    cached_preview_fmt = frame->format;
                 }
 
                 uint8_t *rgba_buf = rgba_pool[p_w_idx & (preview_queue.capacity - 1)];
                 uint8_t *dest_data[4] = { rgba_buf, NULL, NULL, NULL };
-                int dest_linesize[4] = { 640 * 4, 0, 0, 0 };
+                int dest_linesize[4] = { target_w * 4, 0, 0, 0 };
+
                 sws_scale(preview_sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
                           0, frame->height, dest_data, dest_linesize);
-                push_preview_frame(&preview_queue, rgba_buf, 640, target_height);
+
+                push_preview_frame(&preview_queue, rgba_buf, target_w, target_h);
             }
         }
 
-        // --- ROUTE DECODED YUV TO ENCODER IF RECORDING ---
+        // --- ROUTE DECODED YUV TO ENCODER IF RECORDING AND ARMED ---
         if (!atomic_load_explicit(&engine_is_armed, memory_order_acquire)) {
             total_pause_offset_us = 0;
             was_paused = false;
+            goto frame_cleanup;
+        }
+
+        if (!atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+            goto frame_cleanup;
+        }
+
+        if (atomic_load_explicit(&engine_is_paused, memory_order_acquire)) {
             goto frame_cleanup;
         }
 
@@ -162,35 +177,39 @@ static void* video_capture_loop(void* arg) {
         size_t e_r_idx = atomic_load_explicit(&target_queue->read_index, memory_order_acquire);
         if (e_w_idx - e_r_idx >= target_queue->capacity) goto frame_cleanup;
 
-        // 3. Guarantee output is NV12 for direct VAAPI hardware mapping
         int nv12_size = av_image_get_buffer_size(AV_PIX_FMT_NV12, capture_width, capture_height, 1);
         uint8_t *nv12_payload = nv12_pool[e_w_idx & (target_queue->capacity - 1)];
 
-        // Initialize the dedicated encoder scaler safely
+        if (encode_sws_ctx && (frame->width != cached_encode_w || frame->height != cached_encode_h || frame->format != cached_encode_fmt)) {
+            sws_freeContext(encode_sws_ctx);
+            encode_sws_ctx = NULL;
+        }
+
         if (!encode_sws_ctx) {
             encode_sws_ctx = sws_getContext(frame->width, frame->height, frame->format,
                                             capture_width, capture_height, AV_PIX_FMT_NV12,
                                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            cached_encode_w = frame->width;
+            cached_encode_h = frame->height;
+            cached_encode_fmt = frame->format;
         }
 
         uint8_t *dst_data[4];
         int dst_linesize[4];
         av_image_fill_arrays(dst_data, dst_linesize, nv12_payload, AV_PIX_FMT_NV12, capture_width, capture_height, 1);
 
-        // Safely map and convert the camera's colorspace directly into the ringbuffer payload
         sws_scale(encode_sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
                   0, frame->height, dst_data, dst_linesize);
 
         push_video_frame(target_queue, nv12_payload, (size_t)nv12_size, adjusted_pts);
         wake_encoder();
-        bool expected = false;
-        atomic_compare_exchange_strong(&engine_is_recording, &expected, true);
+
+        // (The atomic_compare_exchange_strong that was here has been moved up)
 
         frame_cleanup:
-        av_frame_unref(frame); // Unref clears pointers, safely releasing manual YUYV memory maps
+        av_frame_unref(frame);
         av_packet_unref(pkt);
 
-        // 4. Immediately return the buffer to the kernel driver
         ioctl(fd, VIDIOC_QBUF, &buf);
     }
 
@@ -199,18 +218,11 @@ static void* video_capture_loop(void* arg) {
     return NULL;
 }
 
-/**
- * @brief Initializes the V4L2 device by querying the hardware for the highest supported format, then starts the video capture thread.
- * @param device_path The hardware path of the video device (e.g., /dev/video0).
- * @param queue Pointer to the lock-free queue for routing frames to the encoder.
- * @return 0 on success, -1 on failure.
- */
 int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue) {
     target_queue = queue;
 
-    // Deep probe the camera for its highest supported format (MJPEG or YUYV)
     if (!get_best_video_format(device_path, &capture_v4l2_fmt, &capture_width, &capture_height)) {
-        printf("Warning: Probing failed, falling back to 1280x720 MJPEG.\n");
+        log_and_notify(0, "Warning: Probing failed, falling back to 1280x720 MJPEG.\n");
         capture_v4l2_fmt = V4L2_PIX_FMT_MJPEG;
         capture_width = 1280;
         capture_height = 720;
@@ -225,20 +237,37 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
     } else if (capture_v4l2_fmt == V4L2_PIX_FMT_YUYV) {
         if (yuyv_cpu_cache) free(yuyv_cpu_cache);
         yuyv_cpu_cache = malloc(capture_width * capture_height * 2);
+        if (!yuyv_cpu_cache) return -1;
     }
 
-    // Ensure allocations are strictly re-entrant for hardware hot-patch retries
+    int alloc_failed = 0;
     for (int i = 0; i < 64; i++) {
         if (nv12_pool[i]) free(nv12_pool[i]);
         nv12_pool[i] = malloc(capture_width * capture_height * 3 / 2);
+        if (!nv12_pool[i]) {
+            alloc_failed = 1;
+            break;
+        }
     }
-    for (int i = 0; i < 32; i++) {
-        // We defer exact RGBA sizing to Phase 2, but allocate enough for a 1080p frame max to be safe
-        if (rgba_pool[i]) free(rgba_pool[i]);
-        rgba_pool[i] = malloc(1920 * 1080 * 4);
+
+    if (!alloc_failed) {
+        for (int i = 0; i < 32; i++) {
+            if (rgba_pool[i]) free(rgba_pool[i]);
+            rgba_pool[i] = malloc(1920 * 1080 * 4);
+            if (!rgba_pool[i]) {
+                alloc_failed = 1;
+                break;
+            }
+        }
     }
-    // Spin-wait to allow the kernel V4L2 driver to release the hardware lock
-    // after the terminal diagnostic scanner probes and closes it.
+
+    if (alloc_failed) {
+        for (int i = 0; i < 64; i++) { free(nv12_pool[i]); nv12_pool[i] = NULL; }
+        for (int i = 0; i < 32; i++) { free(rgba_pool[i]); rgba_pool[i] = NULL; }
+        if (yuyv_cpu_cache) { free(yuyv_cpu_cache); yuyv_cpu_cache = NULL; }
+        return -1;
+    }
+
     int retries = 5;
     while (retries > 0) {
         fd = open(device_path, O_RDWR | O_NONBLOCK, 0);
@@ -249,7 +278,7 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
 
     if (fd == -1) {
         perror("Cannot open V4L2 device");
-        return -1;
+        goto v4l2_init_fail;
     }
 
     struct v4l2_format fmt;
@@ -311,8 +340,8 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
         goto v4l2_init_fail;
     }
 
-    printf("Video Engine Live: V4L2 Thread capturing %s at %dx%d 30FPS.\n",
-           capture_v4l2_fmt == V4L2_PIX_FMT_MJPEG ? "MJPEG" : "YUYV", capture_width, capture_height);
+    log_and_notify(0, "Video Engine Live: V4L2 Thread capturing %s at %dx%d 30FPS.\n",
+                   capture_v4l2_fmt == V4L2_PIX_FMT_MJPEG ? "MJPEG" : "YUYV", capture_width, capture_height);
 
     keep_running = 1;
     pthread_create(&video_thread, NULL, video_capture_loop, NULL);
@@ -327,13 +356,12 @@ int init_and_start_video_engine(const char* device_path, SPSC_Video_Queue* queue
         close(fd);
         fd = -1;
     }
+    for (int i = 0; i < 64; i++) { free(nv12_pool[i]); nv12_pool[i] = NULL; }
+    for (int i = 0; i < 32; i++) { free(rgba_pool[i]); rgba_pool[i] = NULL; }
+    if (yuyv_cpu_cache) { free(yuyv_cpu_cache); yuyv_cpu_cache = NULL; }
     return -1;
 }
 
-/**
- * @brief Shuts down the video capture thread and releases V4L2 hardware resources.
- * @return void
- */
 void stop_video_engine() {
     keep_running = 0;
     if (fd != -1) {
@@ -346,8 +374,6 @@ void stop_video_engine() {
         if (preview_sws_ctx) { sws_freeContext(preview_sws_ctx); preview_sws_ctx = NULL; }
         if (encode_sws_ctx) { sws_freeContext(encode_sws_ctx); encode_sws_ctx = NULL; }
 
-        // Drain the abandoned ringbuffer memory WITHOUT freeing the payload pointers,
-        // as they are strictly owned and freed by the rgba_pool below.
         PreviewPayload p_payload;
         while (pop_preview_frame(&preview_queue, &p_payload)) { }
 
@@ -368,6 +394,6 @@ void stop_video_engine() {
         for (int i = 0; i < 32; i++) { free(rgba_pool[i]); rgba_pool[i] = NULL; }
         if (yuyv_cpu_cache) { free(yuyv_cpu_cache); yuyv_cpu_cache = NULL; }
 
-        printf("Video Engine cleanly shutdown.\n");
+        log_and_notify(0, "Video Engine cleanly shutdown.\n");
     }
 }

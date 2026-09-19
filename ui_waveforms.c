@@ -33,6 +33,10 @@ static cairo_surface_t *surface_bt = NULL;
 static cairo_surface_t *surface_input_grid = NULL;
 
 extern _Atomic bool is_mkv_mode;
+extern _Atomic bool request_track_free;
+extern _Atomic bool ui_scanner_is_busy;
+
+static _Atomic bool bt_render_active = false;
 
 // Add forward declarations so the compiler knows these functions exist regardless of placement order
 static void draw_envelope_waveform(cairo_t *cr, int width, int height, const float *min_buf, const float *max_buf, float gain, double y_center);
@@ -119,14 +123,27 @@ static float amp_to_vu(float amp) {
  */
 static inline void scan_waveform_extents(const float *src_buf, size_t start_frame, size_t end_frame, float *min_l, float *max_l, float *min_r, float *max_r) {
     float lmin = *min_l, lmax = *max_l, rmin = *min_r, rmax = *max_r;
-    for (size_t f = start_frame; f < end_frame; f++) {
+    size_t range = end_frame - start_frame;
+
+    // HARD CAP: Never scan more than 64 samples per physical pixel column
+    size_t max_samples_per_pixel = 64;
+    size_t stride = 1;
+
+    if (range > max_samples_per_pixel) {
+        stride = range / max_samples_per_pixel;
+    }
+
+    // Step through the buffer using the calculated stride
+    for (size_t f = start_frame; f < end_frame; f += stride) {
         float vl = src_buf[f * 2];
         float vr = src_buf[f * 2 + 1];
+
         if (vl < lmin) lmin = vl;
         if (vl > lmax) lmax = vl;
         if (vr < rmin) rmin = vr;
         if (vr > rmax) rmax = vr;
     }
+
     *min_l = lmin; *max_l = lmax;
     *min_r = rmin; *max_r = rmax;
 }
@@ -134,314 +151,133 @@ static inline void scan_waveform_extents(const float *src_buf, size_t start_fram
 /**
  * @brief Draws the background timeline grid and timestamp labels for the waveform area.
  * Dynamically scales the tick intervals based on the visible viewport duration rather than the total track length,
- * ensuring continuous granularity at deep zoom levels.
+ * ensuring continuous granularity at deep zoom levels. Uses a DAW-standard time-aware threshold ladder for absolute time.
  * @param cr The Cairo rendering context.
  * @param width The width of the drawing area.
  * @param height The height of the drawing area.
  * @param total_frames The total length of the loaded track for calculating bounds.
  */
 void draw_waveform_grid(cairo_t *cr, int width, int height, size_t total_frames) {
-    cairo_set_source_rgb(cr, 0.15, 0.15, 0.18);
+    extern _Atomic int active_sample_rate;
+    int sr = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+    double sample_rate = (sr > 0) ? (double)sr : 48000.0;
+
+    cairo_set_source_rgba(cr, 0.14, 0.14, 0.16, 1.0);
     cairo_paint(cr);
 
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.4);
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 0, height / 2.0);
     cairo_line_to(cr, width, height / 2.0);
     cairo_stroke(cr);
 
-    if (total_frames == 0 || active_sample_rate <= 0) return;
+    double total_seconds = (total_frames > 0) ? ((double)total_frames / sample_rate) :
+    ((double)(ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5) * 60.0);
 
-    double total_seconds = (double)total_frames / active_sample_rate;
-    int bt_width = gtk_widget_get_width(waveform_area_bt);
-    double virtual_width = bt_width * zoom_multiplier;
-    double pixels_per_sec = virtual_width / total_seconds;
-    double scroll_x = gtk_adjustment_get_value(waveform_adj);
+    if (total_seconds <= 0.0) return;
 
-    double visible_seconds = width / pixels_per_sec;
+    extern double zoom_multiplier;
+    extern GtkAdjustment *waveform_adj;
+    double scroll_x = waveform_adj ? gtk_adjustment_get_value(waveform_adj) : 0.0;
 
-    // --- Algorithmic Grid Scaling ---
-    // Mathematically target ~8 text labels across whatever the current visible screen width is
-    double target_text_step = visible_seconds / 8.0;
+    double virtual_width = width * zoom_multiplier;
+    double visible_seconds = total_seconds / zoom_multiplier;
 
-    // Calculate dynamic base-10 magnitude to snap to clean numbers (1, 2, or 5)
-    double mag = pow(10.0, floor(log10(target_text_step)));
-    double rel = target_text_step / mag;
+    // PHYSICAL PIXEL TARGETING
+    // Target ~150 pixels between text labels to ensure consistent spacing regardless of window size
+    double target_pixels_between_labels = 150.0;
+    double target_text_step = visible_seconds * (target_pixels_between_labels / (double)width);
 
-    double text_step, tick_step;
-    if (rel < 2.0) text_step = 1.0 * mag;
-    else if (rel < 5.0) text_step = 2.0 * mag;
-    else text_step = 5.0 * mag;
+    // Calculate continuous 1-2-5 scale mathematically for infinite zoom depth
+    double exponent = floor(log10(target_text_step));
+    double fraction = target_text_step / pow(10.0, exponent);
 
-    // Safety bounds for extreme atomic-level zooming
-    if (text_step < 0.00001) text_step = 0.00001;
-    tick_step = text_step / 10.0;
+    double nice_fraction;
+    if (fraction < 1.5) nice_fraction = 1.0;
+    else if (fraction < 3.5) nice_fraction = 2.0;
+    else if (fraction < 7.5) nice_fraction = 5.0;
+    else nice_fraction = 10.0;
 
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10.0);
+    double text_step = nice_fraction * pow(10.0, exponent);
+
+    // Hard floor: Prevent grid intervals smaller than one audio sample
+    double min_step = 1.0 / sample_rate;
+    if (text_step < min_step) text_step = min_step;
+
+    double tick_step = text_step / 4.0; // 4 minor tick subdivisions per major label
+
+    double start_sec = (scroll_x / virtual_width) * total_seconds;
+    double end_sec = start_sec + visible_seconds;
+
+    double current_tick_sec = floor(start_sec / tick_step) * tick_step;
+    double current_text_sec = floor(start_sec / text_step) * text_step;
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.08);
     cairo_set_line_width(cr, 1.0);
+    cairo_new_path(cr);
 
-    double start_sec = scroll_x / pixels_per_sec;
-    double end_sec = (scroll_x + width) / pixels_per_sec;
+    while (current_tick_sec <= end_sec) {
+        double absolute_x = (current_tick_sec / total_seconds) * virtual_width;
+        double x = absolute_x - scroll_x;
 
-    // Align starting tick safely to the grid
-    double current_sec = floor(start_sec / tick_step) * tick_step;
-
-    // High multiplier for safe float modulo math (handles nanosecond bounds safely)
-    long long mult = 100000000LL;
-    long long txt_val = llround(text_step * mult);
-    long long mid_val = txt_val / 2;
-
-    while (current_sec <= end_sec && current_sec <= total_seconds) {
-        if (current_sec < 0.0) {
-            current_sec += tick_step;
-            continue;
+        if (x >= 0 && x <= width) {
+            cairo_move_to(cr, x, 0);
+            cairo_line_to(cr, x, height);
         }
+        current_tick_sec += tick_step;
+    }
+    cairo_stroke(cr);
 
-        double x = (current_sec * pixels_per_sec) - scroll_x;
-        if (x < -50 || x > width + 50) {
-            current_sec += tick_step;
-            continue;
-        }
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *desc = pango_font_description_from_string("Sans 9");
+    pango_layout_set_font_description(layout, desc);
+    pango_font_description_free(desc);
 
-        long long cur_val = llround(current_sec * mult);
-        bool is_text = (txt_val > 0) && (cur_val % txt_val == 0);
-        bool is_mid = (mid_val > 0) && (cur_val % mid_val == 0);
+    while (current_text_sec <= end_sec) {
+        double absolute_x = (current_text_sec / total_seconds) * virtual_width;
+        double x = absolute_x - scroll_x;
 
-        if (is_text) {
-            cairo_set_source_rgba(cr, 0.8, 0.8, 0.8, 1.0); // Major Tick
+        if (x >= 0 && x <= width) {
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.35);
             cairo_move_to(cr, x, 0);
             cairo_line_to(cr, x, height);
             cairo_stroke(cr);
 
             cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.8);
-            cairo_move_to(cr, x + 3, 12);
+            char time_str[64];
 
-            char time_str[32];
+            // Dynamic string formatting explicitly tied to zoom depth
             if (text_step >= 1.0) {
-                int mins = (int)current_sec / 60;
-                int secs = (int)current_sec % 60;
-                if (secs == 0) snprintf(time_str, sizeof(time_str), "%d:00", mins);
-                else snprintf(time_str, sizeof(time_str), "%d:%02d", mins, secs);
+                int mins = (int)current_text_sec / 60;
+                int secs = (int)current_text_sec % 60;
+                snprintf(time_str, sizeof(time_str), "%d:%02d", mins, secs);
             } else if (text_step >= 0.1) {
-                snprintf(time_str, sizeof(time_str), "%.1fs", current_sec);
+                snprintf(time_str, sizeof(time_str), "%.1fs", current_text_sec);
             } else if (text_step >= 0.01) {
-                snprintf(time_str, sizeof(time_str), "%.2fs", current_sec);
+                snprintf(time_str, sizeof(time_str), "%.2fs", current_text_sec);
             } else if (text_step >= 0.001) {
-                snprintf(time_str, sizeof(time_str), "%.3fs", current_sec);
-            } else if (text_step >= 0.0001) {
-                snprintf(time_str, sizeof(time_str), "%.4fs", current_sec);
+                snprintf(time_str, sizeof(time_str), "%.3fs", current_text_sec);
             } else {
-                snprintf(time_str, sizeof(time_str), "%.5fs", current_sec);
-            }
-            cairo_show_text(cr, time_str);
-        } else if (is_mid) {
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.20); // Medium Tick
-            cairo_move_to(cr, x, 0);
-            cairo_line_to(cr, x, height);
-            cairo_stroke(cr);
-        } else {
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.08); // Minor Tick
-            cairo_move_to(cr, x, 0);
-            cairo_line_to(cr, x, height);
-            cairo_stroke(cr);
-        }
-        current_sec += tick_step;
-    }
-}
-
-/**
- * @brief Cairo draw callback for the backing track waveform area.
- * @param area The drawing area widget.
- * @param cr The Cairo rendering context.
- * @param width The width of the drawing area.
- * @param height The height of the drawing area.
- * @param user_data Optional user data.
- * @return void
- */
-void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
-    (void)area; (void)user_data;
-
-    if (ui_state.is_loading_track || !pristine_bt_buf || pristine_frames == 0) {
-        draw_waveform_grid(cr, width, height, 0);
-        return;
-    }
-
-    int bt_width = gtk_widget_get_width(waveform_area_bt);
-    double virtual_width = bt_width * zoom_multiplier;
-    double scroll_x = gtk_adjustment_get_value(waveform_adj);
-
-    double frames_per_pixel = (double)pristine_frames / virtual_width;
-    if (frames_per_pixel == 0) frames_per_pixel = 1.0;
-
-    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-    int active_tracks = atomic_load_explicit(&active_track_count, memory_order_relaxed);
-    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
-
-    static double cached_bt_scroll_x = -1.0;
-    static double cached_bt_zoom = -1.0;
-    static float *cached_track_ptrs[MAX_TRACKS] = {NULL};
-    static bool cached_audible[MAX_TRACKS] = {false};
-
-    bool any_solo_active = false;
-    bool track_audible[MAX_TRACKS] = {false};
-
-    // Pass 1: Determine if any solo is engaged
-    for (int l = 0; l < MAX_TRACKS; l++) {
-        if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
-            any_solo_active = true;
-            break;
-        }
-    }
-
-    bool pointers_changed = false;
-    // Pass 2: Map audibility and check for state invalidation
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        // STRICT: A layer is only audible if it is unmuted/soloed AND explicitly contains recorded audio
-        track_audible[i] = (!any_solo_active || atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_relaxed)) &&
-        atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
-
-        if (master_tracks[i].active_buffer != cached_track_ptrs[i]) {
-            pointers_changed = true;
-            cached_track_ptrs[i] = master_tracks[i].active_buffer;
-        }
-        if (track_audible[i] != cached_audible[i]) {
-            pointers_changed = true;
-            cached_audible[i] = track_audible[i];
-        }
-    }
-
-    if (width != cached_bt_width || height != cached_bt_height || pristine_bt_buf != cached_bt_ptr ||
-        active_tracks != cached_active_tracks || scroll_x != cached_bt_scroll_x || zoom_multiplier != cached_bt_zoom || pointers_changed) {
-
-        if (surface_bt) {
-            cairo_surface_destroy(surface_bt);
-            surface_bt = NULL;
-        }
-
-        surface_bt = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
-    cairo_t *surface_cr = cairo_create(surface_bt);
-
-    draw_waveform_grid(surface_cr, width, height, backing_track_frames);
-
-    // Clamp the render bounds to strictly prevent out-of-bounds pointer sweeps
-    int max_render_track = active_tracks;
-    if (max_render_track > MAX_TRACKS) max_render_track = MAX_TRACKS;
-
-    for (int l = 0; l < max_render_track; l++) {
-        float *active_buf = master_tracks[l].active_buffer;
-        if (!active_buf || !track_audible[l]) continue;
-
-        if (frames_per_pixel >= 1.0) {
-            memset(bt_min_l, 0, sizeof(bt_min_l));
-            memset(bt_max_l, 0, sizeof(bt_max_l));
-            memset(bt_min_r, 0, sizeof(bt_min_r));
-            memset(bt_max_r, 0, sizeof(bt_max_r));
-
-            for (int x = 0; x < width && x < MAX_UI_WIDTH; x++) {
-                size_t start_frame = (size_t)((scroll_x + x) * frames_per_pixel);
-                size_t end_frame = (size_t)((scroll_x + x + 1) * frames_per_pixel);
-
-                if (end_frame <= start_frame) end_frame = start_frame + 1;
-                if (start_frame >= pristine_frames) continue;
-                if (end_frame > pristine_frames) end_frame = pristine_frames;
-
-                scan_waveform_extents(active_buf, start_frame, end_frame, &bt_min_l[x], &bt_max_l[x], &bt_min_r[x], &bt_max_r[x]);
+                snprintf(time_str, sizeof(time_str), "%.5fs", current_text_sec);
             }
 
-            float layer_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
-
-            // Restore OVER operator to prevent additive color clipping when tracks stack
-            cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
-            double alpha = 0.65; // Boost alpha slightly to retain vibrancy under standard overlap
-            set_track_color(surface_cr, l, alpha);
-
-            cairo_set_line_width(surface_cr, 1.0);
-            draw_envelope_waveform(surface_cr, width, height, bt_min_l, bt_max_l, layer_gain, height / 4.0);
-            draw_envelope_waveform(surface_cr, width, height, bt_min_r, bt_max_r, layer_gain, 3.0 * height / 4.0);
-        } else {
-            float layer_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
-            double alpha = 0.65;
-
-            // Restore OVER operator here as well for deep zoom views
-            cairo_set_operator(surface_cr, CAIRO_OPERATOR_OVER);
-            set_track_color(surface_cr, l, alpha);
-
-            cairo_set_line_width(surface_cr, 1.5);
-            draw_sample_waveform(surface_cr, width, height, active_buf, pristine_frames, scroll_x, frames_per_pixel, layer_gain, height / 4.0, 0);
-            draw_sample_waveform(surface_cr, width, height, active_buf, pristine_frames, scroll_x, frames_per_pixel, layer_gain, 3.0 * height / 4.0, 1);
+            pango_layout_set_text(layout, time_str, -1);
+            cairo_move_to(cr, x + 4, 4);
+            pango_cairo_show_layout(cr, layout);
         }
+        current_text_sec += text_step;
     }
 
-    cairo_destroy(surface_cr);
-    cached_bt_width = width;
-    cached_bt_height = height;
-    cached_bt_ptr = pristine_bt_buf;
-    cached_active_tracks = active_tracks;
-    cached_bt_scroll_x = scroll_x;
-    cached_bt_zoom = zoom_multiplier;
-        }
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.5);
+    pango_layout_set_text(layout, "L", -1);
+    cairo_move_to(cr, 5, 20);
+    pango_cairo_show_layout(cr, layout);
 
-        if (surface_bt) {
-            cairo_set_source_surface(cr, surface_bt, 0, 0);
-            cairo_paint(cr);
-        }
+    pango_layout_set_text(layout, "R", -1);
+    cairo_move_to(cr, 5, (height / 2.0) + 6);
+    pango_cairo_show_layout(cr, layout);
 
-        if (active_tracks > 1 && atomic_load_explicit(&engine_is_recording, memory_order_relaxed)) {
-            float *rec_buf = master_tracks[rec_track].active_buffer;
-
-            if (frames_per_pixel >= 1.0 && rec_buf) {
-                memset(sweep_min_l, 0, sizeof(sweep_min_l));
-                memset(sweep_max_l, 0, sizeof(sweep_max_l));
-                memset(sweep_min_r, 0, sizeof(sweep_min_r));
-                memset(sweep_max_r, 0, sizeof(sweep_max_r));
-
-                for (int x = 0; x < width && x < MAX_UI_WIDTH; x++) {
-                    size_t start_frame = (size_t)((scroll_x + x) * frames_per_pixel);
-                    size_t end_frame = (size_t)((scroll_x + x + 1) * frames_per_pixel);
-
-                    if (start_frame >= current_pos) break;
-                    if (end_frame > current_pos) end_frame = current_pos;
-
-                    scan_waveform_extents(rec_buf, start_frame, end_frame,
-                                          &sweep_min_l[x], &sweep_max_l[x], &sweep_min_r[x], &sweep_max_r[x]);
-                }
-
-                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
-                set_track_color(cr, rec_track, 0.5);
-                cairo_set_line_width(cr, 1.0);
-                draw_envelope_waveform(cr, width, height, sweep_min_l, sweep_max_l, 1.0f, height / 4.0);
-                draw_envelope_waveform(cr, width, height, sweep_min_r, sweep_max_r, 1.0f, 3.0 * height / 4.0);
-            } else if (rec_buf) {
-                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
-                set_track_color(cr, rec_track, 0.5);
-                cairo_set_line_width(cr, 1.5);
-                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
-                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
-            }
-        }
-
-        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
-            size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
-            size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
-
-            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
-            double start_px = (((double)l_start / (double)t_frames) * virtual_width) - scroll_x;
-            double end_px = (((double)l_end / (double)t_frames) * virtual_width) - scroll_x;
-
-            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
-            cairo_fill(cr);
-        } else if (is_dragging && drag_start_fraction >= 0.0) {
-            double start_px = (drag_start_fraction * virtual_width) - scroll_x;
-            double end_px = (current_drag_fraction * virtual_width) - scroll_x;
-            if (start_px > end_px) { double tmp = start_px; start_px = end_px; end_px = tmp; }
-            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
-            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
-            cairo_fill(cr);
-        }
-
-        draw_playhead(cr, width, height, current_pos, backing_track_frames);
+    g_object_unref(layout);
 }
 
 /**
@@ -577,7 +413,310 @@ static void draw_playhead(cairo_t *cr, int width, int height, size_t current_pos
     }
 }
 
-// --- PUBLIC CALLBACKS ---
+// --- ASYNCHRONOUS RENDERER ---
+
+typedef struct {
+    int width;
+    int height;
+    double scroll_x;
+    double zoom;
+    size_t bt_frames_len;
+    int active_tracks;
+    bool track_audible[MAX_TRACKS];
+    float track_gains[MAX_TRACKS];
+    float *track_ptrs[MAX_TRACKS];
+} BTRenderJob;
+
+static void on_bt_surface_ready(GObject *source, GAsyncResult *res, gpointer data) {
+    cairo_surface_t *new_surf = g_task_propagate_pointer(G_TASK(res), NULL);
+    if (new_surf) {
+        if (surface_bt) cairo_surface_destroy(surface_bt);
+        surface_bt = new_surf;
+        extern GtkWidget *waveform_area_bt;
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    }
+    atomic_store_explicit(&bt_render_active, false, memory_order_release);
+}
+
+static void bt_render_thread(GTask *task, gpointer source, gpointer task_data, GCancellable *cancel) {
+    BTRenderJob *job = task_data;
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, job->width, job->height);
+    cairo_t *cr = cairo_create(surf);
+
+    draw_waveform_grid(cr, job->width, job->height, job->bt_frames_len);
+
+    double virtual_width = job->width * job->zoom;
+    double frames_per_pixel = (double)job->bt_frames_len / virtual_width;
+    if (frames_per_pixel == 0) frames_per_pixel = 1.0;
+
+    atomic_store_explicit(&ui_scanner_is_busy, true, memory_order_release);
+
+    for (int l = 0; l < job->active_tracks; l++) {
+        float *active_buf = job->track_ptrs[l];
+        if (!active_buf || !job->track_audible[l]) continue;
+
+        if (frames_per_pixel >= 1.0) {
+            float min_l[MAX_UI_WIDTH] = {0}, max_l[MAX_UI_WIDTH] = {0};
+            float min_r[MAX_UI_WIDTH] = {0}, max_r[MAX_UI_WIDTH] = {0};
+
+            for (int x = 0; x < job->width && x < MAX_UI_WIDTH; x++) {
+                if (atomic_load_explicit(&request_track_free, memory_order_relaxed)) {
+                    atomic_store_explicit(&ui_scanner_is_busy, false, memory_order_release);
+                    cairo_destroy(cr);
+                    cairo_surface_destroy(surf);
+                    g_task_return_pointer(task, NULL, NULL);
+                    return;
+                }
+
+                size_t start_frame = (size_t)((job->scroll_x + x) * frames_per_pixel);
+                size_t end_frame = (size_t)((job->scroll_x + x + 1) * frames_per_pixel);
+
+                if (end_frame <= start_frame) end_frame = start_frame + 1;
+                if (start_frame >= job->bt_frames_len) continue;
+                if (end_frame > job->bt_frames_len) end_frame = job->bt_frames_len;
+
+                scan_waveform_extents(active_buf, start_frame, end_frame, &min_l[x], &max_l[x], &min_r[x], &max_r[x]);
+            }
+
+            cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+            set_track_color(cr, l, 0.65);
+            cairo_set_line_width(cr, 1.0);
+            draw_envelope_waveform(cr, job->width, job->height, min_l, max_l, job->track_gains[l], job->height / 4.0);
+            draw_envelope_waveform(cr, job->width, job->height, min_r, max_r, job->track_gains[l], 3.0 * job->height / 4.0);
+        } else {
+            if (atomic_load_explicit(&request_track_free, memory_order_relaxed)) {
+                atomic_store_explicit(&ui_scanner_is_busy, false, memory_order_release);
+                cairo_destroy(cr);
+                cairo_surface_destroy(surf);
+                g_task_return_pointer(task, NULL, NULL);
+                return;
+            }
+            cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+            set_track_color(cr, l, 0.65);
+            cairo_set_line_width(cr, 1.5);
+            draw_sample_waveform(cr, job->width, job->height, active_buf, job->bt_frames_len, job->scroll_x, frames_per_pixel, job->track_gains[l], job->height / 4.0, 0);
+            draw_sample_waveform(cr, job->width, job->height, active_buf, job->bt_frames_len, job->scroll_x, frames_per_pixel, job->track_gains[l], 3.0 * job->height / 4.0, 1);
+        }
+    }
+
+    atomic_store_explicit(&ui_scanner_is_busy, false, memory_order_release);
+    cairo_destroy(cr);
+    g_task_return_pointer(task, surf, (GDestroyNotify)cairo_surface_destroy);
+}
+
+/**
+ * @brief Cairo draw callback for the backing track waveform area.
+ * @param area The drawing area widget.
+ * @param cr The Cairo rendering context.
+ * @param width The width of the drawing area.
+ * @param height The height of the drawing area.
+ * @param user_data Optional user data.
+ * @return void
+ */
+void on_draw_bt_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+    (void)area; (void)user_data;
+
+    if (ui_state.is_loading_track || !pristine_bt_buf || pristine_frames == 0) {
+        draw_waveform_grid(cr, width, height, 0);
+        return;
+    }
+
+    int bt_width = gtk_widget_get_width(waveform_area_bt);
+    double virtual_width = bt_width * zoom_multiplier;
+    double scroll_x = gtk_adjustment_get_value(waveform_adj);
+
+    size_t bt_frames_len = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    double frames_per_pixel = (double)bt_frames_len / virtual_width;
+    if (frames_per_pixel == 0) frames_per_pixel = 1.0;
+
+    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+    int active_tracks = atomic_load_explicit(&active_track_count, memory_order_relaxed);
+    int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
+
+    static double cached_bt_scroll_x = -1.0;
+    static double cached_bt_zoom = -1.0;
+    static float *cached_track_ptrs[MAX_TRACKS] = {NULL};
+    static bool cached_audible[MAX_TRACKS] = {false};
+
+    bool any_solo_active = false;
+    bool track_audible[MAX_TRACKS] = {false};
+
+    for (int l = 0; l < MAX_TRACKS; l++) {
+        if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
+            any_solo_active = true;
+            break;
+        }
+    }
+
+    bool pointers_changed = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        track_audible[i] = (!any_solo_active || atomic_load_explicit(&master_tracks[i].is_soloed, memory_order_relaxed)) &&
+        atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
+
+        if (master_tracks[i].active_buffer != cached_track_ptrs[i]) {
+            pointers_changed = true;
+            cached_track_ptrs[i] = master_tracks[i].active_buffer;
+        }
+        if (track_audible[i] != cached_audible[i]) {
+            pointers_changed = true;
+            cached_audible[i] = track_audible[i];
+        }
+    }
+
+    if (width != cached_bt_width || height != cached_bt_height || pristine_bt_buf != cached_bt_ptr ||
+        active_tracks != cached_active_tracks || scroll_x != cached_bt_scroll_x || zoom_multiplier != cached_bt_zoom || pointers_changed) {
+
+        if (!atomic_exchange_explicit(&bt_render_active, true, memory_order_acquire)) {
+            BTRenderJob *job = g_new0(BTRenderJob, 1);
+            job->width = width;
+            job->height = height;
+            job->scroll_x = scroll_x;
+            job->zoom = zoom_multiplier;
+            job->bt_frames_len = bt_frames_len;
+            job->active_tracks = (active_tracks > MAX_TRACKS) ? MAX_TRACKS : active_tracks;
+
+            for (int l = 0; l < job->active_tracks; l++) {
+                job->track_ptrs[l] = master_tracks[l].active_buffer;
+                job->track_audible[l] = track_audible[l];
+                job->track_gains[l] = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
+            }
+
+            GTask *task = g_task_new(NULL, NULL, on_bt_surface_ready, NULL);
+            g_task_set_task_data(task, job, g_free);
+            g_task_run_in_thread(task, bt_render_thread);
+            g_object_unref(task);
+
+            cached_bt_width = width;
+            cached_bt_height = height;
+            cached_bt_ptr = pristine_bt_buf;
+            cached_active_tracks = active_tracks;
+            cached_bt_scroll_x = scroll_x;
+            cached_bt_zoom = zoom_multiplier;
+        }
+        }
+
+        if (surface_bt) {
+            cairo_set_source_surface(cr, surface_bt, 0, 0);
+            cairo_paint(cr);
+        }
+
+        if (active_tracks > 1 && atomic_load_explicit(&engine_is_recording, memory_order_relaxed)) {
+            float *rec_buf = master_tracks[rec_track].active_buffer;
+
+            if (frames_per_pixel >= 1.0 && rec_buf) {
+                memset(sweep_min_l, 0, sizeof(sweep_min_l));
+                memset(sweep_max_l, 0, sizeof(sweep_max_l));
+                memset(sweep_min_r, 0, sizeof(sweep_min_r));
+                memset(sweep_max_r, 0, sizeof(sweep_max_r));
+
+                for (int x = 0; x < width && x < MAX_UI_WIDTH; x++) {
+                    size_t start_frame = (size_t)((scroll_x + x) * frames_per_pixel);
+                    size_t end_frame = (size_t)((scroll_x + x + 1) * frames_per_pixel);
+
+                    if (start_frame >= current_pos) break;
+                    if (end_frame > current_pos) end_frame = current_pos;
+
+                    scan_waveform_extents(rec_buf, start_frame, end_frame,
+                                          &sweep_min_l[x], &sweep_max_l[x], &sweep_min_r[x], &sweep_max_r[x]);
+                }
+
+                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+                set_track_color(cr, rec_track, 0.5);
+                cairo_set_line_width(cr, 1.0);
+                draw_envelope_waveform(cr, width, height, sweep_min_l, sweep_max_l, 1.0f, height / 4.0);
+                draw_envelope_waveform(cr, width, height, sweep_min_r, sweep_max_r, 1.0f, 3.0 * height / 4.0);
+            } else if (rec_buf) {
+                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+                set_track_color(cr, rec_track, 0.5);
+                cairo_set_line_width(cr, 1.5);
+                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, height / 4.0, 0);
+                draw_sample_waveform(cr, width, height, rec_buf, current_pos, scroll_x, frames_per_pixel, 1.0f, 3.0 * height / 4.0, 1);
+            }
+        }
+
+        if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+            size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
+            size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
+
+            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            double start_px = (((double)l_start / (double)t_frames) * virtual_width) - scroll_x;
+            double end_px = (((double)l_end / (double)t_frames) * virtual_width) - scroll_x;
+
+            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
+            cairo_fill(cr);
+        } else if (is_dragging && drag_start_fraction >= 0.0) {
+            double start_px = (drag_start_fraction * virtual_width) - scroll_x;
+            double end_px = (current_drag_fraction * virtual_width) - scroll_x;
+            if (start_px > end_px) { double tmp = start_px; start_px = end_px; end_px = tmp; }
+            cairo_set_source_rgba(cr, 0.3, 0.7, 1.0, 0.25);
+            cairo_rectangle(cr, round(start_px), 0, round(end_px) - round(start_px), height);
+            cairo_fill(cr);
+        }
+
+        extern char current_raw_path[1024];
+        extern size_t video_start_frame;
+        extern size_t video_end_frame;
+        extern _Atomic bool video_is_armed;
+
+        bool has_mkv_backing = (g_str_has_suffix(ui_state.selected_track_path, ".mkv") ||
+        g_str_has_suffix(ui_state.selected_track_path, ".MKV"));
+        bool has_recorded_video = (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0);
+
+        if (has_mkv_backing || has_recorded_video) {
+            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+            if (t_frames > 0) {
+                cairo_set_source_rgba(cr, 0.85, 0.1, 0.1, 0.9);
+                cairo_set_line_width(cr, 2.0);
+
+                if (has_mkv_backing) {
+                    extern size_t get_last_audible_frame(void);
+                    size_t last_f = get_last_audible_frame();
+
+                    if (last_f > 0) {
+                        double start_px = 0.0 - scroll_x;
+                        double end_px = (((double)last_f / (double)t_frames) * virtual_width) - scroll_x;
+
+                        cairo_move_to(cr, start_px, height / 2.0);
+                        cairo_line_to(cr, end_px, height / 2.0);
+                        cairo_stroke(cr);
+
+                        cairo_arc(cr, start_px < 0 ? 0 : start_px, height / 2.0, 4.0, 0, 2 * M_PI);
+                        cairo_fill(cr);
+                        cairo_arc(cr, end_px > width ? width : end_px, height / 2.0, 4.0, 0, 2 * M_PI);
+                        cairo_fill(cr);
+                    }
+                }
+
+                if (has_recorded_video) {
+                    size_t v_start = video_start_frame;
+                    size_t v_end = video_end_frame;
+
+                    if (atomic_load_explicit(&engine_is_recording, memory_order_acquire) &&
+                        atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+                        v_end = current_pos;
+                        }
+
+                        if (v_end > v_start) {
+                            double start_px = (((double)v_start / (double)t_frames) * virtual_width) - scroll_x;
+                            double end_px = (((double)v_end / (double)t_frames) * virtual_width) - scroll_x;
+
+                            cairo_move_to(cr, start_px, height / 2.0);
+                            cairo_line_to(cr, end_px, height / 2.0);
+                            cairo_stroke(cr);
+
+                            cairo_arc(cr, start_px, height / 2.0, 4.0, 0, 2 * M_PI);
+                            cairo_fill(cr);
+                            cairo_arc(cr, end_px, height / 2.0, 4.0, 0, 2 * M_PI);
+                            cairo_fill(cr);
+                        }
+                }
+            }
+        }
+
+        draw_playhead(cr, width, height, current_pos, backing_track_frames);
+}
+
 /**
  * @brief Cairo draw callback for a generic horizontal VU meter.
  * @param area The drawing area widget.
@@ -632,15 +771,60 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
     extern _Atomic uint32_t rt_dropped_audio_frames;
     uint32_t dropped = atomic_exchange_explicit(&rt_dropped_audio_frames, 0, memory_order_relaxed);
     if (dropped > 0) {
-        printf("[RT-EVENT] Warning: Dropped %u audio frames (Ringbuffer Overrun)\n", dropped);
+        log_and_notify(0, "[RT-EVENT] Warning: Dropped %u audio frames (Ringbuffer Overrun)\n", dropped);
     }
 
     // Check for silent background encoder failure
     extern _Atomic bool encoder_disk_error;
     if (atomic_exchange_explicit(&encoder_disk_error, false, memory_order_acquire)) {
+        extern GtkWidget *btn_stop;
         if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
             g_signal_emit_by_name(btn_stop, "clicked");
-            gtk_label_set_markup(GTK_LABEL(lbl_status), "<span foreground='#ff4444'><b>Status: RECORDING ABORTED (Disk Full / I/O Error)</b></span>");
+            log_and_notify(1, "<span foreground='#ff4444'><b>Status: RECORDING ABORTED (Disk Full / I/O Error)</b></span>");
+        }
+    }
+
+    extern _Atomic bool loop_wrap_pending;
+    if (atomic_exchange_explicit(&loop_wrap_pending, false, memory_order_acquire)) {
+        extern _Atomic bool video_is_armed;
+        bool was_video = atomic_load_explicit(&video_is_armed, memory_order_acquire);
+
+        // Signal on_stop_clicked to retain loop points and bypass track auto-advance
+        extern _Atomic bool is_loop_wrapping;
+        atomic_store_explicit(&is_loop_wrapping, true, memory_order_release);
+
+        // 1. Cache loop points before the "Stop" command accesses them
+        extern _Atomic size_t loop_start_frame;
+        extern _Atomic size_t loop_end_frame;
+        extern atomic_size_t backing_track_frames;
+        size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+        size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+        size_t frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+
+        // 2. Simulate Stop (Commits the take to the Undo ledger but stays on current track)
+        extern GtkWidget *btn_stop;
+        if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+            g_signal_emit_by_name(btn_stop, "clicked");
+        }
+
+        // 3. Rewind the playhead back to the start of the loop safely
+        if (frames > 0 && l_end > l_start) {
+            double start_frac = (double)l_start / (double)frames;
+            extern void seek_backing_track(double);
+            seek_backing_track(start_frac);
+        }
+
+        // 4. Suppress the video overwrite nag dialogue for automatic passes
+        extern _Atomic bool suppress_video_overwrite;
+        atomic_store_explicit(&suppress_video_overwrite, true, memory_order_release);
+
+        // 5. Restart recording to trigger the 3-second countdown
+        extern GtkWidget *btn_record_video;
+        extern GtkWidget *btn_record;
+        if (was_video && btn_record_video) {
+            g_signal_emit_by_name(btn_record_video, "clicked");
+        } else if (btn_record) {
+            g_signal_emit_by_name(btn_record, "clicked");
         }
     }
 
@@ -705,6 +889,7 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
 
             // Auto-stop logic
             if (is_active && backing_track_frames > 0 && current_pos >= backing_track_frames) {
+                extern void on_stop_clicked(GtkButton *button, gpointer user_data);
                 on_stop_clicked(NULL, NULL);
             }
         }
@@ -743,14 +928,14 @@ void invalidate_waveform_caches(void) {
 }
 
 /**
-* @brief Cairo draw callback for the Quad Cortex input waveform area.
-* @param area The drawing area widget.
-* @param cr The Cairo rendering context.
-* @param width The width of the drawing area.
-* @param height The height of the drawing area.
-* @param user_data Optional user data.
-* @return void
-*/
+ * @brief Cairo draw callback for the Quad Cortex input waveform area.
+ * @param area The drawing area widget.
+ * @param cr The Cairo rendering context.
+ * @param width The width of the drawing area.
+ * @param height The height of the drawing area.
+ * @param user_data Optional user data.
+ * @return void
+ */
 void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area; (void)user_data;
 
@@ -770,7 +955,7 @@ void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int he
     if (frames_per_pixel == 0) frames_per_pixel = 1.0;
 
     size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
-    size_t target_scan = backing_track_frames;
+    size_t target_scan = current_pos; // SWEEP OPTIMIZATION
 
     static double cached_input_scroll_x = -1.0;
     static double cached_input_zoom = -1.0;
@@ -851,17 +1036,48 @@ void on_draw_input_waveform(GtkDrawingArea *area, cairo_t *cr, int width, int he
             cairo_fill(cr);
         }
 
-        draw_playhead(cr, width, height, current_pos, backing_track_frames);
+        extern size_t video_start_frame;
+        extern _Atomic bool video_is_armed;
+
+        if (atomic_load_explicit(&engine_is_recording, memory_order_acquire) &&
+            atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+
+            size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+        if (t_frames > 0 && current_pos > video_start_frame) {
+            double start_px = (((double)video_start_frame / (double)t_frames) * virtual_width) - scroll_x;
+            double end_px = (((double)current_pos / (double)t_frames) * virtual_width) - scroll_x;
+
+            cairo_set_source_rgba(cr, 0.85, 0.1, 0.1, 0.9);
+            cairo_set_line_width(cr, 2.0);
+
+            cairo_move_to(cr, start_px, height / 2.0);
+            cairo_line_to(cr, end_px, height / 2.0);
+            cairo_stroke(cr);
+
+            cairo_arc(cr, start_px, height / 2.0, 4.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+            cairo_arc(cr, end_px, height / 2.0, 4.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+            }
+
+            draw_playhead(cr, width, height, current_pos, backing_track_frames);
 }
 
-// --- LOOPER DRAG GESTURES --
+// LOOPER DRAG GESTURES
 
 void clear_waveform_anchor(void) {
+    extern void clear_loop_points(void);
     clear_loop_points();
 }
 
 void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
     (void)n_press; (void)y; (void)user_data;
+
+    GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    gtk_widget_set_focusable(widget, TRUE);
+    gtk_widget_grab_focus(widget);
+
     if (atomic_load_explicit(&engine_is_recording, memory_order_acquire)) return;
     if (backing_track_frames == 0) return;
 
@@ -887,7 +1103,9 @@ void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, 
 
     if ((state & GDK_SHIFT_MASK) == 0) {
         // Normal Click: Clear loop and move playhead
+        extern void clear_loop_points(void);
         clear_loop_points();
+        extern void seek_backing_track(double);
         seek_backing_track(click_fraction);
     } else {
         // Shift + Click: Create selection between current playhead and click location
@@ -897,9 +1115,14 @@ void on_waveform_click_pressed(GtkGestureClick *gesture, int n_press, double x, 
         // Failsafe: Prevent mathematically identical start/end loops
         if (playhead_fraction == click_fraction) click_fraction += 0.000001;
 
+        extern void set_loop_points(double, double);
         set_loop_points(playhead_fraction, click_fraction);
+        extern void seek_backing_track(double);
         seek_backing_track(fmin(playhead_fraction, click_fraction));
     }
+
+    extern void update_multitrack_status_ui(void);
+    update_multitrack_status_ui();
 
     last_seek_time = g_get_monotonic_time();
     gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
@@ -953,6 +1176,7 @@ void on_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpoi
     is_dragging = true;
     current_drag_fraction = drag_start_fraction;
 
+    extern void clear_loop_points(void);
     clear_loop_points();
 }
 
@@ -1039,16 +1263,180 @@ void on_drag_end(GtkGestureDrag *gesture, double offset_x, double offset_y, gpoi
     is_dragging = false;
 
     // Use physical screen pixels to differentiate a click from a drag.
-    // Increasing the threshold to 10.0px prevents accidental micro-loops from sloppy clicks.
-    // Pure clicks are naturally handled by on_waveform_click_pressed on mouse-down.
     if (fabs(offset_x) >= 10.0) {
+        extern void set_loop_points(double, double);
+        extern void seek_backing_track(double);
         set_loop_points(drag_start_fraction, end_fraction);
         seek_backing_track(fmin(drag_start_fraction, end_fraction));
         last_seek_time = g_get_monotonic_time();
     }
 
+    extern void update_multitrack_status_ui(void);
+    update_multitrack_status_ui();
+
     drag_start_fraction = -1.0;
-    gtk_widget_queue_draw(waveform_area_input); // Ensure final boundary snaps to bottom canvas
+    gtk_widget_queue_draw(waveform_area_bt);
+    gtk_widget_queue_draw(waveform_area_input);
+}
+
+static bool get_video_dot_positions(GtkWidget *widget, double *out_start_x, double *out_end_x, double *out_y) {
+    extern size_t video_start_frame;
+    extern size_t video_end_frame;
+    extern char current_raw_path[1024];
+
+    bool has_mkv_backing = (g_str_has_suffix(ui_state.selected_track_path, ".mkv") || g_str_has_suffix(ui_state.selected_track_path, ".MKV"));
+    bool has_recorded_video = (strlen(current_raw_path) > 0 && access(current_raw_path, F_OK) == 0);
+
+    if (!has_mkv_backing && !has_recorded_video) return false;
+
+    size_t t_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    if (t_frames == 0) return false;
+
+    int width = gtk_widget_get_width(widget);
+    double virtual_width = width * zoom_multiplier;
+    double scroll_x = gtk_adjustment_get_value(waveform_adj);
+
+    *out_y = gtk_widget_get_height(widget) / 2.0;
+
+    if (has_mkv_backing) {
+        extern size_t get_last_audible_frame(void);
+        size_t last_f = get_last_audible_frame();
+
+        // Reject the hitbox if the indicator isn't drawn
+        if (last_f == 0) return false;
+
+        *out_start_x = 0.0 - scroll_x;
+        *out_end_x = (((double)last_f / (double)t_frames) * virtual_width) - scroll_x;
+        return true;
+    } else if (has_recorded_video) {
+        *out_start_x = (((double)video_start_frame / (double)t_frames) * virtual_width) - scroll_x;
+        *out_end_x = (((double)video_end_frame / (double)t_frames) * virtual_width) - scroll_x;
+        return true;
+    }
+    return false;
+}
+
+gboolean on_waveform_query_tooltip(GtkWidget *widget, gint x, gint y, gboolean keyboard_mode, GtkTooltip *tooltip, gpointer user_data) {
+    (void)user_data;
+    if (keyboard_mode) return FALSE;
+
+    double dot_start_x, dot_end_x, dot_y;
+    if (get_video_dot_positions(widget, &dot_start_x, &dot_end_x, &dot_y)) {
+        if ((fabs((double)x - dot_start_x) <= 15.0 && fabs((double)y - dot_y) <= 15.0) ||
+            (fabs((double)x - dot_end_x) <= 15.0 && fabs((double)y - dot_y) <= 15.0)) {
+
+            bool has_mkv_backing = (g_str_has_suffix(ui_state.selected_track_path, ".mkv") || g_str_has_suffix(ui_state.selected_track_path, ".MKV"));
+
+        if (has_mkv_backing) {
+            gtk_tooltip_set_text(tooltip, "External video track");
+        } else {
+            gtk_tooltip_set_text(tooltip, "Right-click dot to remove video");
+        }
+        return TRUE;
+            }
+    }
+    return FALSE;
+}
+
+static void on_video_delete_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)user_data;
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        extern void on_stop_clicked(GtkButton*, gpointer);
+        on_stop_clicked(NULL, NULL);
+
+        extern _Atomic int current_recording_track;
+        int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+        extern void backup_track_to_ledger(int);
+        backup_track_to_ledger(rec_track);
+
+        extern void mark_current_transaction_as_video_deletion(void);
+        mark_current_transaction_as_video_deletion();
+
+        extern void abort_active_video_preview(bool stash);
+        abort_active_video_preview(true);
+
+        extern size_t video_start_frame;
+        extern size_t video_end_frame;
+        video_start_frame = 0;
+        video_end_frame = 0;
+
+        extern void mark_session_dirty(void);
+        mark_session_dirty();
+
+        extern GtkWidget *waveform_area_bt;
+        extern GtkWidget *waveform_area_input;
+        if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+        log_and_notify(1, "Status: Video removed from session");
+    }
+}
+
+void on_waveform_right_click(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
+    (void)n_press; (void)user_data;
+    GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    double dot_start_x, dot_end_x, dot_y;
+
+    if (get_video_dot_positions(widget, &dot_start_x, &dot_end_x, &dot_y)) {
+        if ((fabs(x - dot_start_x) <= 15.0 && fabs(y - dot_y) <= 15.0) ||
+            (fabs(x - dot_end_x) <= 15.0 && fabs(y - dot_y) <= 15.0)) {
+
+            gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+
+        bool has_mkv_backing = (g_str_has_suffix(ui_state.selected_track_path, ".mkv") || g_str_has_suffix(ui_state.selected_track_path, ".MKV"));
+
+        if (has_mkv_backing) {
+            GtkAlertDialog *alert = gtk_alert_dialog_new("Unsupported Action");
+            gtk_alert_dialog_set_detail(alert, "Deleting the video track from external files is not supported.");
+            GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
+            gtk_alert_dialog_show(alert, parent);
+            g_object_unref(alert);
+        } else {
+            GtkAlertDialog *alert = gtk_alert_dialog_new("Remove Video Take?");
+            gtk_alert_dialog_set_detail(alert, "You are about to delete this video take from the session. Are you sure?");
+            const char *buttons[] = { "Delete Video", "Cancel", NULL };
+            gtk_alert_dialog_set_buttons(alert, buttons);
+            gtk_alert_dialog_set_cancel_button(alert, 1);
+            gtk_alert_dialog_set_default_button(alert, 0);
+
+            GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
+            gtk_alert_dialog_choose(alert, parent, NULL, on_video_delete_confirm, NULL);
+            g_object_unref(alert);
+        }
+        return;
+            }
+    }
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
+}
+
+static float pending_gain_multiplier = 1.0f;
+static guint gain_debounce_id = 0;
+
+static gboolean apply_gain_deferred(gpointer user_data) {
+    (void)user_data;
+    extern void apply_gain_selection(float multiplier);
+    apply_gain_selection(pending_gain_multiplier);
+
+    // Reset accumulator for the next scroll event
+    pending_gain_multiplier = 1.0f;
+    gain_debounce_id = 0;
+
+    extern void mark_session_dirty(void);
+    mark_session_dirty();
+
+    extern void update_multitrack_status_ui(void);
+    update_multitrack_status_ui();
+
+    extern void invalidate_waveform_caches(void);
+    invalidate_waveform_caches();
+
+    extern GtkWidget *waveform_area_bt;
+    extern GtkWidget *waveform_area_input;
+    if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
+    if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+
+    return G_SOURCE_REMOVE;
 }
 
 gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data) {
@@ -1056,6 +1444,16 @@ gboolean on_waveform_scroll(GtkEventControllerScroll *controller, double dx, dou
     GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller));
 
     if (state & GDK_SHIFT_MASK) {
+        double delta = (dy != 0.0) ? dy : dx;
+        float multiplier = (delta < 0) ? 1.122018f : 0.891251f; // +1dB or -1dB
+
+        pending_gain_multiplier *= multiplier;
+
+        if (gain_debounce_id != 0) {
+            g_source_remove(gain_debounce_id);
+        }
+        gain_debounce_id = g_timeout_add(250, apply_gain_deferred, NULL);
+
         return TRUE;
     }
 

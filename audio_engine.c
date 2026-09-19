@@ -3,6 +3,8 @@
 #include <stdlib.h>      // For calloc, free
 #include <stdatomic.h>   // For lock-free atomic variables
 #include <math.h>        // For audio math/clipping
+#include <ctype.h>       // For isdigit
+#include <fcntl.h>       // For fcntl, O_NONBLOCK
 
 // Audio Processing Libraries
 #include <sndfile.h>     // For reading FLAC/WAV files
@@ -17,13 +19,75 @@
 #include <libavutil/opt.h>
 #include <stdalign.h>
 #include <glib.h>
+#include <gio/gio.h>
 #include "encoder.h"
 
 // Project Local Headers
+#include "config.h"
 #include "audio_engine.h" // Provides <jack/jack.h> and function signatures
 #include "encoder.h"
 #include "video_ringbuffer.h" // Required for SPSC_Video_Queue
 #include "ringbuffer.h"   // Provides AudioFrame and lock-free queue
+
+#include <sys/mman.h>
+
+/**
+ * Helper functions to allocate zero-filled audio buffers.
+ * Rely on calloc's native page-faulting rather than hitting strict OS mlock limits.
+ */
+
+static float* alloc_audio_buffer(size_t frames) {
+    size_t bytes = frames * 2 * sizeof(float);
+    return calloc(1, bytes);
+}
+
+static void free_audio_buffer(float *ptr, size_t frames) {
+    (void)frames; // Retained for signature compatibility
+    if (ptr) {
+        free(ptr);
+    }
+}
+
+typedef struct {
+    float *ptr;
+    size_t frames;
+} DeferredFreeData;
+
+static gboolean deferred_locked_free_cb(gpointer data) {
+    DeferredFreeData *df = (DeferredFreeData *)data;
+    free_audio_buffer(df->ptr, df->frames);
+    free(df);
+    return G_SOURCE_REMOVE;
+}
+
+static inline void safe_deferred_locked_free(float *ptr, size_t frames) {
+    if (!ptr) return;
+    DeferredFreeData *df = malloc(sizeof(DeferredFreeData));
+    if (df) {
+        df->ptr = ptr;
+        df->frames = frames;
+        g_idle_add(deferred_locked_free_cb, df);
+    }
+}
+
+static inline void safe_deferred_free(void *ptr);
+
+static void free_detached_ledger(UndoLedger *ledger, size_t frames) {
+    if (!ledger || !ledger->states) return;
+    for (int i = 0; i < ledger->max_capacity; i++) {
+        if (ledger->states[i].buffer) safe_deferred_locked_free(ledger->states[i].buffer, frames);
+    }
+    safe_deferred_free(ledger->states);
+}
+
+static void free_detached_ledger_sync(UndoLedger *ledger, size_t frames) {
+    if (!ledger || !ledger->states) return;
+    for (int i = 0; i < ledger->max_capacity; i++) {
+        if (ledger->states[i].buffer) free_audio_buffer(ledger->states[i].buffer, frames);
+    }
+    free(ledger->states);
+}
+// End helper finctions to call mlock
 
 // UI -> RT Communication (Aligned to 64 bytes to prevent false sharing with RT writes)
 /** Destructive pre-buffer multiplier applied directly to incoming hardware samples before writing to memory. */
@@ -41,6 +105,12 @@ _Atomic bool loop_active = false;
 _Atomic size_t loop_start_frame = 0;
 _Atomic size_t loop_end_frame = 0;
 
+// SAFETY [Critical]: Heartbeat to detect PipeWire graph suspension
+_Atomic uint32_t dsp_heartbeat = 0;
+
+// SAFETY [Critical]: Gatekeeper to prevent DSP loop from accessing detached ports
+_Atomic bool audio_available = true;
+
 // RT -> UI Communication (Isolated cache lines to prevent RT thread cache evictions)
 alignas(64) _Atomic float vu_peak_input_l = 0.0f;
 _Atomic float vu_peak_input_r = 0.0f;
@@ -57,6 +127,10 @@ SPSC_Command_Queue cmd_queue;
 float *pristine_bt_buf = NULL;
 size_t pristine_frames = 0;
 
+// RT Metronome State
+static int click_frames_remaining = 0;
+static double click_phase = 0.0;
+
 // --- REPLACED GLOBALS (Around line 40) ---
 // Real-Time Engine State
 RubberBandState rt_rb_state = NULL;
@@ -70,6 +144,12 @@ static _Atomic bool stretcher_flush_request = false;
 static _Atomic bool stretcher_ratio_update = false;
 
 // Multi-Track Multitrack Engine State
+_Atomic int active_track_count = 0;
+_Atomic int current_recording_track = 0;
+_Atomic int timebase_track = 0;
+
+UndoLedger global_undo_ledger = { .states = NULL, .max_capacity = 0, .head = 0, .tail = 0, .count = 0 };
+
 QJTrackBuffer master_tracks[MAX_TRACKS] = {
     { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f },
     { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f }, { .gain = 1.0f },
@@ -80,23 +160,68 @@ float *clipboard_buffers[MAX_TRACKS] = {NULL};
 size_t clipboard_frames = 0;
 _Atomic uint32_t selected_tracks_mask = 1;
 
-_Atomic int active_track_count = 0;
-_Atomic int current_recording_track = 0;
-
 atomic_size_t backing_track_frames = 0; // Dynamic tracking for UI playhead completion
 alignas(64) atomic_size_t playback_pos = 0;
 atomic_int active_sample_rate = 44100; // Will be immediately overwritten by JACK on init
 
 _Atomic bool seek_flag = false;
 _Atomic double seek_target = 0.0;
+static int output_fade_remaining = 0;
+_Atomic bool loop_wrap_pending = false;
 
 _Atomic bool speed_change_flag = false;
 _Atomic float speed_target = 1.0f;
+
+static uint32_t current_transaction_id = 0;
+uint32_t video_creation_trans_id = 0;
+uint32_t video_deletion_trans_id = 0;
+
+_Atomic uint32_t saved_transaction_id = 0;
+
+static uint32_t get_current_transaction(void) {
+    if (global_undo_ledger.count == 0 || global_undo_ledger.head == 0) return 0;
+    int idx = (global_undo_ledger.tail + global_undo_ledger.head - 1) % global_undo_ledger.max_capacity;
+    return global_undo_ledger.states[idx].transaction_id;
+}
+
+void evaluate_session_dirty_state(void) {
+    if (get_current_transaction() == atomic_load_explicit(&saved_transaction_id, memory_order_acquire)) {
+        atomic_store_explicit(&global_undo_ledger.is_dirty, false, memory_order_release);
+    } else {
+        atomic_store_explicit(&global_undo_ledger.is_dirty, true, memory_order_release);
+    }
+}
+
+bool is_session_dirty(void) {
+    return atomic_load_explicit(&global_undo_ledger.is_dirty, memory_order_acquire);
+}
+
+void mark_session_saved(void) {
+    atomic_store_explicit(&saved_transaction_id, get_current_transaction(), memory_order_release);
+    atomic_store_explicit(&global_undo_ledger.is_dirty, false, memory_order_release);
+}
+
+void mark_session_dirty(void) {
+    atomic_store_explicit(&global_undo_ledger.is_dirty, true, memory_order_release);
+}
+
+void mark_current_transaction_as_video(void) {
+    video_creation_trans_id = current_transaction_id;
+    video_deletion_trans_id = 0;
+}
+
+void mark_current_transaction_as_video_deletion(void) {
+    video_deletion_trans_id = current_transaction_id;
+}
+
+static void push_undo_state(int track_idx, uint32_t trans_id);
+static void free_detached_ledger(UndoLedger *ledger, size_t frames);
 
 // Atomic Handshake flags for lock-free memory swapping
 _Atomic bool request_track_free = false;
 _Atomic bool safe_to_free_track = false;
 _Atomic bool stretcher_safe_to_free = false;
+_Atomic bool ui_scanner_is_busy = false;
 
 // --- GLOBAL RT ANOMALY COUNTERS ---
 _Atomic uint32_t rt_dropped_audio_frames = 0;
@@ -108,7 +233,7 @@ _Atomic uint32_t rt_cmd_queue_full = 0;
  * @return G_SOURCE_REMOVE
  */
 static gboolean deferred_free_cb(gpointer data) {
-    printf("[MEM-TEARDOWN] Deferred release: Pointer=%p\n", data);
+    log_and_notify(0, "[MEM-TEARDOWN] Deferred release: Pointer=%p\n", data);
     free(data);
     return G_SOURCE_REMOVE;
 }
@@ -127,7 +252,7 @@ static inline void safe_deferred_free(void *ptr) {
  * @return G_SOURCE_REMOVE
  */
 static gboolean deferred_rb_free_cb(gpointer data) {
-    printf("[MEM-TEARDOWN] Deferred release: RubberBandState=%p\n", data);
+    log_and_notify(0, "[MEM-TEARDOWN] Deferred release: RubberBandState=%p\n", data);
     rubberband_delete((RubberBandState)data);
     return G_SOURCE_REMOVE;
 }
@@ -148,40 +273,45 @@ static pthread_mutex_t dsp_barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
  * @return true if both threads successfully detached, false if the operation timed out.
  */
 bool await_rt_thread_detach(void) {
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
     pthread_mutex_lock(&dsp_barrier_mutex);
 
     atomic_store_explicit(&safe_to_free_track, false, memory_order_relaxed);
     atomic_store_explicit(&stretcher_safe_to_free, false, memory_order_relaxed);
 
+    // PRE-FLIGHT CHECK: Determine if PipeWire has suspended the audio graph
+    uint32_t h1 = atomic_load_explicit(&dsp_heartbeat, memory_order_relaxed);
+    usleep(25000); // 25ms is enough for any buffer size under 1024 to tick
+    uint32_t h2 = atomic_load_explicit(&dsp_heartbeat, memory_order_relaxed);
+    bool rt_is_ticking = (client != NULL && h1 != h2);
+
     atomic_store_explicit(&request_track_free, true, memory_order_release);
     int timeout = 500;
-    while ((!atomic_load_explicit(&safe_to_free_track, memory_order_acquire) ||
-        !atomic_load_explicit(&stretcher_safe_to_free, memory_order_acquire)) && timeout > 0) {
+
+    while (timeout > 0) {
+        bool rt_safe = rt_is_ticking ? atomic_load_explicit(&safe_to_free_track, memory_order_acquire) : true;
+        bool stretcher_safe = atomic_load_explicit(&stretcher_safe_to_free, memory_order_acquire);
+        bool ui_safe = !atomic_load_explicit(&ui_scanner_is_busy, memory_order_acquire);
+
+        if (rt_safe && stretcher_safe && ui_safe) break;
+
         usleep(1000);
-    timeout--;
-        }
+        timeout--;
+    }
 
-        if (timeout == 0) {
-            printf("[DSP-SYNC:CRITICAL] Detach Timeout (500ms). Handshake aborted.\n");
-            atomic_store_explicit(&request_track_free, false, memory_order_release);
-            pthread_mutex_unlock(&dsp_barrier_mutex);
-            return false;
-        }
+    if (timeout == 0) {
+        log_and_notify(0, "[DSP-SYNC:CRITICAL] Detach Timeout (500ms). Handshake aborted. (rt_ticking=%d)\n", rt_is_ticking);
+        atomic_store_explicit(&request_track_free, false, memory_order_release);
+        pthread_mutex_unlock(&dsp_barrier_mutex);
+        return false;
+    }
 
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
-        (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
-        printf("[DSP-SYNC] Detached in %.2fms (Threads: RT=ACK, Stretcher=ACK)\n", elapsed_ms);
-
-        return true;
+    return true;
 }
 
 /**
  * @brief Releases the synchronization barrier, resuming active real-time processing.
  */
+
 void resume_rt_thread(void) {
     atomic_store_explicit(&safe_to_free_track, false, memory_order_relaxed);
     atomic_store_explicit(&stretcher_safe_to_free, false, memory_order_relaxed);
@@ -190,22 +320,21 @@ void resume_rt_thread(void) {
 }
 
 /**
- * @brief Dynamically calculates if the system has enough available physical memory
- * to safely load and pre-allocate recording buffers for the requested track.
- * @param source_frames Total frames in the source file.
+ * @brief RAM Gatekeeper: Dynamically calculates the safe maximum history capacity for the active canvas size.
+ * Enforces a strict 2GB OS floor to protect the kernel and background muxing from OOM kills.
+ * @param source_frames Total frames in the source file or target canvas.
  * @param source_rate Sample rate of the source file.
  * @param target_rate The active JACK hardware sample rate.
- * @return true if safe to load, false if it exceeds safe RAM limits.
+ * @return Safe integer multiplier for the UndoLedger pool (minimum 1, maximum 64).
  */
-static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, int target_rate) {
-    if (source_rate <= 0 || target_rate <= 0) return false;
+static int calculate_safe_history_capacity(sf_count_t source_frames, int source_rate, int target_rate) {
+    if (source_rate <= 0 || target_rate <= 0) return 1;
 
     double ratio = (double)target_rate / (double)source_rate;
     size_t pristine_frames_est = (size_t)(source_frames * ratio);
+    size_t track_bytes = pristine_frames_est * 2 * sizeof(float);
 
-    size_t pristine_bytes = pristine_frames_est * 2 * sizeof(float);
-    size_t layer_bytes = pristine_frames_est * 2 * sizeof(float);
-    size_t total_required_bytes = pristine_bytes + (layer_bytes * MAX_TRACKS * 2);
+    size_t base_monolith_bytes = track_bytes + (track_bytes * MAX_TRACKS);
 
     size_t available_ram = 0;
     FILE *meminfo = fopen("/proc/meminfo", "r");
@@ -226,30 +355,36 @@ static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, in
     if (available_ram == 0) {
         long pages = sysconf(_SC_AVPHYS_PAGES);
         long page_size = sysconf(_SC_PAGE_SIZE);
-        if (pages < 0 || page_size < 0) return true;
-        available_ram = (size_t)pages * (size_t)page_size;
+        if (pages > 0 && page_size > 0) available_ram = (size_t)pages * (size_t)page_size;
+    }
+
+    size_t os_floor_bytes = 2048ULL * 1024 * 1024; // 2GB Absolute Floor
+
+    if (available_ram <= (os_floor_bytes + base_monolith_bytes)) {
+        log_and_notify(0, "[MEM-GATE] Track allocation: OS Floor hit during swap validation.\n");
+        return 0;
     }
 
     size_t currently_held_bytes = 0;
+    if (pristine_bt_buf) currently_held_bytes += pristine_frames * 2 * sizeof(float);
     for (int i = 0; i < MAX_TRACKS; i++) {
         if (master_tracks[i].active_buffer) currently_held_bytes += pristine_frames * 2 * sizeof(float);
-        if (master_tracks[i].undo_buffer) currently_held_bytes += pristine_frames * 2 * sizeof(float);
-    }
-    available_ram += currently_held_bytes;
-
-    size_t absolute_cap_bytes = 40ULL * 1024 * 1024 * 1024;
-    size_t dynamic_cap_bytes = (available_ram * 85) / 100;
-    size_t final_cap = (dynamic_cap_bytes < absolute_cap_bytes) ? dynamic_cap_bytes : absolute_cap_bytes;
-
-    if (total_required_bytes > final_cap) {
-        printf("[MEM-GATE] Track allocation: Req=%.1f MB | Available=%.1f MB | Result=FAIL\n",
-               (double)total_required_bytes / (1024 * 1024), (double)final_cap / (1024 * 1024));
-        return false;
     }
 
-    printf("[MEM-GATE] Track allocation: Req=%.1f MB | Available=%.1f MB | Result=PASS\n",
-           (double)total_required_bytes / (1024 * 1024), (double)final_cap / (1024 * 1024));
-    return true;
+    currently_held_bytes += global_undo_ledger.max_capacity * (pristine_frames * 2 * sizeof(float));
+
+    size_t long_term_ram = available_ram + currently_held_bytes;
+    size_t remaining_bytes = long_term_ram - os_floor_bytes - base_monolith_bytes;
+
+    int capacity = (int)(remaining_bytes / track_bytes);
+
+    if (capacity > 64) capacity = 64;
+    if (capacity < MAX_TRACKS) capacity = 0;
+
+    log_and_notify(0, "[MEM-GATE] Dynamic History Calc: Floor=2GB | Base=%.1f MB | Remaining=%.1f MB | Capacity=%d states\n",
+                   (double)base_monolith_bytes / (1024 * 1024), (double)remaining_bytes / (1024 * 1024), capacity);
+
+    return capacity;
 }
 
 /**
@@ -258,16 +393,27 @@ static bool is_ram_allocation_safe(sf_count_t source_frames, int source_rate, in
  * @param codec_ctx The FFmpeg codec context.
  * @param frame The pre-allocated FFmpeg frame.
  * @param raw_buf Pointer to the destination float array.
- * @param capacity Pointer to the current maximum frame capacity of the destination array.
- * @param total_samples Pointer to the total number of samples currently written.
- * @param channels The number of audio channels in the stream.
- * @return 0 on success, -1 on memory allocation failure.
+ * @param capacity Pointer to the current capacity (in frames).
+ * @param total_samples Pointer to the total extracted samples.
+ * @param channels Number of audio channels.
+ * @return 0 on success, -1 on allocation failure or integer overflow.
  */
 static int drain_and_extract_frames(AVCodecContext *codec_ctx, AVFrame *frame, float **raw_buf, size_t *capacity, size_t *total_samples, int channels) {
     while (avcodec_receive_frame(codec_ctx, frame) == 0) {
         int nb_samples = frame->nb_samples;
-        if (*total_samples + nb_samples * channels > *capacity * channels) {
+
+        // CRITICAL: Prevent integer overflow during sample counting and allocation size calculations
+        if ((size_t)nb_samples > SIZE_MAX / channels) return -1;
+        size_t new_samples = (size_t)nb_samples * channels;
+
+        if (SIZE_MAX - *total_samples < new_samples) return -1;
+
+        if (*total_samples + new_samples > *capacity * channels) {
+            if (*capacity > SIZE_MAX / 2) return -1;
             size_t new_cap = *capacity * 2;
+
+            if (new_cap > SIZE_MAX / (channels * sizeof(float))) return -1;
+
             float *tmp = realloc(*raw_buf, new_cap * channels * sizeof(float));
             if (!tmp) return -1;
             *capacity = new_cap;
@@ -355,7 +501,7 @@ static int load_audio_ffmpeg(const char* filepath, float** out_raw, sf_count_t* 
 
     if (duration_sec > 0.0) {
         sf_count_t estimated_frames = (sf_count_t)(duration_sec * sample_rate);
-        if (!is_ram_allocation_safe(estimated_frames, sample_rate, target_jack_rate)) {
+        if (calculate_safe_history_capacity(estimated_frames, sample_rate, target_jack_rate) == 0) {
             avcodec_free_context(&codec_ctx1);
             avformat_close_input(&fmt_ctx);
             return -2;
@@ -520,6 +666,11 @@ static void* stretcher_loop(void* arg) {
 
         if (atomic_exchange_explicit(&stretcher_flush_request, false, memory_order_acquire)) {
             rubberband_reset(rt_rb_state);
+            float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+            size_t sync_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+            size_t target_pristine = (size_t)(sync_pos * current_speed);
+            if (target_pristine > pristine_frames) target_pristine = pristine_frames;
+            atomic_store_explicit(&pristine_read_pos, target_pristine, memory_order_release);
         }
 
         if (atomic_exchange_explicit(&stretcher_ratio_update, false, memory_order_acquire)) {
@@ -595,6 +746,8 @@ static void* stretcher_loop(void* arg) {
 int process_audio(jack_nframes_t nframes, void *arg) {
     (void)arg;
 
+    atomic_fetch_add_explicit(&dsp_heartbeat, 1, memory_order_relaxed);
+
     jack_nframes_t cycle_start_time = jack_last_frame_time(client);
 
     jack_default_audio_sample_t *out_1 = (jack_default_audio_sample_t *)jack_port_get_buffer(output_port_1, nframes);
@@ -617,13 +770,29 @@ int process_audio(jack_nframes_t nframes, void *arg) {
                 }
                 break;
             }
+            case CMD_PLAY_CLICK: {
+                int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+                click_frames_remaining = (int)((rate > 0 ? rate : 48000) * 0.05); // 50ms burst
+                click_phase = 0.0;
+                break;
+            }
             default:
                 break;
         }
     }
 
+    // SAFETY [Critical]: Acknowledge memory barrier BEFORE the audio gatekeeper to prevent UI deadlocks during imports
     if (atomic_load_explicit(&request_track_free, memory_order_acquire)) {
         atomic_store_explicit(&safe_to_free_track, true, memory_order_release);
+        for (jack_nframes_t i = 0; i < nframes; i++) {
+            out_1[i] = 0.0f;
+            out_2[i] = 0.0f;
+        }
+        return 0;
+    }
+
+    // SAFETY [Critical]: Bypass processing if hardware is actively dropping/re-routing
+    if (!atomic_load_explicit(&audio_available, memory_order_acquire)) {
         for (jack_nframes_t i = 0; i < nframes; i++) {
             out_1[i] = 0.0f;
             out_2[i] = 0.0f;
@@ -657,17 +826,26 @@ int process_audio(jack_nframes_t nframes, void *arg) {
             double loop_s_frac = (backing_track_frames > 0) ? ((double)atomic_load_explicit(&loop_start_frame, memory_order_relaxed) / (double)backing_track_frames) : 0.0;
             double loop_e_frac = (backing_track_frames > 0) ? ((double)atomic_load_explicit(&loop_end_frame, memory_order_relaxed) / (double)backing_track_frames) : 0.0;
 
-            backing_track_frames = (size_t)(pristine_frames / speed);
-            current_pos = (size_t)(fraction * backing_track_frames);
+            extern size_t video_start_frame;
+            extern size_t video_end_frame;
+            double v_start_frac = (backing_track_frames > 0) ? ((double)video_start_frame / (double)backing_track_frames) : 0.0;
+            double v_end_frac = (backing_track_frames > 0) ? ((double)video_end_frame / (double)backing_track_frames) : 0.0;
+
+            size_t new_bt_frames = (size_t)(pristine_frames / speed);
+            atomic_store_explicit(&backing_track_frames, new_bt_frames, memory_order_release);
+
+            current_pos = (size_t)(fraction * new_bt_frames);
+
+            // (Removed the invalid active_pos assignment here)
+            atomic_store_explicit(&playback_pos, current_pos, memory_order_release);
 
             if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
-                atomic_store_explicit(&loop_start_frame, (size_t)(loop_s_frac * backing_track_frames), memory_order_relaxed);
-                atomic_store_explicit(&loop_end_frame, (size_t)(loop_e_frac * backing_track_frames), memory_order_relaxed);
+                atomic_store_explicit(&loop_start_frame, (size_t)(loop_s_frac * new_bt_frames), memory_order_relaxed);
+                atomic_store_explicit(&loop_end_frame, (size_t)(loop_e_frac * new_bt_frames), memory_order_relaxed);
             }
 
-            if (!(active && !paused) && !do_seek) {
-                atomic_store_explicit(&playback_pos, current_pos, memory_order_release);
-            }
+            video_start_frame = (size_t)(v_start_frac * new_bt_frames);
+            video_end_frame = (size_t)(v_end_frac * new_bt_frames);
 
             atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
             atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
@@ -676,42 +854,52 @@ int process_audio(jack_nframes_t nframes, void *arg) {
 
     if (do_seek) {
         double frac = atomic_load_explicit(&seek_target, memory_order_relaxed);
-        size_t new_pristine = (size_t)(frac * pristine_frames);
         current_pos = (size_t)(frac * backing_track_frames);
 
-        atomic_store_explicit(&pristine_read_pos, new_pristine, memory_order_release);
+        // (Removed the invalid active_pos assignment here)
         atomic_store_explicit(&playback_pos, current_pos, memory_order_release);
 
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+        output_fade_remaining = 128;
     }
 
     bool is_looping = atomic_load_explicit(&loop_active, memory_order_acquire);
     size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_relaxed);
     size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_relaxed);
     size_t active_pos = current_pos;
+    bool pushed_audio = false;
 
     for (jack_nframes_t i = 0; i < nframes; i++) {
         if (active && !paused && is_looping && active_pos >= l_end) {
-            active_pos = l_start + (active_pos - l_end);
-
-            size_t target_pristine = (size_t)(((double)active_pos / (double)backing_track_frames) * pristine_frames);
-            atomic_store_explicit(&pristine_read_pos, target_pristine, memory_order_release);
-            atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
-            atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+            if (recording) {
+                // Pause the RT playhead and signal the UI thread to cycle the take
+                atomic_store_explicit(&loop_wrap_pending, true, memory_order_release);
+                atomic_store_explicit(&engine_is_paused, true, memory_order_release);
+            } else {
+                active_pos = l_start + (active_pos - l_end);
+                atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+                output_fade_remaining = 128;
+            }
         }
 
         float raw_bt_l = 0.0f;
         float raw_bt_r = 0.0f;
 
-        if (active && !paused) {
-            float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
-            float l0_gain = atomic_load_explicit(&master_tracks[0].gain, memory_order_relaxed);
+        int current_timebase = atomic_load_explicit(&timebase_track, memory_order_relaxed);
+        float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
 
-            if (current_speed == 1.0f && master_tracks[0].active_buffer) {
-                if (active_pos < pristine_frames) {
-                    raw_bt_l = master_tracks[0].active_buffer[active_pos * 2] * l0_gain;
-                    raw_bt_r = master_tracks[0].active_buffer[active_pos * 2 + 1] * l0_gain;
+        // Scale raw index by current speed to ensure overdubs sync with stretched timebase
+        size_t raw_pos = (size_t)(active_pos * current_speed);
+
+        if (active && !paused) {
+            float l0_gain = atomic_load_explicit(&master_tracks[current_timebase].gain, memory_order_relaxed);
+
+            if (current_speed == 1.0f && master_tracks[current_timebase].active_buffer) {
+                if (raw_pos < pristine_frames) {
+                    raw_bt_l = master_tracks[current_timebase].active_buffer[raw_pos * 2] * l0_gain;
+                    raw_bt_r = master_tracks[current_timebase].active_buffer[raw_pos * 2 + 1] * l0_gain;
                 }
             } else {
                 StereoFrame sf;
@@ -725,6 +913,37 @@ int process_audio(jack_nframes_t nframes, void *arg) {
         int layers = atomic_load_explicit(&active_track_count, memory_order_relaxed);
 
         bool any_solo_active = false;
+        for (int l = 0; l < MAX_TRACKS; l++) {
+            if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
+                any_solo_active = true;
+                break;
+            }
+        }
+
+        if (active && !paused && active_pos < backing_track_frames) {
+            bool base_audible = true;
+            if (any_solo_active && !atomic_load_explicit(&master_tracks[current_timebase].is_soloed, memory_order_relaxed)) base_audible = false;
+
+            if (!base_audible) {
+                raw_bt_l = 0.0f;
+                raw_bt_r = 0.0f;
+            }
+
+            for (int l = 0; l < layers && l < MAX_TRACKS; l++) {
+                if (l == current_timebase) continue;
+                if (!master_tracks[l].active_buffer) continue;
+
+                bool overdub_audible = true;
+                if (any_solo_active && !atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) overdub_audible = false;
+
+                if (overdub_audible && raw_pos < pristine_frames) {
+                    float l_gain = atomic_load_explicit(&master_tracks[l].gain, memory_order_relaxed);
+                    raw_bt_l += master_tracks[l].active_buffer[raw_pos * 2] * l_gain;
+                    raw_bt_r += master_tracks[l].active_buffer[raw_pos * 2 + 1] * l_gain;
+                }
+            }
+        }
+
         for (int l = 0; l < MAX_TRACKS; l++) {
             if (atomic_load_explicit(&master_tracks[l].is_soloed, memory_order_relaxed)) {
                 any_solo_active = true;
@@ -755,14 +974,11 @@ int process_audio(jack_nframes_t nframes, void *arg) {
             }
         }
 
-        // ---------------------------------------------------------
-        // REAL-TIME PLAYBACK DE-CLICKER
-        // Applies a 2.6ms (128 sample) V-fade perfectly straddling
-        // the loop boundary to mask zero-crossing waveform pops.
-        // ---------------------------------------------------------
         if (active && !paused && is_looping && l_end > l_start + 256) {
             float fade_mult = 1.0f;
-            if (active_pos >= l_end - 128) {
+            if (active_pos >= l_end) {
+                fade_mult = 0.0f;
+            } else if (active_pos >= l_end - 128) {
                 fade_mult = (float)(l_end - active_pos) / 128.0f;
             } else if (active_pos < l_start + 128) {
                 fade_mult = (float)(active_pos - l_start) / 128.0f;
@@ -774,11 +990,43 @@ int process_audio(jack_nframes_t nframes, void *arg) {
         float scaled_bt_l = raw_bt_l * current_bt_gain;
         float scaled_bt_r = raw_bt_r * current_bt_gain;
 
+        if (output_fade_remaining > 0) {
+            float fade_factor = (float)(128 - output_fade_remaining) / 128.0f;
+            scaled_bt_l *= fade_factor;
+            scaled_bt_r *= fade_factor;
+            output_fade_remaining--;
+        }
+
         if (fabsf(scaled_bt_l) > max_bt_l) max_bt_l = fabsf(scaled_bt_l);
         if (fabsf(scaled_bt_r) > max_bt_r) max_bt_r = fabsf(scaled_bt_r);
 
         out_1[i] = soft_clip(scaled_bt_l);
         out_2[i] = soft_clip(scaled_bt_r);
+
+        // Synthesize 1500Hz percussive metronome tick directly to hardware output
+        if (click_frames_remaining > 0) {
+            int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+            if (rate <= 0) rate = 48000;
+            int total_click_frames = (int)(rate * 0.05); // 50ms total window
+
+            // 1.5kHz tone cuts through clearly without being abrasive
+            double phase_inc = 2.0 * M_PI * 1500.0 / (double)rate;
+
+            // Create a steep cubic decay envelope (1.0 -> 0.0) for a natural "tick" sound
+            float env = (float)click_frames_remaining / (float)total_click_frames;
+            env = env * env * env;
+
+            // Apply envelope to the sine wave at -12dBFS (0.25 linear)
+            float click_samp = (float)(sin(click_phase) * 0.25f) * env;
+
+            click_phase += phase_inc;
+            if (click_phase >= 2.0 * M_PI) click_phase -= 2.0 * M_PI;
+
+            out_1[i] = soft_clip(out_1[i] + click_samp);
+            out_2[i] = soft_clip(out_2[i] + click_samp);
+
+            click_frames_remaining--;
+        }
 
         float raw_input_l = in_1[i];
         float raw_input_r = in_2[i];
@@ -788,22 +1036,45 @@ int process_audio(jack_nframes_t nframes, void *arg) {
         if (fabsf(scaled_input_l) > max_l) max_l = fabsf(scaled_input_l);
         if (fabsf(scaled_input_r) > max_r) max_r = fabsf(scaled_input_r);
 
-        if (recording && !paused && active_pos < pristine_frames) {
+        if (recording && !paused && raw_pos < pristine_frames) {
             int rec_track = atomic_load_explicit(&current_recording_track, memory_order_relaxed);
             if (rec_track >= 0 && rec_track < MAX_TRACKS && master_tracks[rec_track].active_buffer) {
-                master_tracks[rec_track].active_buffer[active_pos * 2] = scaled_input_l;
-                master_tracks[rec_track].active_buffer[active_pos * 2 + 1] = scaled_input_r;
+                master_tracks[rec_track].active_buffer[raw_pos * 2] = scaled_input_l;
+                master_tracks[rec_track].active_buffer[raw_pos * 2 + 1] = scaled_input_r;
             }
 
-            AudioFrame *frame = acquire_audio_frame(&audio_queue);
-            if (frame) {
-                frame->mix_l = soft_clip(scaled_bt_l + scaled_input_l);
-                frame->mix_r = soft_clip(scaled_bt_r + scaled_input_r);
-                frame->pts = (int64_t)(cycle_start_time + i);
-                commit_audio_frame(&audio_queue);
-                wake_encoder();
-            } else {
-                atomic_fetch_add_explicit(&rt_dropped_audio_frames, 1, memory_order_relaxed);
+            extern _Atomic bool video_is_armed;
+            if (atomic_load_explicit(&video_is_armed, memory_order_acquire)) {
+                AudioFrame *frame = acquire_audio_frame(&audio_queue);
+                if (frame) {
+                    // 1. MASTER MIX (Destructive routing for MKV Stream 0)
+                    frame->mix_l = soft_clip(scaled_bt_l + scaled_input_l);
+                    frame->mix_r = soft_clip(scaled_bt_r + scaled_input_r);
+
+                    // 2. ISOLATED TRACKS (Mapped exactly to UI Layers for MKV Streams 1-N)
+                    int active_count = atomic_load_explicit(&active_track_count, memory_order_relaxed);
+
+                    for (int t = 0; t < MAX_TRACKS; t++) {
+                        if (t == rec_track) {
+                            frame->tracks_l[t] = scaled_input_l;
+                            frame->tracks_r[t] = scaled_input_r;
+                        } else if (t < active_count && master_tracks[t].active_buffer && atomic_load_explicit(&master_tracks[t].has_audio, memory_order_relaxed)) {
+                            float l_gain = atomic_load_explicit(&master_tracks[t].gain, memory_order_relaxed);
+                            frame->tracks_l[t] = master_tracks[t].active_buffer[raw_pos * 2] * l_gain;
+                            frame->tracks_r[t] = master_tracks[t].active_buffer[raw_pos * 2 + 1] * l_gain;
+                        } else {
+                            frame->tracks_l[t] = 0.0f;
+                            frame->tracks_r[t] = 0.0f;
+                        }
+                    }
+
+                    frame->active_count = active_count;
+                    frame->pts = (int64_t)(cycle_start_time + i);
+                    commit_audio_frame(&audio_queue);
+                    pushed_audio = true;
+                } else {
+                    atomic_fetch_add_explicit(&rt_dropped_audio_frames, 1, memory_order_relaxed);
+                }
             }
         }
 
@@ -811,6 +1082,8 @@ int process_audio(jack_nframes_t nframes, void *arg) {
             active_pos++;
         }
     }
+
+    if (pushed_audio) wake_encoder();
 
     update_peak_decay(&vu_peak_input_l, max_l);
     update_peak_decay(&vu_peak_input_r, max_r);
@@ -851,15 +1124,31 @@ static const char** wait_for_jack_ports(jack_client_t *client, const char *targe
 }
 
 /**
+ * @brief Immediately severs JACK graph links to clear PipeWire GC locks during an unplug.
+ */
+void qjams_drop_connections(void) {
+    atomic_store_explicit(&audio_available, false, memory_order_release);
+    if (client && input_port_1 && input_port_2) {
+        jack_port_disconnect(client, input_port_1);
+        jack_port_disconnect(client, input_port_2);
+        jack_port_disconnect(client, output_port_1);
+        jack_port_disconnect(client, output_port_2);
+        log_and_notify(0, "[JACK DSP] Graph links severed to clear PipeWire GC locks.\n");
+    }
+}
+
+/**
  * @brief Connects physical USB hardware inputs to the internal QJams capture ports.
+ * Integrates ghost-pruning to bypass dead file descriptors during rapid hot-plugging.
  * @param target_audio_device The name identifier of the hardware to connect.
  * @return 0 on success, 2 if the ports could not be located or routed.
  */
 int patch_audio_ports(const char* target_audio_device) {
     if (!client) return 2;
 
-    printf("Attempting to patch capture device: %s\n", target_audio_device);
+    log_and_notify(0, "Attempting to patch capture device: %s\n", target_audio_device);
 
+    atomic_store_explicit(&audio_available, false, memory_order_release);
     jack_port_disconnect(client, input_port_1);
     jack_port_disconnect(client, input_port_2);
 
@@ -867,54 +1156,57 @@ int patch_audio_ports(const char* target_audio_device) {
     int connected = 0;
 
     if (ports) {
-        // Pass 1: Explicitly target USB 1 & 2 (AUX0 and AUX1 in PipeWire Pro Audio mode)
-        for (int i = 0; ports[i] != NULL && connected < 2; i++) {
-            if (strstr(ports[i], target_audio_device) != NULL) {
-                jack_port_t *dst = NULL;
-                if (strstr(ports[i], "AUX0") != NULL) dst = input_port_1;
-                else if (strstr(ports[i], "AUX1") != NULL) dst = input_port_2;
+        // SAFETY [Critical]: Ghost Pruning. Scan all ports for the highest suffix to bypass dead file descriptors.
+        const char *best_l = NULL;
+        const char *best_r = NULL;
+        int highest_l = -1, highest_r = -1;
 
-                if (dst && jack_connect(client, ports[i], jack_port_name(dst)) == 0) {
-                    printf("Connected Capture (USB 1/2): %s -> %s\n", ports[i], jack_port_name(dst));
-                    connected++;
+        char prefix[256];
+        snprintf(prefix, sizeof(prefix), "%s:", target_audio_device);
+        size_t prefix_len = strlen(prefix);
+
+        for (int i = 0; ports[i] != NULL; i++) {
+            if (strncmp(ports[i], prefix, prefix_len) == 0) {
+                const char *local_name = ports[i] + prefix_len;
+                int suffix = 0;
+                char base_name[256] = {0};
+                strncpy(base_name, local_name, sizeof(base_name) - 1);
+                char *dash = strrchr(base_name, '-');
+                if (dash && isdigit(*(dash + 1))) {
+                    suffix = atoi(dash + 1);
+                    *dash = '\0';
                 }
+
+                bool is_l = (strstr(base_name, "AUX0") || strstr(base_name, "FL") || strstr(base_name, "capture_1") || strstr(base_name, "left"));
+                bool is_r = (strstr(base_name, "AUX1") || strstr(base_name, "FR") || strstr(base_name, "capture_2") || strstr(base_name, "right"));
+
+                if (!is_l && !is_r) {
+                    if (!best_l || highest_l < suffix) is_l = true;
+                    else if (!best_r || highest_r < suffix) is_r = true;
+                }
+
+                if (is_l && suffix > highest_l) { highest_l = suffix; best_l = ports[i]; }
+                else if (is_r && suffix > highest_r) { highest_r = suffix; best_r = ports[i]; }
             }
         }
 
-        // Pass 2: The original strict filter (Targets standard non-AUX channels like FL/FR if present)
-        if (connected < 2) {
-            for (int i = 0; ports[i] != NULL && connected < 2; i++) {
-                if (strstr(ports[i], target_audio_device) != NULL && strstr(ports[i], "AUX") == NULL) {
-                    jack_port_t *dst = (connected == 0) ? input_port_1 : input_port_2;
-                    if (jack_connect(client, ports[i], jack_port_name(dst)) == 0) {
-                        printf("Connected Capture (Standard): %s -> %s\n", ports[i], jack_port_name(dst));
-                        connected++;
-                    }
-                }
-            }
+        if (best_l && jack_connect(client, best_l, jack_port_name(input_port_1)) == 0) {
+            log_and_notify(0, "[JACK DSP] Connected Capture L: %s -> %s\n", best_l, jack_port_name(input_port_1));
+            connected++;
         }
-
-        // Pass 3: Ultimate Fallback (Accept any matching port)
-        if (connected < 2) {
-            for (int i = 0; ports[i] != NULL && connected < 2; i++) {
-                if (strstr(ports[i], target_audio_device) != NULL) {
-                    jack_port_t *dst = (connected == 0) ? input_port_1 : input_port_2;
-                    // jack_connect fails safely if a connection already exists, preventing duplicates
-                    if (jack_connect(client, ports[i], jack_port_name(dst)) == 0) {
-                        printf("Connected Capture (Fallback): %s -> %s\n", ports[i], jack_port_name(dst));
-                        connected++;
-                    }
-                }
-            }
+        if (best_r && jack_connect(client, best_r, jack_port_name(input_port_2)) == 0) {
+            log_and_notify(0, "[JACK DSP] Connected Capture R: %s -> %s\n", best_r, jack_port_name(input_port_2));
+            connected++;
         }
         jack_free(ports);
     }
 
     if (connected < 2) {
-        printf("Warning: Failure mapping complete stereo ports for audio device '%s'.\n", target_audio_device);
+        log_and_notify(0, "Warning: Failure mapping complete stereo ports for audio device '%s'.\n", target_audio_device);
         return 2;
     }
 
+    atomic_store_explicit(&audio_available, true, memory_order_release);
     return 0;
 }
 
@@ -926,9 +1218,8 @@ int patch_audio_ports(const char* target_audio_device) {
 int patch_playback_ports(const char* target_playback_device) {
     if (!client) return 2;
 
-    printf("Attempting to patch playback device: %s\n", target_playback_device);
+    log_and_notify(0, "Attempting to patch playback device: %s\n", target_playback_device);
 
-    // Disconnect old routes just in case the user changed hardware live
     jack_port_disconnect(client, output_port_1);
     jack_port_disconnect(client, output_port_2);
 
@@ -936,20 +1227,53 @@ int patch_playback_ports(const char* target_playback_device) {
     int connected = 0;
 
     if (ports) {
-        for (int i = 0; ports[i] != NULL && connected < 2; i++) {
-            if (strstr(ports[i], target_playback_device) != NULL) {
-                jack_port_t *src = (connected == 0) ? output_port_1 : output_port_2;
-                if (jack_connect(client, jack_port_name(src), ports[i]) == 0) {
-                    printf("Connected Playback: %s -> %s\n", jack_port_name(src), ports[i]);
-                    connected++;
+        // SAFETY [Critical]: Ghost Pruning for Playback
+        const char *best_l = NULL;
+        const char *best_r = NULL;
+        int highest_l = -1, highest_r = -1;
+
+        char prefix[256];
+        snprintf(prefix, sizeof(prefix), "%s:", target_playback_device);
+        size_t prefix_len = strlen(prefix);
+
+        for (int i = 0; ports[i] != NULL; i++) {
+            if (strncmp(ports[i], prefix, prefix_len) == 0) {
+                const char *local_name = ports[i] + prefix_len;
+                int suffix = 0;
+                char base_name[256] = {0};
+                strncpy(base_name, local_name, sizeof(base_name) - 1);
+                char *dash = strrchr(base_name, '-');
+                if (dash && isdigit(*(dash + 1))) {
+                    suffix = atoi(dash + 1);
+                    *dash = '\0';
                 }
+
+                bool is_l = (strstr(base_name, "AUX0") || strstr(base_name, "FL") || strstr(base_name, "playback_1") || strstr(base_name, "left"));
+                bool is_r = (strstr(base_name, "AUX1") || strstr(base_name, "FR") || strstr(base_name, "playback_2") || strstr(base_name, "right"));
+
+                if (!is_l && !is_r) {
+                    if (!best_l || highest_l < suffix) is_l = true;
+                    else if (!best_r || highest_r < suffix) is_r = true;
+                }
+
+                if (is_l && suffix > highest_l) { highest_l = suffix; best_l = ports[i]; }
+                else if (is_r && suffix > highest_r) { highest_r = suffix; best_r = ports[i]; }
             }
+        }
+
+        if (best_l && jack_connect(client, jack_port_name(output_port_1), best_l) == 0) {
+            log_and_notify(0, "[JACK DSP] Connected Playback L: %s -> %s\n", jack_port_name(output_port_1), best_l);
+            connected++;
+        }
+        if (best_r && jack_connect(client, jack_port_name(output_port_2), best_r) == 0) {
+            log_and_notify(0, "[JACK DSP] Connected Playback R: %s -> %s\n", jack_port_name(output_port_2), best_r);
+            connected++;
         }
         jack_free(ports);
     }
 
     if (connected == 0) {
-        printf("Warning: Failure mapping ports for playback device '%s'.\n", target_playback_device);
+        log_and_notify(0, "Warning: Failure mapping ports for playback device '%s'.\n", target_playback_device);
         return 2;
     }
 
@@ -965,35 +1289,62 @@ int patch_playback_ports(const char* target_playback_device) {
 int jack_sample_rate_cb(jack_nframes_t nframes, void *arg) {
     (void)arg;
     atomic_store_explicit(&active_sample_rate, (int)nframes, memory_order_release);
-    printf("JACK sample rate dynamically updated to %d Hz\n", nframes);
+    log_and_notify(0, "JACK sample rate dynamically updated to %d Hz\n", nframes);
     return 0;
 }
 
-/**
- * @brief Callback triggered when the JACK server forcefully shuts down or disconnects the client.
- * @param arg Opaque pointer to user data (unused).
- * @return void
- */
-extern gboolean on_jack_shutdown_ui(gpointer data);
+static int event_pipe[2] = {-1, -1};
 
-void jack_shutdown(void *arg) {
-    (void)arg;
-    printf("JACK shutdown triggered. Attempting graceful UI halt...\n");
-    g_idle_add(on_jack_shutdown_ui, NULL);
+/**
+ * @brief Returns the read end file descriptor of the JACK event synchronization pipe.
+ * @return File descriptor integer, or -1 if uninitialized.
+ */
+int get_jack_event_fd(void) {
+    return event_pipe[0];
 }
 
-extern gboolean on_jack_port_registration_ui(gpointer data);
+/**
+ * @brief Callback triggered when the JACK server forcefully shuts down or disconnects.
+ * @param arg Opaque pointer to user data.
+ */
+void jack_shutdown(void *arg) {
+    (void)arg;
+    // SAFETY [Critical]: Lock-free async signal handler safely notifying the GTK thread via IPC.
+    // Absolutely no mutexes, memory allocations, or GTK calls are permitted here.
+    if (event_pipe[1] != -1) {
+        const uint8_t msg = 1;
+        (void)write(event_pipe[1], &msg, sizeof(msg));
+    }
+}
 
 /**
- * @brief Callback triggered when JACK detects a hardware port connection or disconnection.
- * @param port_id The ID of the port.
- * @param register_port Non-zero if registering, zero if unregistering.
- * @param arg Opaque user data.
- */
+* @brief Callback triggered when JACK detects a hardware port connection or disconnection.
+* Logs the specific hardware port name to the unified logger before alerting the UI.
+* @param port_id The ID of the port.
+* @param register_port Non-zero if registering, zero if unregistering.
+* @param arg Opaque user data.
+*/
 void jack_port_registration_cb(jack_port_id_t port_id, int register_port, void *arg) {
-    (void)port_id; (void)register_port; (void)arg;
-    // Run safely in the GTK main loop, bouncing out of JACK's notification thread
-    g_idle_add(on_jack_port_registration_ui, NULL);
+    (void)arg;
+
+    // Attempt to grab the exact name of the hardware that triggered the event
+    const char *port_name = "Unknown Port";
+    if (client) {
+        jack_port_t *port = jack_port_by_id(client, port_id);
+        if (port) {
+            port_name = jack_port_name(port);
+        }
+    }
+
+    // Log the specific event directly to QJams.log
+    log_and_notify(0, "[JACK EVENT] Hardware Port %s: %s\n",
+                   register_port ? "ADDED" : "REMOVED", port_name);
+
+    // SAFETY [Critical]: Strict lock-free IPC write, completely decoupled from GTK main loop overhead.
+    if (event_pipe[1] != -1) {
+        const uint8_t msg = register_port ? 2 : 3;
+        (void)write(event_pipe[1], &msg, sizeof(msg));
+    }
 }
 
 /**
@@ -1067,6 +1418,11 @@ int import_to_layer(const char* filepath, int track_idx) {
     }
 
     if (file) {
+        if (calculate_safe_history_capacity(sfinfo.frames, sfinfo.samplerate, jack_rate) == 0) {
+            sf_close(file);
+            return -2;
+        }
+
         raw_data = calloc(sfinfo.frames * sfinfo.channels, sizeof(float));
         if (!raw_data) {
             sf_close(file);
@@ -1077,8 +1433,9 @@ int import_to_layer(const char* filepath, int track_idx) {
     } else {
         int rate = 0, channels = 0;
         sf_count_t frames = 0;
-        if (load_audio_ffmpeg(filepath, &raw_data, &frames, &channels, &rate, NULL, NULL, jack_rate) != 0) {
-            return -1;
+        int ret = load_audio_ffmpeg(filepath, &raw_data, &frames, &channels, &rate, NULL, NULL, jack_rate);
+        if (ret != 0) {
+            return ret; // FIX: Propagate the actual error code (-2 for RAM, etc.)
         }
         sfinfo.frames = frames;
         sfinfo.channels = channels;
@@ -1145,15 +1502,20 @@ int import_to_layer(const char* filepath, int track_idx) {
         return -1;
     }
 
-    bool prev_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
+    current_transaction_id++;
+    push_undo_state(track_idx, current_transaction_id);
 
-    float *old_undo = master_tracks[track_idx].undo_buffer;
-    master_tracks[track_idx].undo_buffer = master_tracks[track_idx].active_buffer;
-    master_tracks[track_idx].active_buffer = new_layer_buf;
-    if (old_undo) safe_deferred_free(old_undo);
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    if (!atomic_load_explicit(&master_tracks[current_timebase].has_audio, memory_order_acquire)) {
+        atomic_store_explicit(&timebase_track, track_idx, memory_order_release);
+        current_timebase = track_idx;
+    }
 
-    if (track_idx == 0 && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, new_layer_buf, pristine_frames * 2 * sizeof(float));
+    memcpy(master_tracks[track_idx].active_buffer, new_layer_buf, pristine_frames * 2 * sizeof(float));
+    free(new_layer_buf);
+
+    if (track_idx == current_timebase && pristine_bt_buf) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -1164,10 +1526,6 @@ int import_to_layer(const char* filepath, int track_idx) {
     }
 
     atomic_store_explicit(&master_tracks[track_idx].has_audio, true, memory_order_release);
-    atomic_store_explicit(&master_tracks[track_idx].is_soloed, true, memory_order_release);
-
-    atomic_store_explicit(&master_tracks[track_idx].undo_has_audio, prev_audio, memory_order_release);
-    atomic_store_explicit(&master_tracks[track_idx].has_undo, true, memory_order_release);
 
     // Auto-focus the newly imported track into the bitmask so Ctrl+Z works immediately
     atomic_store_explicit(&current_recording_track, track_idx, memory_order_release);
@@ -1177,7 +1535,7 @@ int import_to_layer(const char* filepath, int track_idx) {
 
     // TELEMETRY: Safely emit the decode summary
     char *base_name = g_path_get_basename(filepath);
-    printf("[IO-DECODE] Loaded: \"%s\" | Track %d | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=%s\n",
+    log_and_notify(0, "[IO-DECODE] Loaded: \"%s\" | Track %d | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=%s\n",
            base_name, track_idx, sfinfo.samplerate, jack_rate, ratio, resampled_frames, truncated ? "TRUNCATED" : "OK");
     g_free(base_name);
 
@@ -1194,10 +1552,9 @@ int import_to_layer(const char* filepath, int track_idx) {
 int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     if (!client_ptr) return -1;
 
-    // --- RT-SAFE POINTER STEALING ---
     float* stolen_pristine = NULL;
     float* stolen_active[MAX_TRACKS] = {NULL};
-    float* stolen_undo[MAX_TRACKS] = {NULL};
+    UndoLedger stolen_ledger = {0};
     RubberBandState stolen_rb = NULL;
 
     if (await_rt_thread_detach()) {
@@ -1205,25 +1562,31 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
         pristine_bt_buf = NULL;
         for (int i = 0; i < MAX_TRACKS; i++) {
             stolen_active[i] = master_tracks[i].active_buffer;
-            stolen_undo[i] = master_tracks[i].undo_buffer;
             master_tracks[i].active_buffer = NULL;
-            master_tracks[i].undo_buffer = NULL;
         }
+        stolen_ledger = global_undo_ledger;
+        global_undo_ledger.states = NULL;
+        global_undo_ledger.max_capacity = 0;
         stolen_rb = rt_rb_state;
         rt_rb_state = NULL;
+
+        size_t old_frames = pristine_frames;
         pristine_frames = 0;
         atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
         resume_rt_thread();
+
+        // CRITICAL PATCH: Synchronously free memory in the background thread.
+        // This guarantees RAM is physically unmapped before the new capacity check.
+        if (stolen_pristine) free_audio_buffer(stolen_pristine, old_frames);
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (stolen_active[i]) free_audio_buffer(stolen_active[i], old_frames);
+        }
+        free_detached_ledger_sync(&stolen_ledger, old_frames);
     } else {
         return -1;
     }
 
-    if (stolen_pristine) safe_deferred_free(stolen_pristine);
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        if (stolen_active[i]) safe_deferred_free(stolen_active[i]);
-        if (stolen_undo[i]) safe_deferred_free(stolen_undo[i]);
-    }
-    if (stolen_rb) safe_deferred_rb_free(stolen_rb);
+    if (stolen_rb) rubberband_delete(stolen_rb);
 
     SF_INFO sfinfo = {0};
     float* raw_data = NULL;
@@ -1238,7 +1601,7 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     }
 
     if (file) {
-        if (!is_ram_allocation_safe(sfinfo.frames, sfinfo.samplerate, jack_rate)) {
+        if (calculate_safe_history_capacity(sfinfo.frames, sfinfo.samplerate, jack_rate) == 0) {
             sf_close(file);
             return -2;
         }
@@ -1271,14 +1634,21 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     double ratio = (double)jack_rate / (double)sfinfo.samplerate;
     size_t new_pristine_frames = (size_t)(sfinfo.frames * ratio);
 
-    float* new_pristine_buf = calloc(new_pristine_frames * 2, sizeof(float));
-    float* src_out = calloc(new_pristine_frames * 2, sizeof(float));
-    float* src_out2 = raw_data2 ? calloc(new_pristine_frames * 2, sizeof(float)) : NULL;
+    int capacity = calculate_safe_history_capacity(new_pristine_frames, jack_rate, jack_rate);
+    if (capacity == 0) {
+        if (raw_data) free(raw_data);
+        if (raw_data2) free(raw_data2);
+        return -2;
+    }
+
+    float* new_pristine_buf = alloc_audio_buffer(new_pristine_frames);
+    float* src_out = alloc_audio_buffer(new_pristine_frames);
+    float* src_out2 = raw_data2 ? alloc_audio_buffer(new_pristine_frames) : NULL;
 
     if (!new_pristine_buf || !src_out || (raw_data2 && !src_out2)) {
-        if (new_pristine_buf) free(new_pristine_buf);
-        if (src_out) free(src_out);
-        if (src_out2) free(src_out2);
+        if (new_pristine_buf) free_audio_buffer(new_pristine_buf, new_pristine_frames);
+        if (src_out) free_audio_buffer(src_out, new_pristine_frames);
+        if (src_out2) free_audio_buffer(src_out2, new_pristine_frames);
         if (raw_data) free(raw_data);
         if (raw_data2) free(raw_data2);
         return -2;
@@ -1314,19 +1684,46 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     RubberBandState new_rb_state = rubberband_new(jack_rate, 2, rb_options, 1.0, 1.0);
 
     float* temp_active[MAX_TRACKS] = {NULL};
-    float* temp_undo[MAX_TRACKS] = {NULL};
-
     for (int i = 0; i < MAX_TRACKS; i++) {
-        temp_active[i] = calloc(new_pristine_frames * 2, sizeof(float));
-        temp_undo[i] = calloc(new_pristine_frames * 2, sizeof(float));
-        if (!temp_active[i] || !temp_undo[i]) {
+        temp_active[i] = alloc_audio_buffer(new_pristine_frames);
+        if (!temp_active[i]) {
             for (int j = 0; j <= i; j++) {
-                if (temp_active[j]) free(temp_active[j]);
-                if (temp_undo[j]) free(temp_undo[j]);
+                if (temp_active[j]) free_audio_buffer(temp_active[j], new_pristine_frames);
             }
-            free(new_pristine_buf);
-            if (src_out) free(src_out);
-            if (src_out2) free(src_out2);
+            free_audio_buffer(new_pristine_buf, new_pristine_frames);
+            if (src_out) free_audio_buffer(src_out, new_pristine_frames);
+            if (src_out2) free_audio_buffer(src_out2, new_pristine_frames);
+            if (raw_data) free(raw_data);
+            if (raw_data2) free(raw_data2);
+            rubberband_delete(new_rb_state);
+            return -2;
+        }
+    }
+
+    UndoState *temp_states = calloc(capacity, sizeof(UndoState));
+    if (!temp_states) {
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(temp_active[i], new_pristine_frames);
+        free_audio_buffer(new_pristine_buf, new_pristine_frames);
+        if (src_out) free_audio_buffer(src_out, new_pristine_frames);
+        if (src_out2) free_audio_buffer(src_out2, new_pristine_frames);
+        if (raw_data) free(raw_data);
+        if (raw_data2) free(raw_data2);
+        rubberband_delete(new_rb_state);
+        return -2;
+    }
+
+    for (int i = 0; i < capacity; i++) {
+        temp_states[i].buffer = alloc_audio_buffer(new_pristine_frames);
+        temp_states[i].track_idx = -1;
+        temp_states[i].has_audio = false;
+
+        if (!temp_states[i].buffer) {
+            for (int j = 0; j <= i; j++) free_audio_buffer(temp_states[j].buffer, new_pristine_frames);
+            free(temp_states);
+            for (int j = 0; j < MAX_TRACKS; j++) free_audio_buffer(temp_active[j], new_pristine_frames);
+            free_audio_buffer(new_pristine_buf, new_pristine_frames);
+            if (src_out) free_audio_buffer(src_out, new_pristine_frames);
+            if (src_out2) free_audio_buffer(src_out2, new_pristine_frames);
             if (raw_data) free(raw_data);
             if (raw_data2) free(raw_data2);
             rubberband_delete(new_rb_state);
@@ -1338,23 +1735,22 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
         temp_active[0][i] = src_out[i];
     }
 
-    free(src_out);
+    free_audio_buffer(src_out, new_pristine_frames);
     free(raw_data);
 
     if (src_out2) {
         for (size_t i = 0; i < new_pristine_frames * 2; i++) {
             temp_active[1][i] = src_out2[i];
         }
-        free(src_out2);
+        free_audio_buffer(src_out2, new_pristine_frames);
     }
     if (raw_data2) free(raw_data2);
 
     if (!await_rt_thread_detach()) {
-        for (int i = 0; i < MAX_TRACKS; i++) {
-            if (temp_active[i]) free(temp_active[i]);
-            if (temp_undo[i]) free(temp_undo[i]);
-        }
-        free(new_pristine_buf);
+        for (int i = 0; i < capacity; i++) free_audio_buffer(temp_states[i].buffer, new_pristine_frames);
+        free(temp_states);
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(temp_active[i], new_pristine_frames);
+        free_audio_buffer(new_pristine_buf, new_pristine_frames);
         rubberband_delete(new_rb_state);
         return -1;
     }
@@ -1362,8 +1758,14 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     pristine_bt_buf = new_pristine_buf;
     for (int i = 0; i < MAX_TRACKS; i++) {
         master_tracks[i].active_buffer = temp_active[i];
-        master_tracks[i].undo_buffer = temp_undo[i];
     }
+
+    global_undo_ledger.states = temp_states;
+    global_undo_ledger.max_capacity = capacity;
+    global_undo_ledger.head = 0;
+    global_undo_ledger.tail = 0;
+    global_undo_ledger.count = 0;
+    atomic_store_explicit(&global_undo_ledger.is_dirty, false, memory_order_release);
 
     rt_rb_state = new_rb_state;
     pristine_read_pos = 0;
@@ -1378,10 +1780,8 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     atomic_store_explicit(&current_recording_track, 1, memory_order_release);
 
     atomic_store_explicit(&master_tracks[0].has_audio, true, memory_order_release);
-    atomic_store_explicit(&master_tracks[0].is_soloed, true, memory_order_release);
     if (master_tracks[1].active_buffer && atomic_load_explicit(&master_tracks[1].has_audio, memory_order_acquire) == false) {
         atomic_store_explicit(&master_tracks[1].has_audio, true, memory_order_release);
-        atomic_store_explicit(&master_tracks[1].is_soloed, true, memory_order_release);
     }
 
     resume_rt_thread();
@@ -1389,9 +1789,8 @@ int load_backing_track(const char* filepath, jack_client_t* client_ptr) {
     float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
     set_playback_speed(current_speed);
 
-    // TELEMETRY: Safely emit the decode summary
     char *base_name = g_path_get_basename(filepath);
-    printf("[IO-DECODE] Base Track Loaded: \"%s\" | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=OK\n",
+    log_and_notify(0, "[IO-DECODE] Base Track Loaded: \"%s\" | %dHz -> %dHz (Ratio=%.3f) | Frames=%zu | Status=OK\n",
            base_name, sfinfo.samplerate, jack_rate, ratio, new_pristine_frames);
     g_free(base_name);
 
@@ -1409,16 +1808,69 @@ int init_exact_loop_canvas(size_t exact_frames) {
     jack_nframes_t jack_rate = jack_get_sample_rate(client);
     atomic_store_explicit(&active_sample_rate, (int)jack_rate, memory_order_release);
 
+    int capacity = calculate_safe_history_capacity(exact_frames, jack_rate, jack_rate);
+
+    // CRITICAL PATCH: Destructive Teardown Fallback
+    // If the new canvas hits the OS memory floor because the old bloated canvas
+    // is still holding the RAM, forcefully nuke the old canvas and retry.
+    if (capacity == 0) {
+        if (!await_rt_thread_detach()) return -1;
+
+        float* stolen_pristine = pristine_bt_buf;
+        pristine_bt_buf = NULL;
+        float* stolen_active[MAX_TRACKS] = {NULL};
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            stolen_active[i] = master_tracks[i].active_buffer;
+            master_tracks[i].active_buffer = NULL;
+            atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
+            atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
+        }
+
+        UndoLedger stolen_ledger = global_undo_ledger;
+        global_undo_ledger.states = NULL;
+        global_undo_ledger.max_capacity = 0;
+        global_undo_ledger.head = 0;
+        global_undo_ledger.tail = 0;
+        global_undo_ledger.count = 0;
+
+        size_t old_frames = pristine_frames;
+        pristine_frames = 0;
+        atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
+        atomic_store_explicit(&playback_pos, 0, memory_order_release);
+
+        resume_rt_thread();
+
+        // Synchronously return RAM to OS
+        if (stolen_pristine) free_audio_buffer(stolen_pristine, old_frames);
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (stolen_active[i]) free_audio_buffer(stolen_active[i], old_frames);
+        }
+        free_detached_ledger_sync(&stolen_ledger, old_frames);
+
+        // Retry calculation now that RAM is physically zeroed
+        capacity = calculate_safe_history_capacity(exact_frames, jack_rate, jack_rate);
+        if (capacity == 0) return -2; // Legitimately out of RAM for this requested duration
+    }
+
     if (exact_frames == pristine_frames && pristine_bt_buf) {
         if (!await_rt_thread_detach()) return -1;
         memset(pristine_bt_buf, 0, exact_frames * 2 * sizeof(float));
         for (int i = 0; i < MAX_TRACKS; i++) {
             if (master_tracks[i].active_buffer) memset(master_tracks[i].active_buffer, 0, exact_frames * 2 * sizeof(float));
-            if (master_tracks[i].undo_buffer) memset(master_tracks[i].undo_buffer, 0, exact_frames * 2 * sizeof(float));
             atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
-            atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
             atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
         }
+
+        global_undo_ledger.head = 0;
+        global_undo_ledger.tail = 0;
+        global_undo_ledger.count = 0;
+        if (global_undo_ledger.states) {
+            for (int i = 0; i < global_undo_ledger.max_capacity; i++) {
+                global_undo_ledger.states[i].has_audio = false;
+                global_undo_ledger.states[i].track_idx = -1;
+            }
+        }
+
         if (rt_rb_state) rubberband_reset(rt_rb_state);
         pristine_read_pos = 0;
         atomic_store_explicit(&playback_pos, 0, memory_order_release);
@@ -1433,70 +1885,94 @@ int init_exact_loop_canvas(size_t exact_frames) {
 
     float* stolen_pristine = NULL;
     float* stolen_active[MAX_TRACKS] = {NULL};
-    float* stolen_undo[MAX_TRACKS] = {NULL};
+    UndoLedger stolen_ledger = {0};
 
     if (!await_rt_thread_detach()) return -1;
     stolen_pristine = pristine_bt_buf;
     pristine_bt_buf = NULL;
     for (int i = 0; i < MAX_TRACKS; i++) {
         stolen_active[i] = master_tracks[i].active_buffer;
-        stolen_undo[i] = master_tracks[i].undo_buffer;
         master_tracks[i].active_buffer = NULL;
-        master_tracks[i].undo_buffer = NULL;
     }
+
+    stolen_ledger = global_undo_ledger;
+    global_undo_ledger.states = NULL;
+    global_undo_ledger.max_capacity = 0;
+
+    size_t old_frames = pristine_frames;
     pristine_frames = 0;
     atomic_store_explicit(&backing_track_frames, 0, memory_order_release);
     resume_rt_thread();
 
-    if (stolen_pristine) safe_deferred_free(stolen_pristine);
+    if (stolen_pristine) safe_deferred_locked_free(stolen_pristine, old_frames);
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (stolen_active[i]) safe_deferred_free(stolen_active[i]);
-        if (stolen_undo[i]) safe_deferred_free(stolen_undo[i]);
+        if (stolen_active[i]) safe_deferred_locked_free(stolen_active[i], old_frames);
     }
-
-    if (!is_ram_allocation_safe(exact_frames, jack_rate, jack_rate)) return -2;
+    free_detached_ledger(&stolen_ledger, old_frames);
 
     RubberBandState new_rb_state = rt_rb_state;
     if (!new_rb_state) {
         int rb_options = RubberBandOptionProcessRealTime | RubberBandOptionEngineFiner | RubberBandOptionPitchHighQuality | RubberBandOptionPhaseIndependent | RubberBandOptionWindowLong | RubberBandOptionPitchHighConsistency;
+
         new_rb_state = rubberband_new(jack_rate, 2, rb_options, 1.0, 1.0);
     }
 
-    float *temp_pristine = calloc(exact_frames * 2, sizeof(float));
+    float *temp_pristine = alloc_audio_buffer(exact_frames);
     if (!temp_pristine) return -2;
 
     float *temp_active[MAX_TRACKS] = {NULL};
-    float *temp_undo[MAX_TRACKS] = {NULL};
     for (int i = 0; i < MAX_TRACKS; i++) {
-        temp_active[i] = calloc(exact_frames * 2, sizeof(float));
-        temp_undo[i] = calloc(exact_frames * 2, sizeof(float));
-        if (!temp_active[i] || !temp_undo[i]) {
-            free(temp_pristine);
+        temp_active[i] = alloc_audio_buffer(exact_frames);
+        if (!temp_active[i]) {
+            free_audio_buffer(temp_pristine, exact_frames);
             for (int j = 0; j <= i; j++) {
-                if (temp_active[j]) free(temp_active[j]);
-                if (temp_undo[j]) free(temp_undo[j]);
+                if (temp_active[j]) free_audio_buffer(temp_active[j], exact_frames);
             }
             return -2;
         }
     }
 
-    if (!await_rt_thread_detach()) {
-        free(temp_pristine);
-        for (int i = 0; i < MAX_TRACKS; i++) {
-            free(temp_active[i]);
-            free(temp_undo[i]);
+    UndoState *temp_states = calloc(capacity, sizeof(UndoState));
+    if (!temp_states) {
+        free_audio_buffer(temp_pristine, exact_frames);
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(temp_active[i], exact_frames);
+        return -2;
+    }
+
+    for (int i = 0; i < capacity; i++) {
+        temp_states[i].buffer = alloc_audio_buffer(exact_frames);
+        temp_states[i].track_idx = -1;
+        temp_states[i].has_audio = false;
+
+        if (!temp_states[i].buffer) {
+            for (int j = 0; j <= i; j++) free_audio_buffer(temp_states[j].buffer, exact_frames);
+            free(temp_states);
+            free_audio_buffer(temp_pristine, exact_frames);
+            for (int j = 0; j < MAX_TRACKS; j++) free_audio_buffer(temp_active[j], exact_frames);
+            return -2;
         }
+    }
+
+    if (!await_rt_thread_detach()) {
+        for (int i = 0; i < capacity; i++) free_audio_buffer(temp_states[i].buffer, exact_frames);
+        free(temp_states);
+        free_audio_buffer(temp_pristine, exact_frames);
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(temp_active[i], exact_frames);
         return -1;
     }
 
     pristine_bt_buf = temp_pristine;
     for (int i = 0; i < MAX_TRACKS; i++) {
         master_tracks[i].active_buffer = temp_active[i];
-        master_tracks[i].undo_buffer = temp_undo[i];
         atomic_store_explicit(&master_tracks[i].has_audio, false, memory_order_release);
-        atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
         atomic_store_explicit(&master_tracks[i].is_soloed, false, memory_order_release);
     }
+
+    global_undo_ledger.states = temp_states;
+    global_undo_ledger.max_capacity = capacity;
+    global_undo_ledger.head = 0;
+    global_undo_ledger.tail = 0;
+    global_undo_ledger.count = 0;
 
     rt_rb_state = new_rb_state;
     if (rt_rb_state) rubberband_reset(rt_rb_state);
@@ -1541,53 +2017,101 @@ int resize_loop_canvas_seconds(int duration_seconds) {
     if (jack_rate <= 0) jack_rate = 48000;
 
     size_t new_exact_frames = (size_t)jack_rate * duration_seconds;
-    if (new_exact_frames <= pristine_frames) return 0;
 
-    if (!is_ram_allocation_safe(new_exact_frames, jack_rate, jack_rate)) return -2;
+    // ALLOW SHRINKING: Only abort if the canvas is already the exact requested size
+    if (new_exact_frames == pristine_frames) return 0;
 
-    size_t frames_to_copy = pristine_frames;
+    int new_capacity = calculate_safe_history_capacity(new_exact_frames, jack_rate, jack_rate);
+    if (new_capacity == 0) return -2;
 
+    // CLAMP COPY SIZE: Prevents out-of-bounds reads when shrinking the canvas
+    size_t frames_to_copy = (new_exact_frames < pristine_frames) ? new_exact_frames : pristine_frames;
+
+    float *new_active[MAX_TRACKS] = {NULL};
     for (int i = 0; i < MAX_TRACKS; i++) {
-        float *new_active = calloc(new_exact_frames * 2, sizeof(float));
-        float *new_undo = calloc(new_exact_frames * 2, sizeof(float));
-
-        if (!new_active || !new_undo) {
-            if (new_active) free(new_active);
-            if (new_undo) free(new_undo);
+        new_active[i] = alloc_audio_buffer(new_exact_frames);
+        if (!new_active[i]) {
+            for (int j = 0; j < i; j++) free_audio_buffer(new_active[j], new_exact_frames);
             return -2;
         }
-
-        if (!await_rt_thread_detach()) {
-            free(new_active);
-            free(new_undo);
-            return -1;
-        }
-
-        if (master_tracks[i].active_buffer) {
-            memcpy(new_active, master_tracks[i].active_buffer, frames_to_copy * 2 * sizeof(float));
-            safe_deferred_free(master_tracks[i].active_buffer);
-        }
-        if (master_tracks[i].undo_buffer) {
-            memcpy(new_undo, master_tracks[i].undo_buffer, frames_to_copy * 2 * sizeof(float));
-            safe_deferred_free(master_tracks[i].undo_buffer);
-        }
-
-        master_tracks[i].active_buffer = new_active;
-        master_tracks[i].undo_buffer = new_undo;
-        resume_rt_thread();
     }
 
-    float *new_pristine = calloc(new_exact_frames * 2, sizeof(float));
-    if (!new_pristine) return -2;
+    UndoState *new_states = calloc(new_capacity, sizeof(UndoState));
+    if (!new_states) {
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(new_active[i], new_exact_frames);
+        return -2;
+    }
+
+    for (int i = 0; i < new_capacity; i++) {
+        new_states[i].buffer = alloc_audio_buffer(new_exact_frames);
+        new_states[i].track_idx = -1;
+        new_states[i].has_audio = false;
+        if (!new_states[i].buffer) {
+            for (int j = 0; j <= i; j++) free_audio_buffer(new_states[j].buffer, new_exact_frames);
+            free(new_states);
+            for (int j = 0; j < MAX_TRACKS; j++) free_audio_buffer(new_active[j], new_exact_frames);
+            return -2;
+        }
+    }
+
+    float *new_pristine = alloc_audio_buffer(new_exact_frames);
+    if (!new_pristine) {
+        for (int i = 0; i < new_capacity; i++) free_audio_buffer(new_states[i].buffer, new_exact_frames);
+        free(new_states);
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(new_active[i], new_exact_frames);
+        return -2;
+    }
+
+    int target_count = global_undo_ledger.count;
+    int shrink_diff = target_count - new_capacity;
+    if (shrink_diff > 0) target_count = new_capacity;
+
+    int new_head = global_undo_ledger.head - (shrink_diff > 0 ? shrink_diff : 0);
+    if (new_head < 0) new_head = 0;
 
     if (!await_rt_thread_detach()) {
-        free(new_pristine);
+        for (int i = 0; i < new_capacity; i++) free_audio_buffer(new_states[i].buffer, new_exact_frames);
+        free(new_states);
+        for (int i = 0; i < MAX_TRACKS; i++) free_audio_buffer(new_active[i], new_exact_frames);
+        free_audio_buffer(new_pristine, new_exact_frames);
         return -1;
+    }
+
+    UndoLedger old_ledger = global_undo_ledger;
+
+    for (int i = 0; i < target_count; i++) {
+        int old_idx = (global_undo_ledger.tail + (shrink_diff > 0 ? shrink_diff : 0) + i) % global_undo_ledger.max_capacity;
+        if (global_undo_ledger.states[old_idx].buffer) {
+            memcpy(new_states[i].buffer, global_undo_ledger.states[old_idx].buffer, frames_to_copy * 2 * sizeof(float));
+        }
+        new_states[i].track_idx = global_undo_ledger.states[old_idx].track_idx;
+        new_states[i].has_audio = global_undo_ledger.states[old_idx].has_audio;
+        new_states[i].transaction_id = global_undo_ledger.states[old_idx].transaction_id;
+        new_states[i].canvas_frames = global_undo_ledger.states[old_idx].canvas_frames;
+        new_states[i].v_start = global_undo_ledger.states[old_idx].v_start;
+        new_states[i].v_end = global_undo_ledger.states[old_idx].v_end;
+        new_states[i].gain = global_undo_ledger.states[old_idx].gain;
+        new_states[i].is_soloed = global_undo_ledger.states[old_idx].is_soloed;
+        strncpy(new_states[i].name, global_undo_ledger.states[old_idx].name, 64);
+    }
+
+    global_undo_ledger.states = new_states;
+    global_undo_ledger.max_capacity = new_capacity;
+    global_undo_ledger.head = new_head;
+    global_undo_ledger.tail = 0;
+    global_undo_ledger.count = target_count;
+
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (master_tracks[i].active_buffer) {
+            memcpy(new_active[i], master_tracks[i].active_buffer, frames_to_copy * 2 * sizeof(float));
+            safe_deferred_locked_free(master_tracks[i].active_buffer, frames_to_copy);
+        }
+        master_tracks[i].active_buffer = new_active[i];
     }
 
     if (pristine_bt_buf) {
         memcpy(new_pristine, pristine_bt_buf, frames_to_copy * 2 * sizeof(float));
-        safe_deferred_free(pristine_bt_buf);
+        safe_deferred_locked_free(pristine_bt_buf, frames_to_copy);
     }
     pristine_bt_buf = new_pristine;
 
@@ -1603,6 +2127,8 @@ int resize_loop_canvas_seconds(int duration_seconds) {
     atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
 
     resume_rt_thread();
+    free_detached_ledger(&old_ledger, frames_to_copy);
+
     return 0;
 }
 
@@ -1627,7 +2153,83 @@ void set_bt_gain(float multiplier) {
 void set_multitrack_layer_gain(int track_idx, float multiplier) {
     if (track_idx >= 0 && track_idx < MAX_TRACKS) {
         atomic_store_explicit(&master_tracks[track_idx].gain, multiplier, memory_order_relaxed);
+        mark_session_dirty();
     }
+}
+
+void delete_multitrack_layer(int track_idx) {
+    if (track_idx < 0 || track_idx >= MAX_TRACKS) return;
+
+    bool has_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
+
+    // FAST-PATH: If the track is already empty, just reset metadata and bump focus up.
+    // Bypasses the Undo ledger and RT thread lock entirely.
+    if (!has_audio) {
+        atomic_store_explicit(&master_tracks[track_idx].gain, 1.0f, memory_order_release);
+        atomic_store_explicit(&master_tracks[track_idx].is_soloed, false, memory_order_release);
+
+        char default_name[64];
+        snprintf(default_name, sizeof(default_name), "Track %d", track_idx + 1);
+        extern void set_multitrack_track_name(int, const char*);
+        set_multitrack_track_name(track_idx, default_name);
+
+        int new_focus = (track_idx > 0) ? track_idx - 1 : 0;
+        atomic_store_explicit(&current_recording_track, new_focus, memory_order_release);
+        atomic_store_explicit(&selected_tracks_mask, (1 << new_focus), memory_order_release);
+        return;
+    }
+
+    if (!await_rt_thread_detach()) return;
+
+    current_transaction_id++;
+
+    // 1. Backup only the single targeted track
+    push_undo_state(track_idx, current_transaction_id);
+
+    // ... [Rest of the existing deletion logic follows below] ...
+
+    // 2. Wipe the audio buffer in-place
+    if (master_tracks[track_idx].active_buffer) {
+        memset(master_tracks[track_idx].active_buffer, 0, pristine_frames * 2 * sizeof(float));
+    }
+
+    // 3. Reset metadata to defaults
+    atomic_store_explicit(&master_tracks[track_idx].gain, 1.0f, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].is_soloed, false, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
+
+    char default_name[64];
+    snprintf(default_name, sizeof(default_name), "Track %d", track_idx + 1);
+    extern void set_multitrack_track_name(int, const char*);
+    set_multitrack_track_name(track_idx, default_name);
+
+    // 4. Safely flush the time-stretcher if the timebase track was wiped
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    if (current_timebase == track_idx && pristine_bt_buf && master_tracks[track_idx].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[track_idx].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+
+    // 5. Shift UI focus UP by one row (bounded at 0)
+    int new_focus = (track_idx > 0) ? track_idx - 1 : 0;
+    atomic_store_explicit(&current_recording_track, new_focus, memory_order_release);
+    atomic_store_explicit(&selected_tracks_mask, (1 << new_focus), memory_order_release);
+
+    // 6. Recalculate the absolute ceiling for the engine loop
+    int highest_active = 0;
+    for (int i = MAX_TRACKS - 1; i >= 0; i--) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) {
+            highest_active = i;
+            break;
+        }
+    }
+
+    int new_active_count = highest_active + 1;
+    if (new_focus >= new_active_count) new_active_count = new_focus + 1;
+    atomic_store_explicit(&active_track_count, new_active_count, memory_order_release);
+
+    resume_rt_thread();
 }
 
 /**
@@ -1648,6 +2250,7 @@ void seek_backing_track(double fraction) {
 void set_playback_speed(float speed) {
     atomic_store_explicit(&speed_target, speed, memory_order_relaxed);
     atomic_store_explicit(&speed_change_flag, true, memory_order_release);
+    mark_session_dirty();
 }
 
 /**
@@ -1671,6 +2274,7 @@ void set_loop_points(double start_frac, double end_frac) {
         atomic_store_explicit(&loop_start_frame, start, memory_order_relaxed);
         atomic_store_explicit(&loop_end_frame, end, memory_order_relaxed);
         atomic_store_explicit(&loop_active, true, memory_order_release);
+        mark_session_dirty();
     }
 }
 
@@ -1682,6 +2286,7 @@ void clear_loop_points(void) {
     atomic_store_explicit(&loop_active, false, memory_order_release);
     atomic_store_explicit(&loop_start_frame, 0, memory_order_relaxed);
     atomic_store_explicit(&loop_end_frame, 0, memory_order_relaxed);
+    mark_session_dirty();
 }
 
 void multitrack_next_track(void) {
@@ -1741,6 +2346,14 @@ int init_audio_engine(size_t queue_capacity, float init_input_gain, jack_client_
     client = existing_client;
     input_gain = init_input_gain;
 
+    // SAFETY [Low]: Initialize POSIX non-blocking IPC pipe for GTK event loop sync.
+    if (event_pipe[0] == -1) {
+        if (pipe(event_pipe) == 0) {
+            fcntl(event_pipe[0], F_SETFL, fcntl(event_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+            fcntl(event_pipe[1], F_SETFL, fcntl(event_pipe[1], F_GETFL, 0) | O_NONBLOCK);
+        }
+    }
+
     // Immediately query the active hardware sample rate and register the dynamic callback
     jack_nframes_t current_rate = jack_get_sample_rate(client);
     atomic_store_explicit(&active_sample_rate, (int)current_rate, memory_order_release);
@@ -1766,20 +2379,59 @@ int init_audio_engine(size_t queue_capacity, float init_input_gain, jack_client_
     output_port_2 = jack_port_register(client, "playback_2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
 
     if (jack_activate(client)) {
-        printf("Cannot activate JACK client\n");
+        log_and_notify(0, "Cannot activate JACK client\n");
         return 1;
     }
 
-    printf("Audio Engine Live: CachyOS RT thread active.\n");
+    log_and_notify(0, "Audio Engine Live: CachyOS RT thread active.\n");
 
     patch_playback_ports(target_playback_device);
     return patch_audio_ports(target_audio_device);
 }
 
 /**
-* @brief Closes the JACK client and frees all allocated DSP buffers, queues, and states.
-* @return void
-*/
+ * @brief Safely reboots the JACK client mid-session without destroying memory canvases or lock-free queues.
+ * @return 0 on success, -1 on failure.
+ */
+int reboot_audio_engine(const char* target_audio_device, const char* target_playback_device, float input_gain_multiplier) {
+    if (client) {
+        jack_deactivate(client);
+        jack_client_close(client);
+        client = NULL;
+    }
+
+    jack_status_t status;
+    client = jack_client_open("QJams_Engine", JackNullOption, &status);
+    if (!client) return -1;
+
+    input_gain = input_gain_multiplier;
+    jack_nframes_t current_rate = jack_get_sample_rate(client);
+    atomic_store_explicit(&active_sample_rate, (int)current_rate, memory_order_release);
+
+    jack_set_sample_rate_callback(client, jack_sample_rate_cb, 0);
+    jack_set_process_callback(client, process_audio, 0);
+    jack_on_shutdown(client, jack_shutdown, 0);
+    jack_set_port_registration_callback(client, jack_port_registration_cb, 0);
+
+    input_port_1 = jack_port_register(client, "capture_1", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+    input_port_2 = jack_port_register(client, "capture_2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+    output_port_1 = jack_port_register(client, "playback_1", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+    output_port_2 = jack_port_register(client, "playback_2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+
+    if (jack_activate(client)) {
+        log_and_notify(0, "[HW-REBOOT] Cannot activate JACK client on reboot\n");
+        return -1;
+    }
+
+    log_and_notify(0, "[HW-REBOOT] Audio Engine Rebooted: CachyOS RT thread active.\n");
+    patch_playback_ports(target_playback_device);
+    return patch_audio_ports(target_audio_device);
+}
+
+/**
+ * @brief Closes the JACK client and frees all allocated DSP buffers, queues, and states.
+ * @return void
+ */
 void shutdown_audio_engine(void) {
     if (atomic_exchange_explicit(&stretcher_keep_running, false, memory_order_release)) {
         pthread_join(stretcher_thread, NULL);
@@ -1794,20 +2446,26 @@ void shutdown_audio_engine(void) {
     if (video_queue.buffer) free(video_queue.buffer);
     if (stretch_queue.buffer) free(stretch_queue.buffer);
     if (cmd_queue.buffer) free(cmd_queue.buffer);
-    if (pristine_bt_buf) free(pristine_bt_buf);
+    if (pristine_bt_buf) free_audio_buffer(pristine_bt_buf, pristine_frames);
 
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if (master_tracks[i].active_buffer) { free(master_tracks[i].active_buffer); master_tracks[i].active_buffer = NULL; }
-        if (master_tracks[i].undo_buffer) { free(master_tracks[i].undo_buffer); master_tracks[i].undo_buffer = NULL; }
+        if (master_tracks[i].active_buffer) {
+            free_audio_buffer(master_tracks[i].active_buffer, pristine_frames);
+            master_tracks[i].active_buffer = NULL;
+        }
         if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
     }
+
+    free_detached_ledger_sync(&global_undo_ledger, pristine_frames);
+    global_undo_ledger.states = NULL;
+    global_undo_ledger.max_capacity = 0;
 
     clipboard_frames = 0;
 
     atomic_store_explicit(&vu_peak_input_l, 0.0f, memory_order_relaxed);
     atomic_store_explicit(&vu_peak_input_r, 0.0f, memory_order_relaxed);
 
-    printf("Audio engine cleanly shut down.\n");
+    log_and_notify(0, "Audio engine cleanly shut down.\n");
 }
 
 void swap_multitrack_tracks(int idx_a, int idx_b) {
@@ -1819,85 +2477,54 @@ void swap_multitrack_tracks(int idx_a, int idx_b) {
         master_tracks[idx_a] = master_tracks[idx_b];
         master_tracks[idx_b] = tmp;
 
-        // Synchronize the time-stretcher buffer if Track 1 was moved
-        if ((idx_a == 0 || idx_b == 0) && pristine_bt_buf && pristine_frames > 0) {
-            memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+        int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+        if (current_timebase == idx_a) {
+            atomic_store_explicit(&timebase_track, idx_b, memory_order_release);
+            current_timebase = idx_b;
+        } else if (current_timebase == idx_b) {
+            atomic_store_explicit(&timebase_track, idx_a, memory_order_release);
+            current_timebase = idx_a;
+        }
+
+        // Synchronize the time-stretcher buffer if the timebase was moved
+        if ((idx_a == current_timebase || idx_b == current_timebase) && pristine_bt_buf && pristine_frames > 0) {
+            memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
             atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
             atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
         }
 
+        mark_session_dirty();
         resume_rt_thread();
     }
 }
 
 /**
- * @brief Atomically swaps a multitrack layer with its dedicated A/B undo buffer.
- * Safely detaches the RT thread before swapping memory block pointers.
- * Aborts if the RT thread fails to detach within the timeout window.
- * @param track_idx The index of the layer to swap.
- * @return void
- */
-void swap_undo_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer || !master_tracks[track_idx].undo_buffer) return;
-
-    if (!await_rt_thread_detach()) return;
-
-    float *tmp = master_tracks[track_idx].active_buffer;
-    master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
-    master_tracks[track_idx].undo_buffer = tmp;
-
-    resume_rt_thread();
-}
-/**
- * @brief Clears a layer to absolute silence (backing up to undo) or restores it if already empty.
- * Uses the centralized atomic handshake to safely detach the RT thread before memory manipulation.
+ * @brief Clears a layer to absolute silence. Restoring is natively handled via Ctrl+Z ledger pop.
  * @param track_idx The target layer index.
- * @return 0 if cleared, 1 if restored, -1 on error.
+ * @return 0 if cleared, 1 if ignored, -1 on error.
  */
 int clear_or_restore_track(int track_idx) {
-    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer || !master_tracks[track_idx].undo_buffer) return -1;
+    if (track_idx < 0 || track_idx >= MAX_TRACKS || !master_tracks[track_idx].active_buffer) return -1;
 
     size_t total_samples = pristine_frames * 2;
     bool has_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
-    int action_status = -1;
+
+    if (!has_audio) return 1;
 
     if (!await_rt_thread_detach()) return -1;
+
+    current_transaction_id++;
+    push_undo_state(track_idx, current_transaction_id);
 
     int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
     if (track_idx >= active && track_idx < MAX_TRACKS) {
         atomic_store_explicit(&active_track_count, track_idx + 1, memory_order_release);
     }
 
-    if (has_audio) {
-        bool undo_is_silent = true;
-        for (size_t i = 0; i < total_samples; i++) {
-            if (master_tracks[track_idx].undo_buffer[i] != 0.0f) {
-                undo_is_silent = false;
-                break;
-            }
-        }
+    memset(master_tracks[track_idx].active_buffer, 0, total_samples * sizeof(float));
 
-        if (undo_is_silent) {
-            float *tmp = master_tracks[track_idx].active_buffer;
-            master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
-            master_tracks[track_idx].undo_buffer = tmp;
-        } else {
-            memcpy(master_tracks[track_idx].undo_buffer, master_tracks[track_idx].active_buffer, total_samples * sizeof(float));
-            memset(master_tracks[track_idx].active_buffer, 0, total_samples * sizeof(float));
-        }
-
-        atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
-        atomic_store_explicit(&master_tracks[track_idx].is_soloed, false, memory_order_release);
-        action_status = 0;
-    } else {
-        float *tmp = master_tracks[track_idx].active_buffer;
-        master_tracks[track_idx].active_buffer = master_tracks[track_idx].undo_buffer;
-        master_tracks[track_idx].undo_buffer = tmp;
-
-        atomic_store_explicit(&master_tracks[track_idx].has_audio, true, memory_order_release);
-        atomic_store_explicit(&master_tracks[track_idx].is_soloed, true, memory_order_release);
-        action_status = 1;
-    }
+    atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
+    atomic_store_explicit(&master_tracks[track_idx].is_soloed, false, memory_order_release);
 
     if (track_idx == 0 && pristine_bt_buf) {
         memcpy(pristine_bt_buf, master_tracks[0].active_buffer, total_samples * sizeof(float));
@@ -1906,8 +2533,7 @@ int clear_or_restore_track(int track_idx) {
     }
 
     resume_rt_thread();
-
-    return action_status;
+    return 0;
 }
 
 void clear_multitrack_track(int track_idx) {
@@ -1915,24 +2541,79 @@ void clear_multitrack_track(int track_idx) {
 
     if (!await_rt_thread_detach()) return;
 
+    current_transaction_id++;
+    push_undo_state(track_idx, current_transaction_id);
+
     memset(master_tracks[track_idx].active_buffer, 0, pristine_frames * 2 * sizeof(float));
     atomic_store_explicit(&master_tracks[track_idx].has_audio, false, memory_order_release);
-    atomic_store_explicit(&master_tracks[track_idx].has_undo, false, memory_order_release);
 
     resume_rt_thread();
+}
+
+void backup_track_to_ledger(int track_idx) {
+    if (track_idx >= 0 && track_idx < MAX_TRACKS) {
+        current_transaction_id++;
+        push_undo_state(track_idx, current_transaction_id);
+    }
 }
 
 // ==============================================================================
 // TRUE MULTI-SELECT NLE CORE (Unified DSP)
 // ==============================================================================
 
+/**
+ * @brief Pushes a track's current state to the chronological ledger.
+ * @warning CRITICAL: Must be called within await_rt_thread_detach() barrier to prevent use-after-free faults.
+ * @param track_idx The multitrack layer to backup.
+ * @param trans_id The transaction group ID.
+ */
+static void push_undo_state(int track_idx, uint32_t trans_id) {
+    if (global_undo_ledger.max_capacity <= 0 || !global_undo_ledger.states) return;
+
+    mark_session_dirty();
+
+    if (global_undo_ledger.count > global_undo_ledger.head) {
+        global_undo_ledger.count = global_undo_ledger.head;
+    }
+
+    if (global_undo_ledger.count == global_undo_ledger.max_capacity) {
+        uint32_t drop_id = global_undo_ledger.states[global_undo_ledger.tail].transaction_id;
+        while (global_undo_ledger.count > 0 && global_undo_ledger.states[global_undo_ledger.tail].transaction_id == drop_id) {
+            global_undo_ledger.tail = (global_undo_ledger.tail + 1) % global_undo_ledger.max_capacity;
+            global_undo_ledger.count--;
+        }
+    }
+
+    int target_idx = (global_undo_ledger.tail + global_undo_ledger.count) % global_undo_ledger.max_capacity;
+
+    UndoState *state = &global_undo_ledger.states[target_idx];
+    if (state->buffer && master_tracks[track_idx].active_buffer) {
+        memcpy(state->buffer, master_tracks[track_idx].active_buffer, pristine_frames * 2 * sizeof(float));
+    }
+    state->track_idx = track_idx;
+    state->has_audio = atomic_load_explicit(&master_tracks[track_idx].has_audio, memory_order_acquire);
+    state->transaction_id = trans_id;
+    state->canvas_frames = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+
+    state->gain = atomic_load_explicit(&master_tracks[track_idx].gain, memory_order_acquire);
+    state->is_soloed = atomic_load_explicit(&master_tracks[track_idx].is_soloed, memory_order_acquire);
+    extern void get_multitrack_track_name(int, char*);
+    get_multitrack_track_name(track_idx, state->name);
+
+    extern size_t video_start_frame;
+    extern size_t video_end_frame;
+    state->v_start = video_start_frame;
+    state->v_end = video_end_frame;
+
+    global_undo_ledger.count++;
+    global_undo_ledger.head = global_undo_ledger.count;
+}
+
 static inline void internal_backup_masked_tracks(uint32_t mask) {
+    current_transaction_id++;
     for (int i = 0; i < MAX_TRACKS; i++) {
-        if ((mask & (1 << i)) && master_tracks[i].active_buffer && master_tracks[i].undo_buffer) {
-            memcpy(master_tracks[i].undo_buffer, master_tracks[i].active_buffer, pristine_frames * 2 * sizeof(float));
-            bool prev_audio = atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire);
-            atomic_store_explicit(&master_tracks[i].undo_has_audio, prev_audio, memory_order_release);
-            atomic_store_explicit(&master_tracks[i].has_undo, true, memory_order_release);
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            push_undo_state(i, current_transaction_id);
         }
     }
 }
@@ -1997,7 +2678,13 @@ void copy_selection(void) {
     size_t copy_len = end - start;
     if (!await_rt_thread_detach()) return;
 
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
+    bool mem_success = true;
 
     for (int i = 0; i < MAX_TRACKS; i++) {
         if (mask & (1 << i)) {
@@ -2006,13 +2693,25 @@ void copy_selection(void) {
                 if (new_buf) {
                     clipboard_buffers[i] = new_buf;
                     memcpy(clipboard_buffers[i], &master_tracks[i].active_buffer[start * 2], copy_len * 2 * sizeof(float));
+                } else {
+                    mem_success = false;
                 }
             }
         } else {
             if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
         }
     }
-    clipboard_frames = copy_len;
+
+    if (mem_success) {
+        clipboard_frames = copy_len;
+    } else {
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
+        }
+        clipboard_frames = 0;
+        log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to copy selection</b></span>");
+        log_and_notify(0, "[MEM] Critical: Clipboard memory allocation failed. Selection cleared.\n");
+    }
     resume_rt_thread();
     clear_loop_points();
 }
@@ -2024,26 +2723,47 @@ void cut_selection(void) {
     if (start >= end || end > pristine_frames) return;
 
     if (!await_rt_thread_detach()) return;
+
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
     internal_backup_masked_tracks(mask);
 
     size_t copy_len = end - start;
+    bool mem_success = true;
+
     for (int i = 0; i < MAX_TRACKS; i++) {
         if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
             float *new_buf = realloc(clipboard_buffers[i], copy_len * 2 * sizeof(float));
             if (new_buf) {
                 clipboard_buffers[i] = new_buf;
                 memcpy(clipboard_buffers[i], &master_tracks[i].active_buffer[start * 2], copy_len * 2 * sizeof(float));
+            } else {
+                mem_success = false;
             }
             apply_nle_cut_math(i, start, end);
         } else {
             if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
         }
     }
-    clipboard_frames = copy_len;
 
-    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if (mem_success) {
+        clipboard_frames = copy_len;
+    } else {
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (clipboard_buffers[i]) { free(clipboard_buffers[i]); clipboard_buffers[i] = NULL; }
+        }
+        clipboard_frames = 0;
+        log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to cut selection</b></span>");
+        log_and_notify(0, "[MEM] Critical: Clipboard memory allocation failed. Cut acts as delete.\n");
+    }
+
+    if ((mask & (1 << current_timebase)) && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2059,6 +2779,13 @@ void delete_selection(void) {
     if (start >= end || end > pristine_frames) return;
 
     if (!await_rt_thread_detach()) return;
+
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
     internal_backup_masked_tracks(mask);
 
@@ -2068,8 +2795,8 @@ void delete_selection(void) {
         }
     }
 
-    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if ((mask & (1 << current_timebase)) && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2085,7 +2812,14 @@ void global_ripple_delete_selection(void) {
     if (start >= end || end > pristine_frames) return;
 
     if (!await_rt_thread_detach()) return;
-    uint32_t mask = 0xFFFFFFFF; // Target ALL active tracks universally
+
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    uint32_t mask = 0xFFFFFFFF;
     internal_backup_masked_tracks(mask);
 
     for (int i = 0; i < MAX_TRACKS; i++) {
@@ -2094,8 +2828,8 @@ void global_ripple_delete_selection(void) {
         }
     }
 
-    if (pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if (pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2111,7 +2845,13 @@ void paste_selection(void) {
     if (current_pos + clipboard_frames > pristine_frames) {
         int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
         int required_seconds = (int)((current_pos + clipboard_frames) / (rate > 0 ? rate : 48000)) + 1;
-        if (resize_loop_canvas_seconds(required_seconds) != 0) return;
+        int resize_status = resize_loop_canvas_seconds(required_seconds);
+        if (resize_status != 0) {
+            if (resize_status == -2) {
+                log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to expand canvas for paste</b></span>");
+            }
+            return;
+        }
     }
 
     if (!await_rt_thread_detach()) return;
@@ -2121,6 +2861,7 @@ void paste_selection(void) {
         return;
     }
 
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
     internal_backup_masked_tracks(mask);
 
@@ -2129,20 +2870,20 @@ void paste_selection(void) {
         if ((mask & (1 << i)) && clipboard_buffers[i] && master_tracks[i].active_buffer) {
             memcpy(&master_tracks[i].active_buffer[current_pos * 2], clipboard_buffers[i], clipboard_frames * 2 * sizeof(float));
             atomic_store_explicit(&master_tracks[i].has_audio, true, memory_order_release);
-            if (i == 0) bt_updated = true;
+            if (i == current_timebase) bt_updated = true;
 
             int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
             if (i >= active) atomic_store_explicit(&active_track_count, i + 1, memory_order_release);
         }
     }
 
-    if (bt_updated && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if (bt_updated && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
 
-    atomic_store_explicit(&playback_pos, current_pos + clipboard_frames, memory_order_release);
+    evaluate_session_dirty_state(); // Check if we undid our way back to the save point
     resume_rt_thread();
 }
 
@@ -2153,7 +2894,13 @@ void global_paste_selection(void) {
     if (current_pos + clipboard_frames > pristine_frames) {
         int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
         int required_seconds = (int)((current_pos + clipboard_frames) / (rate > 0 ? rate : 48000)) + 1;
-        if (resize_loop_canvas_seconds(required_seconds) != 0) return;
+        int resize_status = resize_loop_canvas_seconds(required_seconds);
+        if (resize_status != 0) {
+            if (resize_status == -2) {
+                log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to expand canvas for paste</b></span>");
+            }
+            return;
+        }
     }
 
     if (!await_rt_thread_detach()) return;
@@ -2163,7 +2910,8 @@ void global_paste_selection(void) {
         return;
     }
 
-    uint32_t mask = 0xFFFFFFFF; // Target ALL active tracks universally
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    uint32_t mask = 0xFFFFFFFF;
     internal_backup_masked_tracks(mask);
 
     bool bt_updated = false;
@@ -2171,20 +2919,21 @@ void global_paste_selection(void) {
         if (clipboard_buffers[i] && master_tracks[i].active_buffer) {
             memcpy(&master_tracks[i].active_buffer[current_pos * 2], clipboard_buffers[i], clipboard_frames * 2 * sizeof(float));
             atomic_store_explicit(&master_tracks[i].has_audio, true, memory_order_release);
-            if (i == 0) bt_updated = true;
+            if (i == current_timebase) bt_updated = true;
 
             int active = atomic_load_explicit(&active_track_count, memory_order_acquire);
             if (i >= active) atomic_store_explicit(&active_track_count, i + 1, memory_order_release);
         }
     }
 
-    if (bt_updated && pristine_bt_buf) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if (bt_updated && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
 
     atomic_store_explicit(&playback_pos, current_pos + clipboard_frames, memory_order_release);
+    evaluate_session_dirty_state();
     resume_rt_thread();
 }
 
@@ -2194,11 +2943,20 @@ void apply_smart_fade_selection(void) {
     size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
     if (start >= end || end > pristine_frames) return;
 
+    size_t sel_len = end - start;
+    if (sel_len < 4) { clear_loop_points(); return; }
+
     if (!await_rt_thread_detach()) return;
+
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
     internal_backup_masked_tracks(mask);
 
-    size_t sel_len = end - start;
     for (int i = 0; i < MAX_TRACKS; i++) {
         if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
             bool touches_start = (start == 0 || master_tracks[i].active_buffer[(start - 1) * 2] == 0.0f);
@@ -2234,8 +2992,8 @@ void apply_smart_fade_selection(void) {
         }
     }
 
-    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if ((mask & (1 << current_timebase)) && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2249,12 +3007,22 @@ void apply_blend_fade_selection(void) {
     size_t end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
     if (start >= end || end > pristine_frames) return;
 
+    size_t sel_len = end - start;
+    if (sel_len < 4) { clear_loop_points(); return; }
+
     if (!await_rt_thread_detach()) return;
+
+    if (end > pristine_frames) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
     internal_backup_masked_tracks(mask);
 
-    size_t sel_len = end - start;
     size_t half_len = sel_len / 2;
+    size_t shift_len = sel_len - half_len;
     size_t remaining = pristine_frames - end;
 
     for (int i = 0; i < MAX_TRACKS; i++) {
@@ -2266,20 +3034,20 @@ void apply_blend_fade_selection(void) {
             }
             for (size_t j = 0; j < half_len; j++) {
                 float mult = ((float)j / (float)half_len);
-                master_tracks[i].active_buffer[(start + j) * 2] += master_tracks[i].active_buffer[(start + half_len + j) * 2] * mult;
-                master_tracks[i].active_buffer[(start + j) * 2 + 1] += master_tracks[i].active_buffer[(start + half_len + j) * 2 + 1] * mult;
+                master_tracks[i].active_buffer[(start + j) * 2] += master_tracks[i].active_buffer[(start + shift_len + j) * 2] * mult;
+                master_tracks[i].active_buffer[(start + j) * 2 + 1] += master_tracks[i].active_buffer[(start + shift_len + j) * 2 + 1] * mult;
             }
             if (remaining > 0) {
                 memmove(&master_tracks[i].active_buffer[(start + half_len) * 2],
                         &master_tracks[i].active_buffer[end * 2],
                         remaining * 2 * sizeof(float));
             }
-            memset(&master_tracks[i].active_buffer[(pristine_frames - half_len) * 2], 0, half_len * 2 * sizeof(float));
+            memset(&master_tracks[i].active_buffer[(pristine_frames - shift_len) * 2], 0, shift_len * 2 * sizeof(float));
         }
     }
 
-    if ((mask & 1) && pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if ((mask & (1 << current_timebase)) && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
@@ -2287,26 +3055,138 @@ void apply_blend_fade_selection(void) {
     clear_loop_points();
 }
 
-void undo_selection(void) {
-    if (!await_rt_thread_detach()) return;
+void apply_gain_selection(float multiplier) {
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
     uint32_t mask = atomic_load_explicit(&selected_tracks_mask, memory_order_acquire);
-    bool bt_updated = false;
 
-    for (int i = 0; i < MAX_TRACKS; i++) {
-        if ((mask & (1 << i)) && master_tracks[i].active_buffer && master_tracks[i].undo_buffer) {
-            if (atomic_load_explicit(&master_tracks[i].has_undo, memory_order_acquire)) {
-                memcpy(master_tracks[i].active_buffer, master_tracks[i].undo_buffer, pristine_frames * 2 * sizeof(float));
+    static gint64 last_gain_edit_time = 0;
+    gint64 now = g_get_monotonic_time();
+    bool is_continuous = (now - last_gain_edit_time < 400000);
+    last_gain_edit_time = now;
 
-                bool prev_audio = atomic_load_explicit(&master_tracks[i].undo_has_audio, memory_order_acquire);
-                atomic_store_explicit(&master_tracks[i].has_audio, prev_audio, memory_order_release);
-                atomic_store_explicit(&master_tracks[i].has_undo, false, memory_order_release);
+    if (!await_rt_thread_detach()) return;
 
-                if (i == 0) bt_updated = true;
-            }
+    if (!is_continuous) {
+        internal_backup_masked_tracks(mask);
+    }
+
+    size_t start = 0;
+    size_t end = pristine_frames;
+
+    if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+        size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
+        size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
+        if (l_start < l_end && l_end <= pristine_frames) {
+            start = l_start;
+            end = l_end;
         }
     }
 
-    // Dynamic UI Cleanup: Prune ghost layers if the track was erased
+    bool bt_updated = false;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if ((mask & (1 << i)) && master_tracks[i].active_buffer) {
+            for (size_t f = start; f < end; f++) {
+                master_tracks[i].active_buffer[f * 2] *= multiplier;
+                master_tracks[i].active_buffer[f * 2 + 1] *= multiplier;
+            }
+            if (i == current_timebase) bt_updated = true;
+        }
+    }
+
+    if (bt_updated && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+
+    mark_session_dirty();
+    resume_rt_thread();
+}
+
+void undo_selection(void) {
+    if (!await_rt_thread_detach()) return;
+
+    if (global_undo_ledger.head <= 0 || global_undo_ledger.count <= 0) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    int last_idx = (global_undo_ledger.tail + global_undo_ledger.head - 1) % global_undo_ledger.max_capacity;
+    uint32_t target_trans_id = global_undo_ledger.states[last_idx].transaction_id;
+    bool bt_updated = false;
+
+    bool stash_video = false;
+    bool restore_video = false;
+
+    if (video_creation_trans_id != 0 && target_trans_id == video_creation_trans_id) {
+        stash_video = true;
+    }
+    if (video_deletion_trans_id != 0 && target_trans_id == video_deletion_trans_id) {
+        restore_video = true;
+    }
+
+    size_t present_bounds = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    extern size_t video_start_frame;
+    extern size_t video_end_frame;
+    size_t present_v_start = video_start_frame;
+    size_t present_v_end = video_end_frame;
+    bool globals_applied = false;
+
+    while (global_undo_ledger.head > 0) {
+        int current_idx = (global_undo_ledger.tail + global_undo_ledger.head - 1) % global_undo_ledger.max_capacity;
+        UndoState *state = &global_undo_ledger.states[current_idx];
+
+        if (state->transaction_id != target_trans_id) break;
+
+        int trk = state->track_idx;
+        if (trk >= 0 && trk < MAX_TRACKS && state->buffer && master_tracks[trk].active_buffer) {
+            float *tmp_buf = master_tracks[trk].active_buffer;
+            master_tracks[trk].active_buffer = state->buffer;
+            state->buffer = tmp_buf;
+
+            bool tmp_audio = atomic_load_explicit(&master_tracks[trk].has_audio, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].has_audio, state->has_audio, memory_order_release);
+            state->has_audio = tmp_audio;
+
+            // Structural Undo tracking
+            float tmp_gain = atomic_load_explicit(&master_tracks[trk].gain, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].gain, state->gain, memory_order_release);
+            state->gain = tmp_gain;
+
+            bool tmp_solo = atomic_load_explicit(&master_tracks[trk].is_soloed, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].is_soloed, state->is_soloed, memory_order_release);
+            state->is_soloed = tmp_solo;
+
+            char tmp_name[64];
+            extern void get_multitrack_track_name(int, char*);
+            extern void set_multitrack_track_name(int, const char*);
+            get_multitrack_track_name(trk, tmp_name);
+            set_multitrack_track_name(trk, state->name);
+            strncpy(state->name, tmp_name, 64);
+
+            if (!globals_applied) {
+                atomic_store_explicit(&backing_track_frames, state->canvas_frames, memory_order_release);
+
+                // FIX: Restore absolute memory bounds based on the restored stretched frames
+                float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+                pristine_frames = (size_t)(state->canvas_frames * current_speed);
+
+                video_start_frame = state->v_start;
+                video_end_frame = state->v_end;
+                globals_applied = true;
+            }
+
+            state->canvas_frames = present_bounds;
+            state->v_start = present_v_start;
+            state->v_end = present_v_end;
+
+            if (trk == current_timebase) bt_updated = true;
+        }
+
+        global_undo_ledger.head--;
+    }
+
     int highest = 0;
     for (int i = 0; i < MAX_TRACKS; i++) {
         if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) highest = i;
@@ -2322,13 +3202,188 @@ void undo_selection(void) {
     if (current_rec > highest) highest = current_rec;
     atomic_store_explicit(&active_track_count, highest + 1, memory_order_release);
 
-    if (bt_updated && pristine_bt_buf && master_tracks[0].active_buffer) {
-        memcpy(pristine_bt_buf, master_tracks[0].active_buffer, pristine_frames * 2 * sizeof(float));
+    if (bt_updated && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
         atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
         atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
     }
 
+    evaluate_session_dirty_state();
     resume_rt_thread();
+
+    if (stash_video) {
+        extern void abort_active_video_preview(bool stash);
+        abort_active_video_preview(true);
+    }
+    if (restore_video) {
+        extern void restore_stashed_video_preview(void);
+        restore_stashed_video_preview();
+    }
+}
+
+void redo_selection(void) {
+    if (!await_rt_thread_detach()) return;
+
+    if (global_undo_ledger.head >= global_undo_ledger.count) {
+        resume_rt_thread();
+        return;
+    }
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    int next_idx = (global_undo_ledger.tail + global_undo_ledger.head) % global_undo_ledger.max_capacity;
+    uint32_t target_trans_id = global_undo_ledger.states[next_idx].transaction_id;
+    bool bt_updated = false;
+
+    bool stash_video = false;
+    bool restore_video = false;
+
+    if (video_creation_trans_id != 0 && target_trans_id == video_creation_trans_id) {
+        restore_video = true;
+    }
+    if (video_deletion_trans_id != 0 && target_trans_id == video_deletion_trans_id) {
+        stash_video = true;
+    }
+
+    size_t present_bounds = atomic_load_explicit(&backing_track_frames, memory_order_acquire);
+    extern size_t video_start_frame;
+    extern size_t video_end_frame;
+    size_t present_v_start = video_start_frame;
+    size_t present_v_end = video_end_frame;
+    bool globals_applied = false;
+
+    while (global_undo_ledger.head < global_undo_ledger.count) {
+        int current_idx = (global_undo_ledger.tail + global_undo_ledger.head) % global_undo_ledger.max_capacity;
+        UndoState *state = &global_undo_ledger.states[current_idx];
+
+        if (state->transaction_id != target_trans_id) break;
+
+        int trk = state->track_idx;
+        if (trk >= 0 && trk < MAX_TRACKS && state->buffer && master_tracks[trk].active_buffer) {
+            float *tmp_buf = master_tracks[trk].active_buffer;
+            master_tracks[trk].active_buffer = state->buffer;
+            state->buffer = tmp_buf;
+
+            bool tmp_audio = atomic_load_explicit(&master_tracks[trk].has_audio, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].has_audio, state->has_audio, memory_order_release);
+            state->has_audio = tmp_audio;
+
+            // Structural Undo tracking
+            float tmp_gain = atomic_load_explicit(&master_tracks[trk].gain, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].gain, state->gain, memory_order_release);
+            state->gain = tmp_gain;
+
+            bool tmp_solo = atomic_load_explicit(&master_tracks[trk].is_soloed, memory_order_acquire);
+            atomic_store_explicit(&master_tracks[trk].is_soloed, state->is_soloed, memory_order_release);
+            state->is_soloed = tmp_solo;
+
+            char tmp_name[64];
+            extern void get_multitrack_track_name(int, char*);
+            extern void set_multitrack_track_name(int, const char*);
+            get_multitrack_track_name(trk, tmp_name);
+            set_multitrack_track_name(trk, state->name);
+            strncpy(state->name, tmp_name, 64);
+
+            if (!globals_applied) {
+                atomic_store_explicit(&backing_track_frames, state->canvas_frames, memory_order_release);
+                video_start_frame = state->v_start;
+                video_end_frame = state->v_end;
+                globals_applied = true;
+            }
+
+            state->canvas_frames = present_bounds;
+            state->v_start = present_v_start;
+            state->v_end = present_v_end;
+
+            if (trk == current_timebase) bt_updated = true;
+        }
+
+        global_undo_ledger.head++;
+    }
+
+    int highest = 0;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) highest = i;
+    }
+
+    int current_rec = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+    if (current_rec > highest && !atomic_load_explicit(&master_tracks[current_rec].has_audio, memory_order_acquire)) {
+        current_rec = highest;
+        atomic_store_explicit(&current_recording_track, current_rec, memory_order_release);
+        atomic_store_explicit(&selected_tracks_mask, (1 << current_rec), memory_order_release);
+    }
+
+    if (current_rec > highest) highest = current_rec;
+    atomic_store_explicit(&active_track_count, highest + 1, memory_order_release);
+
+    if (bt_updated && pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, pristine_frames * 2 * sizeof(float));
+        atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+        atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+    }
+
+    evaluate_session_dirty_state();
+    resume_rt_thread();
+
+    if (stash_video) {
+        extern void abort_active_video_preview(bool stash);
+        abort_active_video_preview(true);
+    }
+    if (restore_video) {
+        extern void restore_stashed_video_preview(void);
+        restore_stashed_video_preview();
+    }
+}
+
+void crop_canvas(void) {
+    size_t target_frames_1x = 0;
+
+    if (atomic_load_explicit(&loop_active, memory_order_acquire)) {
+        float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+        target_frames_1x = (size_t)(atomic_load_explicit(&loop_end_frame, memory_order_acquire) * current_speed);
+    } else {
+        target_frames_1x = get_last_audible_frame();
+    }
+
+    int rate = atomic_load_explicit(&active_sample_rate, memory_order_acquire);
+    if (rate <= 0) rate = 48000;
+
+    if (target_frames_1x < (size_t)rate * 5) target_frames_1x = (size_t)rate * 5;
+    if (target_frames_1x >= pristine_frames) return;
+
+    if (!await_rt_thread_detach()) return;
+
+    int current_timebase = atomic_load_explicit(&timebase_track, memory_order_acquire);
+    uint32_t mask = 0xFFFFFFFF;
+    internal_backup_masked_tracks(mask);
+
+    size_t clear_len = pristine_frames - target_frames_1x;
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        if (master_tracks[i].active_buffer) {
+            memset(&master_tracks[i].active_buffer[target_frames_1x * 2], 0, clear_len * 2 * sizeof(float));
+        }
+    }
+
+    if (pristine_bt_buf && master_tracks[current_timebase].active_buffer) {
+        memcpy(pristine_bt_buf, master_tracks[current_timebase].active_buffer, target_frames_1x * 2 * sizeof(float));
+    }
+
+    pristine_frames = target_frames_1x;
+
+    float current_speed = atomic_load_explicit(&playback_speed, memory_order_relaxed);
+    size_t new_bt_frames = (size_t)(pristine_frames / current_speed);
+
+    atomic_store_explicit(&backing_track_frames, new_bt_frames, memory_order_release);
+
+    size_t current_pos = atomic_load_explicit(&playback_pos, memory_order_acquire);
+    if (current_pos > new_bt_frames) {
+        atomic_store_explicit(&playback_pos, new_bt_frames, memory_order_release);
+    }
+
+    atomic_store_explicit(&stretch_queue.read_index, atomic_load_explicit(&stretch_queue.write_index, memory_order_relaxed), memory_order_release);
+    atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+
+    resume_rt_thread();
+    clear_loop_points();
 }
 
 /**
@@ -2377,4 +3432,102 @@ float* render_mixdown_region(size_t start, size_t end) {
     }
 
     return mix_buf;
+}
+
+void get_engine_telemetry(EngineTelemetry *out_stats) {
+    if (!out_stats) return;
+
+    out_stats->dropped_frames = atomic_load_explicit(&rt_dropped_audio_frames, memory_order_relaxed);
+    out_stats->sample_rate = atomic_load_explicit(&active_sample_rate, memory_order_relaxed);
+    out_stats->ledger_capacity = global_undo_ledger.max_capacity;
+
+    // Calculate unique user actions (Ctrl+Z steps)
+    out_stats->ledger_undos = 0;
+    uint32_t last_id = 0;
+    for (int i = 0; i < global_undo_ledger.head; i++) {
+        int idx = (global_undo_ledger.tail + i) % global_undo_ledger.max_capacity;
+        if (global_undo_ledger.states[idx].transaction_id != last_id) {
+            out_stats->ledger_undos++;
+            last_id = global_undo_ledger.states[idx].transaction_id;
+        }
+    }
+
+    out_stats->ledger_redos = 0;
+    last_id = 0;
+    for (int i = global_undo_ledger.head; i < global_undo_ledger.count; i++) {
+        int idx = (global_undo_ledger.tail + i) % global_undo_ledger.max_capacity;
+        if (global_undo_ledger.states[idx].transaction_id != last_id) {
+            out_stats->ledger_redos++;
+            last_id = global_undo_ledger.states[idx].transaction_id;
+        }
+    }
+
+    out_stats->total_ram_bytes = 0;
+    out_stats->available_ram_bytes = 0;
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo) {
+        char line[256];
+        while (fgets(line, sizeof(line), meminfo)) {
+            long long kb_val;
+            if (sscanf(line, "MemTotal: %lld", &kb_val) == 1) {
+                out_stats->total_ram_bytes = (size_t)kb_val * 1024;
+            } else if (sscanf(line, "MemAvailable: %lld", &kb_val) == 1) {
+                out_stats->available_ram_bytes = (size_t)kb_val * 1024;
+            }
+        }
+        fclose(meminfo);
+    }
+
+    // Parse true QJams allocated memory (Resident Set Size)
+    out_stats->qjams_rss_bytes = 0;
+    FILE *statm = fopen("/proc/self/statm", "r");
+    if (statm) {
+        long size, rss;
+        if (fscanf(statm, "%ld %ld", &size, &rss) == 2) {
+            out_stats->qjams_rss_bytes = (size_t)rss * sysconf(_SC_PAGESIZE);
+        }
+        fclose(statm);
+    }
+}
+
+size_t get_last_audible_frame(void) {
+    if (pristine_frames == 0) return 0;
+    size_t last_frame = 0;
+
+    // Threshold for "silence" (~ -76dB) to ignore analog ADC noise floors
+    float noise_floor = 0.00015f;
+
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        if (!master_tracks[t].active_buffer || !atomic_load_explicit(&master_tracks[t].has_audio, memory_order_acquire)) continue;
+
+        // Scan backwards from the end of the canvas
+        for (size_t f = pristine_frames; f > last_frame; f--) {
+            // Check absolute float value against the noise gate rather than strict 0.0f
+            if (fabsf(master_tracks[t].active_buffer[(f - 1) * 2]) > noise_floor ||
+                fabsf(master_tracks[t].active_buffer[(f - 1) * 2 + 1]) > noise_floor) {
+                last_frame = f;
+            break;
+                }
+        }
+    }
+    return last_frame;
+}
+
+_Atomic size_t cached_audible_frames = 0;
+static _Atomic bool is_scanning_audible = false;
+
+static void audible_scan_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)task_data; (void)cancellable;
+    size_t last = get_last_audible_frame();
+    atomic_store_explicit(&cached_audible_frames, last, memory_order_release);
+    atomic_store_explicit(&is_scanning_audible, false, memory_order_release);
+    g_task_return_boolean(task, TRUE);
+}
+
+void trigger_audible_scan_async(void) {
+    if (!atomic_exchange_explicit(&is_scanning_audible, true, memory_order_acquire)) {
+        GTask *task = g_task_new(NULL, NULL, NULL, NULL);
+        g_task_run_in_thread(task, audible_scan_thread);
+        g_object_unref(task);
+    }
 }
