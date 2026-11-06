@@ -1,135 +1,54 @@
 #include "ui_playlist.h"
+#include "audio_core.h"
+#include "audio_memory.h"
+#include "media_io.h"
 #include "ui_globals.h"
-#include "ui_multitrack.h"
-#include "audio_engine.h"
-#include <libavformat/avformat.h>
-#include <time.h>
+#include "ui_transport.h"
 
 static GListStore *track_list_store = NULL;
 static GtkMultiSelection *track_selection_model = NULL;
 static GtkWidget *track_list_view;
 static GtkWidget *btn_rename;
 static GtkWidget *btn_delete;
-static GtkWidget *preset_btns[10];
+static GtkWidget *preset_btns[22];
 static GtkWidget *lbl_playlist_title = NULL;
 static int current_preset_slot = -1;
-G_DEFINE_TYPE(QjTrack, qj_track, G_TYPE_OBJECT)
+G_DEFINE_TYPE(QJTrack, qj_track, G_TYPE_OBJECT)
 
 static gboolean is_supported_media_file(const char *path);
 
 static void qj_track_finalize(GObject *object) {
-    QjTrack *self = QJ_TRACK(object);
+    QJTrack *self = QJ_TRACK(object);
     g_free(self->filepath);
     g_free(self->display_name);
     G_OBJECT_CLASS(qj_track_parent_class)->finalize(object);
 }
 
-static void qj_track_class_init(QjTrackClass *klass) {
+static void qj_track_class_init(QJTrackClass *klass) {
     GObjectClass *object_class = G_OBJECT_CLASS(klass);
     object_class->finalize = qj_track_finalize;
 }
 
-static void qj_track_init(QjTrack *self) {
+static void qj_track_init(QJTrack *self) {
     self->filepath = NULL;
     self->display_name = NULL;
     self->is_qjams_native = false;
 }
 
-QjTrack *qj_track_new(const char *filepath, const char *display_name, bool is_native) {
-    QjTrack *self = g_object_new(QJ_TYPE_TRACK, NULL);
+QJTrack *qj_track_new(const char *filepath, const char *display_name, bool is_native) {
+    QJTrack *self = g_object_new(QJ_TYPE_TRACK, NULL);
     self->filepath = g_strdup(filepath);
     self->display_name = g_strdup(display_name);
     self->is_qjams_native = is_native;
     return self;
 }
 
-typedef struct {
-    time_t start_time;
-    int max_duration;
-} FFmpegProbeTimeout;
-
-static int probe_interrupt_cb(void *ctx) {
-    FFmpegProbeTimeout *timeout = (FFmpegProbeTimeout *)ctx;
-    if (time(NULL) - timeout->start_time > timeout->max_duration) {
-        return 1;
-    }
-    return 0;
-}
-
-static bool extract_track_metadata(const char *filepath, char *output_buffer, size_t max_len) {
-    bool is_native = false;
-
-    if (g_str_has_suffix(filepath, ".qjams")) {
-        gchar *basename = g_path_get_basename(filepath);
-        char *dot = strrchr(basename, '.');
-        if (dot) *dot = '\0';
-        snprintf(output_buffer, max_len, "%s", basename);
-        g_free(basename);
-        return true;
-    }
-
-    AVFormatContext *fmt_ctx = avformat_alloc_context();
-    FFmpegProbeTimeout timeout = { .start_time = time(NULL), .max_duration = 3 };
-    fmt_ctx->interrupt_callback.callback = probe_interrupt_cb;
-    fmt_ctx->interrupt_callback.opaque = &timeout;
-
-    if (avformat_open_input(&fmt_ctx, filepath, NULL, NULL) == 0) {
-        avformat_find_stream_info(fmt_ctx, NULL);
-
-        AVDictionaryEntry *title = NULL;
-        AVDictionaryEntry *artist = NULL;
-        AVDictionaryEntry *tag = NULL;
-
-        while ((tag = av_dict_get(fmt_ctx->metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
-            if (g_str_has_prefix(tag->value, "Recorded with QJams")) is_native = true;
-            if (g_ascii_strcasecmp(tag->key, "title") == 0) title = tag;
-            if (g_ascii_strcasecmp(tag->key, "artist") == 0) artist = tag;
-        }
-
-        if (!is_native) {
-            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-                tag = NULL;
-                while ((tag = av_dict_get(fmt_ctx->streams[i]->metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
-                    if (g_str_has_prefix(tag->value, "Recorded with QJams")) is_native = true;
-                }
-            }
-        }
-
-        int duration_sec = 0;
-        if (fmt_ctx->duration != AV_NOPTS_VALUE) {
-            duration_sec = fmt_ctx->duration / AV_TIME_BASE;
-        }
-
-        if (title && artist) {
-            snprintf(output_buffer, max_len, "%s - %s [%02d:%02d]", artist->value, title->value, duration_sec / 60, duration_sec % 60);
-        } else if (title) {
-            snprintf(output_buffer, max_len, "%s [%02d:%02d]", title->value, duration_sec / 60, duration_sec % 60);
-        } else {
-            gchar *basename = g_path_get_basename(filepath);
-            snprintf(output_buffer, max_len, "%s", basename);
-            g_free(basename);
-        }
-
-        avformat_close_input(&fmt_ctx);
-    } else {
-        gchar *basename = g_path_get_basename(filepath);
-        snprintf(output_buffer, max_len, "%s", basename);
-        g_free(basename);
-    }
-
-    gchar *valid_utf8 = g_utf8_make_valid(output_buffer, -1);
-    strncpy(output_buffer, valid_utf8, max_len - 1);
-    output_buffer[max_len - 1] = '\0';
-    g_free(valid_utf8);
-
-    return is_native;
-}
-
 static void update_playlist_title_ui(const char *filepath);
 
 static void update_preset_buttons(void) {
-    for (int i = 0; i < 10; i++) {
-        if (!preset_btns[i]) continue;
+    for (int i = 0; i < 22; i++) {
+        if (!preset_btns[i])
+            continue;
 
         gtk_widget_remove_css_class(preset_btns[i], "active-preset");
         if (i == current_preset_slot) {
@@ -138,7 +57,7 @@ static void update_preset_buttons(void) {
 
         if (strlen(ui_state.config.playlist_slots[i]) > 0) {
             char *base = g_path_get_basename(ui_state.config.playlist_slots[i]);
-            char letter[2] = { '?', '\0' };
+            char letter[2] = {'?', '\0'};
             for (int j = 0; base[j] != '\0'; j++) {
                 if (g_ascii_isalpha(base[j])) {
                     letter[0] = g_ascii_toupper(base[j]);
@@ -156,19 +75,20 @@ static void update_preset_buttons(void) {
 }
 
 void activate_playlist_preset(int slot) {
-    if (slot < 0 || slot >= 10) return;
+    if (slot < 0 || slot >= 22)
+        return;
     gtk_widget_grab_focus(preset_btns[slot]);
     current_preset_slot = slot;
 
     if (strlen(ui_state.config.playlist_slots[slot]) > 0) {
-        strncpy(ui_state.playlist_path, ui_state.config.playlist_slots[slot], sizeof(ui_state.playlist_path) - 1);
+        strncpy(ui_state.playlist_path, ui_state.config.playlist_slots[slot],
+                sizeof(ui_state.playlist_path) - 1);
         ui_state.playlist_path[sizeof(ui_state.playlist_path) - 1] = '\0';
 
-        strncpy(ui_state.config.last_playlist_path, ui_state.config.playlist_slots[slot], sizeof(ui_state.config.last_playlist_path) - 1);
+        strncpy(ui_state.config.last_playlist_path, ui_state.config.playlist_slots[slot],
+                sizeof(ui_state.config.last_playlist_path) - 1);
         ui_state.config.last_playlist_path[sizeof(ui_state.config.last_playlist_path) - 1] = '\0';
 
-        // FILE: ui_playlist.c (Inside activate_playlist_preset)
-        // ...
         save_qjams_config(ui_state.config_path, &ui_state.config);
         load_playlist_from_file(ui_state.playlist_path);
     } else {
@@ -182,8 +102,11 @@ void activate_playlist_preset(int slot) {
 }
 // ...
 
-static GdkContentProvider* on_preset_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
-    (void)source; (void)x; (void)y;
+static GdkContentProvider *on_preset_drag_prepare(GtkDragSource *source, double x, double y,
+                                                  gpointer user_data) {
+    (void)source;
+    (void)x;
+    (void)y;
     int slot = GPOINTER_TO_INT(user_data);
     GValue value = G_VALUE_INIT;
     g_value_init(&value, G_TYPE_INT);
@@ -191,14 +114,19 @@ static GdkContentProvider* on_preset_drag_prepare(GtkDragSource *source, double 
     return gdk_content_provider_new_for_value(&value);
 }
 
-static gboolean on_preset_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
-    (void)target; (void)x; (void)y;
-    if (!G_VALUE_HOLDS(value, G_TYPE_INT)) return FALSE;
+static gboolean on_preset_drop(GtkDropTarget *target, const GValue *value, double x, double y,
+                               gpointer user_data) {
+    (void)target;
+    (void)x;
+    (void)y;
+    if (!G_VALUE_HOLDS(value, G_TYPE_INT))
+        return FALSE;
 
     int src_slot = g_value_get_int(value);
     int dest_slot = GPOINTER_TO_INT(user_data);
 
-    if (src_slot == dest_slot || src_slot < 0 || src_slot >= 10 || dest_slot < 0 || dest_slot >= 10) {
+    if (src_slot == dest_slot || src_slot < 0 || src_slot >= 22 || dest_slot < 0 ||
+        dest_slot >= 22) {
         return FALSE;
     }
 
@@ -210,26 +138,31 @@ static gboolean on_preset_drop(GtkDropTarget *target, const GValue *value, doubl
     // Shift elements left or right securely mimicking memmove logic
     if (src_slot < dest_slot) {
         for (int i = src_slot; i < dest_slot; i++) {
-            strncpy(ui_state.config.playlist_slots[i], ui_state.config.playlist_slots[i + 1], sizeof(ui_state.config.playlist_slots[0]) - 1);
+            strncpy(ui_state.config.playlist_slots[i], ui_state.config.playlist_slots[i + 1],
+                    sizeof(ui_state.config.playlist_slots[0]) - 1);
             ui_state.config.playlist_slots[i][sizeof(ui_state.config.playlist_slots[0]) - 1] = '\0';
         }
     } else {
         for (int i = src_slot; i > dest_slot; i--) {
-            strncpy(ui_state.config.playlist_slots[i], ui_state.config.playlist_slots[i - 1], sizeof(ui_state.config.playlist_slots[0]) - 1);
+            strncpy(ui_state.config.playlist_slots[i], ui_state.config.playlist_slots[i - 1],
+                    sizeof(ui_state.config.playlist_slots[0]) - 1);
             ui_state.config.playlist_slots[i][sizeof(ui_state.config.playlist_slots[0]) - 1] = '\0';
         }
     }
 
     // Deposit the cached string into its new home
-    strncpy(ui_state.config.playlist_slots[dest_slot], temp_slot, sizeof(ui_state.config.playlist_slots[0]) - 1);
+    strncpy(ui_state.config.playlist_slots[dest_slot], temp_slot,
+            sizeof(ui_state.config.playlist_slots[0]) - 1);
     ui_state.config.playlist_slots[dest_slot][sizeof(ui_state.config.playlist_slots[0]) - 1] = '\0';
 
     // Maintain focus tracking
     if (current_preset_slot == src_slot) {
         current_preset_slot = dest_slot;
-    } else if (src_slot < dest_slot && current_preset_slot > src_slot && current_preset_slot <= dest_slot) {
+    } else if (src_slot < dest_slot && current_preset_slot > src_slot &&
+               current_preset_slot <= dest_slot) {
         current_preset_slot--;
-    } else if (src_slot > dest_slot && current_preset_slot >= dest_slot && current_preset_slot < src_slot) {
+    } else if (src_slot > dest_slot && current_preset_slot >= dest_slot &&
+               current_preset_slot < src_slot) {
         current_preset_slot++;
     }
 
@@ -248,17 +181,18 @@ static void on_preset_button_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 typedef struct {
-    QjTrack **tracks;
+    QJTrack **tracks;
     int count;
 } PendingAddData;
 
-static guint find_track_index_by_path(const char* target_path) {
+static guint find_track_index_by_path(const char *target_path) {
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
     for (guint i = 0; i < n_items; i++) {
-        QjTrack *item = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
+        QJTrack *item = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
         bool matches = (g_strcmp0(item->filepath, target_path) == 0);
         g_object_unref(item);
-        if (matches) return i;
+        if (matches)
+            return i;
     }
     return GTK_INVALID_LIST_POSITION;
 }
@@ -296,10 +230,16 @@ static void on_save_new_playlist_ready(GObject *source, GAsyncResult *res, gpoin
         }
 
         strncpy(ui_state.playlist_path, path, sizeof(ui_state.playlist_path) - 1);
-        strncpy(ui_state.config.last_playlist_path, path, sizeof(ui_state.config.last_playlist_path) - 1);
+        ui_state.playlist_path[sizeof(ui_state.playlist_path) - 1] = '\0';
+        strncpy(ui_state.config.last_playlist_path, path,
+                sizeof(ui_state.config.last_playlist_path) - 1);
+        ui_state.config.last_playlist_path[sizeof(ui_state.config.last_playlist_path) - 1] = '\0';
 
-        if (current_preset_slot >= 0 && current_preset_slot < 10) {
-            strncpy(ui_state.config.playlist_slots[current_preset_slot], path, sizeof(ui_state.config.playlist_slots[0]) - 1);
+        if (current_preset_slot >= 0 && current_preset_slot < 22) {
+            strncpy(ui_state.config.playlist_slots[current_preset_slot], path,
+                    sizeof(ui_state.config.playlist_slots[0]) - 1);
+            ui_state.config.playlist_slots[current_preset_slot]
+                                          [sizeof(ui_state.config.playlist_slots[0]) - 1] = '\0';
         }
 
         save_qjams_config(ui_state.config_path, &ui_state.config);
@@ -311,18 +251,21 @@ static void on_save_new_playlist_ready(GObject *source, GAsyncResult *res, gpoin
 
         execute_pending_adds(pd);
     } else {
-        for (int i = 0; i < pd->count; i++) g_object_unref(pd->tracks[i]);
+        for (int i = 0; i < pd->count; i++)
+            g_object_unref(pd->tracks[i]);
         free(pd->tracks);
         free(pd);
-        if (err) g_error_free(err);
+        if (err)
+            g_error_free(err);
     }
 }
 
-static void request_append_tracks(QjTrack **tracks, int count, GtkWidget *parent) {
+static void request_append_tracks(QJTrack **tracks, int count, GtkWidget *parent) {
     PendingAddData *pd = malloc(sizeof(PendingAddData));
-    pd->tracks = malloc(sizeof(QjTrack*) * count);
+    pd->tracks = malloc(sizeof(QJTrack *) * count);
     pd->count = count;
-    for (int i = 0; i < count; i++) pd->tracks[i] = tracks[i];
+    for (int i = 0; i < count; i++)
+        pd->tracks[i] = tracks[i];
 
     if (strlen(ui_state.playlist_path) == 0) {
         GtkFileDialog *dialog = gtk_file_dialog_new();
@@ -343,49 +286,12 @@ static void request_append_tracks(QjTrack **tracks, int count, GtkWidget *parent
         gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
         gtk_file_dialog_set_default_filter(dialog, filter);
 
-        g_object_unref(filter); g_object_unref(filters);
+        g_object_unref(filter);
+        g_object_unref(filters);
         gtk_file_dialog_save(dialog, GTK_WINDOW(parent), NULL, on_save_new_playlist_ready, pd);
+        g_object_unref(dialog);
     } else {
         execute_pending_adds(pd);
-    }
-}
-
-static void execute_track_activation(const char *filepath) {
-    if (g_str_has_suffix(filepath, ".qjams")) {
-        extern void command_post_load_session(const char *path);
-        command_post_load_session(filepath);
-    } else {
-        int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
-        multitrack_import_file_async(filepath, rec_track);
-    }
-}
-
-static void on_session_overwrite_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
-    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
-    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
-        char *filepath = (char *)user_data;
-        execute_track_activation(filepath);
-        g_free(filepath);
-    } else {
-        g_free(user_data);
-    }
-}
-
-static void request_track_activation(const char *filepath, GtkWidget *parent) {
-    bool is_qjams = g_str_has_suffix(filepath, ".qjams");
-    extern size_t pristine_frames;
-    extern bool is_session_dirty(void);
-
-    if (is_qjams && is_session_dirty() && pristine_frames > 0) {
-        GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Active Session?");
-        gtk_alert_dialog_set_detail(alert, "Loading this session will discard your currently recorded, unsaved audio. Continue?");
-        const char *buttons[] = { "Discard & Load", "Cancel", NULL };
-        gtk_alert_dialog_set_buttons(alert, buttons);
-        gtk_alert_dialog_set_cancel_button(alert, 1);
-        gtk_alert_dialog_set_default_button(alert, 1);
-        gtk_alert_dialog_choose(alert, GTK_WINDOW(parent), NULL, on_session_overwrite_confirm, g_strdup(filepath));
-    } else {
-        execute_track_activation(filepath);
     }
 }
 
@@ -396,23 +302,68 @@ typedef struct {
 static void on_cycle_track_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
-        CycleTrackData *cd = (CycleTrackData*)user_data;
-        extern void execute_global_canvas_reset(void);
-        execute_global_canvas_reset();
+        CycleTrackData *cd = (CycleTrackData *)user_data;
 
-        QjTrack *next_track = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), cd->next_idx));
-        strncpy(ui_state.selected_track_path, next_track->filepath, sizeof(ui_state.selected_track_path) - 1);
+        atomic_store_explicit(&current_recording_track, 0, memory_order_release);
+        atomic_store_explicit(&selected_tracks_mask, 1, memory_order_release);
 
-        extern GtkWidget *lbl_track;
-        request_track_activation(next_track->filepath, GTK_WIDGET(gtk_widget_get_root(lbl_track)));
+        QJTrack *next_track =
+            QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), cd->next_idx));
+        strncpy(ui_state.selected_track_path, next_track->filepath,
+                sizeof(ui_state.selected_track_path) - 1);
+
+        execute_global_canvas_reset(next_track->filepath);
         g_object_unref(next_track);
     }
     g_free(user_data);
 }
 
+// ui_playlist.c
+static void execute_jukebox_load(guint track_idx) {
+    bool has_any_audio = false;
+    for (int i = 0; i < QJ_MAX_TRACKS; i++) {
+        if (atomic_load_explicit(&master_tracks[i].has_audio, memory_order_acquire)) {
+            has_any_audio = true;
+            break;
+        }
+    }
+
+    if (has_any_audio && is_session_dirty() && pristine_frames > 0) {
+        CycleTrackData *cd = g_new(CycleTrackData, 1);
+        cd->next_idx = track_idx;
+
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Discard Active Session?");
+        gtk_alert_dialog_set_detail(
+            alert,
+            "Loading a new track will discard your currently recorded, unsaved audio. Continue?");
+        const char *buttons[] = {"Discard & Load", "Cancel", NULL};
+        gtk_alert_dialog_set_buttons(alert, buttons);
+        gtk_alert_dialog_set_cancel_button(alert, 1);
+        gtk_alert_dialog_set_default_button(alert, 1);
+
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(gtk_widget_get_root(lbl_track)), NULL,
+                                on_cycle_track_confirm, cd);
+        g_object_unref(alert);
+        return;
+    }
+
+    atomic_store_explicit(&current_recording_track, 0, memory_order_release);
+    atomic_store_explicit(&selected_tracks_mask, 1, memory_order_release);
+
+    QJTrack *next_track =
+        QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), track_idx));
+    strncpy(ui_state.selected_track_path, next_track->filepath,
+            sizeof(ui_state.selected_track_path) - 1);
+
+    execute_global_canvas_reset(next_track->filepath);
+
+    g_object_unref(next_track);
+}
+
 bool cycle_playlist_track(int direction) {
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
-    if (n_items == 0) return false;
+    if (n_items == 0)
+        return false;
 
     guint current_idx = find_track_index_by_path(ui_state.selected_track_path);
 
@@ -423,47 +374,21 @@ bool cycle_playlist_track(int direction) {
         current_idx = (guint)(((int)current_idx + direction + (int)n_items) % (int)n_items);
     }
 
-    extern bool is_session_dirty(void);
-    extern size_t pristine_frames;
-
-    if (is_session_dirty() && pristine_frames > 0) {
-        CycleTrackData *cd = g_new(CycleTrackData, 1);
-        cd->next_idx = current_idx;
-
-        GtkAlertDialog *alert = gtk_alert_dialog_new("Discard Active Session?");
-        gtk_alert_dialog_set_detail(alert, "Loading the next track will discard your currently recorded, unsaved audio. Continue?");
-        const char *buttons[] = { "Discard & Load", "Cancel", NULL };
-        gtk_alert_dialog_set_buttons(alert, buttons);
-        gtk_alert_dialog_set_cancel_button(alert, 1);
-        gtk_alert_dialog_set_default_button(alert, 1);
-
-        extern GtkWidget *lbl_track;
-        gtk_alert_dialog_choose(alert, GTK_WINDOW(gtk_widget_get_root(lbl_track)), NULL, on_cycle_track_confirm, cd);
-        return true;
-    }
-
-    extern void execute_global_canvas_reset(void);
-    execute_global_canvas_reset();
-
-    QjTrack *next_track = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), current_idx));
-    strncpy(ui_state.selected_track_path, next_track->filepath, sizeof(ui_state.selected_track_path) - 1);
-
-    extern GtkWidget *lbl_track;
-    request_track_activation(next_track->filepath, GTK_WIDGET(gtk_widget_get_root(lbl_track)));
-
-    g_object_unref(next_track);
+    execute_jukebox_load(current_idx);
     return true;
 }
 
 void save_current_playlist(void) {
     // ... [Lines 399-408]
-    if (strlen(ui_state.playlist_path) == 0) return;
+    if (strlen(ui_state.playlist_path) == 0)
+        return;
     FILE *f = fopen(ui_state.playlist_path, "w");
-    if (!f) return;
+    if (!f)
+        return;
 
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
     for (guint i = 0; i < n_items; i++) {
-        QjTrack *item = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
+        QJTrack *item = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
         fprintf(f, "%s\n", item->filepath);
         g_object_unref(item);
     }
@@ -471,7 +396,8 @@ void save_current_playlist(void) {
 }
 
 void remove_playlist_tracks(GtkBitset *selections) {
-    if (!selections || gtk_bitset_is_empty(selections)) return;
+    if (!selections || gtk_bitset_is_empty(selections))
+        return;
 
     GtkBitset *safe_selections = gtk_bitset_copy(selections);
     int count = 0;
@@ -504,44 +430,69 @@ void remove_active_track_from_playlist(const char *path) {
     }
 }
 
-static void on_delete_selected_clicked(GtkButton *btn, gpointer user_data) {
-    (void)btn; (void)user_data;
-    GtkSelectionModel *model = gtk_list_view_get_model(GTK_LIST_VIEW(track_list_view));
-    GtkBitset *selections = gtk_selection_model_get_selection(model);
-    remove_playlist_tracks(selections);
-    gtk_bitset_unref(selections);
-}
-
-static gboolean on_playlist_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data) {
-    (void)controller; (void)keycode; (void)state; (void)user_data;
-    if (keyval == GDK_KEY_Delete) {
-        GtkSelectionModel *model = gtk_list_view_get_model(GTK_LIST_VIEW(track_list_view));
-        GtkBitset *selections = gtk_selection_model_get_selection(model);
+static void on_delete_selected_confirm(GObject *source_object, GAsyncResult *res,
+                                       gpointer user_data) {
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        GtkBitset *selections = (GtkBitset *)user_data;
         remove_playlist_tracks(selections);
         gtk_bitset_unref(selections);
+    } else {
+        gtk_bitset_unref((GtkBitset *)user_data);
+    }
+}
+
+static void on_delete_selected_clicked(GtkButton *btn, gpointer user_data) {
+    (void)user_data;
+    GtkSelectionModel *model = gtk_list_view_get_model(GTK_LIST_VIEW(track_list_view));
+    GtkBitset *selections = gtk_selection_model_get_selection(model);
+
+    if (gtk_bitset_is_empty(selections)) {
+        gtk_bitset_unref(selections);
+        return;
+    }
+
+    GtkAlertDialog *alert = gtk_alert_dialog_new("Remove Selected Tracks?");
+    gtk_alert_dialog_set_detail(
+        alert, "Are you sure you want to remove the selected tracks from the playlist?");
+    const char *buttons[] = {"Remove", "Cancel", NULL};
+    gtk_alert_dialog_set_buttons(alert, buttons);
+    gtk_alert_dialog_set_cancel_button(alert, 1);
+    gtk_alert_dialog_set_default_button(alert, 1);
+
+    GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(btn)));
+    gtk_alert_dialog_choose(alert, parent, NULL, on_delete_selected_confirm, selections);
+    g_object_unref(alert);
+}
+
+static gboolean on_playlist_key_pressed(GtkEventControllerKey *controller, guint keyval,
+                                        guint keycode, GdkModifierType state, gpointer user_data) {
+    (void)controller;
+    (void)keycode;
+    (void)state;
+    (void)user_data;
+    if (keyval == GDK_KEY_Delete) {
+        if (btn_delete && gtk_widget_is_sensitive(btn_delete)) {
+            g_signal_emit_by_name(btn_delete, "clicked");
+        }
         return TRUE;
     }
     return FALSE;
 }
 
 bool playlist_handle_ctrl_a(void) {
-    if (!track_selection_model) return FALSE;
-    GtkBitset *selections = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(track_selection_model));
+    if (!track_selection_model)
+        return FALSE;
+    GtkBitset *selections =
+        gtk_selection_model_get_selection(GTK_SELECTION_MODEL(track_selection_model));
     bool is_empty = gtk_bitset_is_empty(selections);
     gtk_bitset_unref(selections);
     return is_empty ? TRUE : FALSE;
 }
 
-void remove_track_from_playlist(const char* filepath) {
-    guint idx = find_track_index_by_path(filepath);
-    if (idx != GTK_INVALID_LIST_POSITION) {
-        g_list_store_remove(track_list_store, idx);
-        save_current_playlist();
-    }
-}
-
 static void update_playlist_title_ui(const char *filepath) {
-    if (!lbl_playlist_title) return;
+    if (!lbl_playlist_title)
+        return;
     if (!filepath || strlen(filepath) == 0) {
         gtk_label_set_markup(GTK_LABEL(lbl_playlist_title), "<b>Unsaved Playlist</b>");
         return;
@@ -549,17 +500,19 @@ static void update_playlist_title_ui(const char *filepath) {
 
     char *basename = g_path_get_basename(filepath);
     char *dot = strrchr(basename, '.');
-    if (dot) *dot = '\0';
-
+    if (dot)
+        *dot = '\0';
+    char *escaped_base = g_markup_escape_text(basename, -1);
     char markup[512];
-    snprintf(markup, sizeof(markup), "<b>%s</b>", basename);
+    snprintf(markup, sizeof(markup), "<b>%s</b>", escaped_base);
     gtk_label_set_markup(GTK_LABEL(lbl_playlist_title), markup);
+    g_free(escaped_base);
     g_free(basename);
 }
 
 void load_playlist_from_file(const char *filepath) {
     int found_slot = -1;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 22; i++) {
         if (g_strcmp0(ui_state.config.playlist_slots[i], filepath) == 0) {
             found_slot = i;
             break;
@@ -568,9 +521,13 @@ void load_playlist_from_file(const char *filepath) {
 
     if (found_slot != -1) {
         current_preset_slot = found_slot;
-    } else if (current_preset_slot >= 0 && current_preset_slot < 10 && strlen(ui_state.config.playlist_slots[current_preset_slot]) == 0) {
-        strncpy(ui_state.config.playlist_slots[current_preset_slot], filepath, sizeof(ui_state.config.playlist_slots[0]) - 1);
-        ui_state.config.playlist_slots[current_preset_slot][sizeof(ui_state.config.playlist_slots[0]) - 1] = '\0';
+    } else if (current_preset_slot >= 0 && current_preset_slot < 22 &&
+               strlen(ui_state.config.playlist_slots[current_preset_slot]) == 0) {
+        strncpy(ui_state.config.playlist_slots[current_preset_slot], filepath,
+                sizeof(ui_state.config.playlist_slots[0]) - 1);
+        ui_state.config
+            .playlist_slots[current_preset_slot][sizeof(ui_state.config.playlist_slots[0]) - 1] =
+            '\0';
         save_qjams_config(ui_state.config_path, &ui_state.config);
     } else {
         current_preset_slot = -1;
@@ -586,8 +543,10 @@ void load_playlist_from_file(const char *filepath) {
 
         while (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\r\n")] = 0;
-            if (strlen(line) == 0 || line[0] == '#') continue;
-            if (!is_supported_media_file(line)) continue;
+            if (strlen(line) == 0 || line[0] == '#')
+                continue;
+            if (!is_supported_media_file(line))
+                continue;
 
             char *abs_path = NULL;
             if (g_path_is_absolute(line)) {
@@ -598,7 +557,7 @@ void load_playlist_from_file(const char *filepath) {
 
             char display_buf[512];
             bool is_native = extract_track_metadata(abs_path, display_buf, sizeof(display_buf));
-            QjTrack *trk = qj_track_new(abs_path, display_buf, is_native);
+            QJTrack *trk = qj_track_new(abs_path, display_buf, is_native);
             g_list_store_append(track_list_store, trk);
 
             g_object_unref(trk);
@@ -614,12 +573,13 @@ void load_playlist_from_file(const char *filepath) {
 }
 
 void update_playlist_toggle_state(void) {
-    if (!btn_playlist_toggle) return;
+    if (!btn_playlist_toggle)
+        return;
 
     if (strlen(ui_state.selected_track_path) == 0) {
         gtk_button_set_icon_name(GTK_BUTTON(btn_playlist_toggle), "");
         gtk_button_set_label(GTK_BUTTON(btn_playlist_toggle), "+");
-        gtk_widget_set_tooltip_text(btn_playlist_toggle, "No Track Selected");
+        gtk_widget_set_tooltip_text(btn_playlist_toggle, "No Track/Session Selected");
         gtk_widget_set_sensitive(btn_playlist_toggle, FALSE);
         gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(track_selection_model));
         return;
@@ -631,19 +591,21 @@ void update_playlist_toggle_state(void) {
     if (found_idx != GTK_INVALID_LIST_POSITION) {
         gtk_button_set_icon_name(GTK_BUTTON(btn_playlist_toggle), "");
         gtk_button_set_label(GTK_BUTTON(btn_playlist_toggle), "-");
-        gtk_widget_set_tooltip_text(btn_playlist_toggle, "Remove from Playlist");
-        gtk_selection_model_select_item(GTK_SELECTION_MODEL(track_selection_model), found_idx, TRUE);
+        gtk_widget_set_tooltip_text(btn_playlist_toggle, "Remove Track/Session from Playlist");
+        gtk_selection_model_select_item(GTK_SELECTION_MODEL(track_selection_model), found_idx,
+                                        TRUE);
     } else {
         gtk_button_set_icon_name(GTK_BUTTON(btn_playlist_toggle), "");
         gtk_button_set_label(GTK_BUTTON(btn_playlist_toggle), "+");
-        gtk_widget_set_tooltip_text(btn_playlist_toggle, "Add to Playlist");
+        gtk_widget_set_tooltip_text(btn_playlist_toggle, "Add Track/Session to Playlist");
         gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(track_selection_model));
     }
 }
 
 void on_playlist_toggle_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
-    if (strlen(ui_state.selected_track_path) == 0) return;
+    if (strlen(ui_state.selected_track_path) == 0)
+        return;
 
     guint existing_index = find_track_index_by_path(ui_state.selected_track_path);
     if (existing_index != GTK_INVALID_LIST_POSITION) {
@@ -652,10 +614,11 @@ void on_playlist_toggle_clicked(GtkButton *button, gpointer user_data) {
     }
 
     char display_buf[512];
-    bool is_native = extract_track_metadata(ui_state.selected_track_path, display_buf, sizeof(display_buf));
-    QjTrack *new_track = qj_track_new(ui_state.selected_track_path, display_buf, is_native);
+    bool is_native =
+        extract_track_metadata(ui_state.selected_track_path, display_buf, sizeof(display_buf));
+    QJTrack *new_track = qj_track_new(ui_state.selected_track_path, display_buf, is_native);
 
-    QjTrack *tracks[] = { new_track };
+    QJTrack *tracks[] = {new_track};
     request_append_tracks(tracks, 1, GTK_WIDGET(gtk_widget_get_root(GTK_WIDGET(button))));
 }
 
@@ -664,15 +627,16 @@ static bool is_playlist_custom_ordered = false;
 
 static gint compare_tracks(gconstpointer a, gconstpointer b, gpointer user_data) {
     (void)user_data;
-    QjTrack *track_a = *(QjTrack **)a;
-    QjTrack *track_b = *(QjTrack **)b;
+    QJTrack *track_a = *(QJTrack **)a;
+    QJTrack *track_b = *(QJTrack **)b;
     int result = g_strcmp0(track_a->display_name, track_b->display_name);
     return sort_ascending ? result : -result;
 }
 
 static void perform_playlist_sort(GtkButton *button) {
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
-    if (n_items <= 1) return;
+    if (n_items <= 1)
+        return;
 
     GPtrArray *array = g_ptr_array_new();
     for (guint i = 0; i < n_items; i++) {
@@ -695,7 +659,8 @@ static void perform_playlist_sort(GtkButton *button) {
     save_current_playlist();
 }
 
-static void on_sort_confirm_response(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+static void on_sort_confirm_response(GObject *source_object, GAsyncResult *res,
+                                     gpointer user_data) {
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
         perform_playlist_sort(GTK_BUTTON(user_data));
@@ -706,46 +671,64 @@ static void on_sort_playlist_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
     if (is_playlist_custom_ordered) {
         GtkAlertDialog *alert = gtk_alert_dialog_new("Sort Custom Playlist?");
-        gtk_alert_dialog_set_detail(alert, "You have manually reordered tracks. Sorting will overwrite your custom order. Continue?");
-        const char *buttons[] = { "Sort", "Cancel", NULL };
+        gtk_alert_dialog_set_detail(alert, "You have manually reordered tracks. Sorting will "
+                                           "overwrite your custom order. Continue?");
+        const char *buttons[] = {"Sort", "Cancel", NULL};
         gtk_alert_dialog_set_buttons(alert, buttons);
         gtk_alert_dialog_set_cancel_button(alert, 1);
         gtk_alert_dialog_set_default_button(alert, 1);
-        gtk_alert_dialog_choose(alert, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))), NULL, on_sort_confirm_response, button);
+        gtk_alert_dialog_choose(alert, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))), NULL,
+                                on_sort_confirm_response, button);
+        g_object_unref(alert);
     } else {
         perform_playlist_sort(button);
     }
 }
 
-static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, GtkWidget *widget) {
-    (void)source; (void)x; (void)y;
-    QjTrack *track = g_object_get_data(G_OBJECT(widget), "track");
-    if (!track) return NULL;
+static GdkContentProvider *on_drag_prepare(GtkDragSource *source, double x, double y,
+                                           GtkWidget *widget) {
+    (void)source;
+    (void)x;
+    (void)y;
+    QJTrack *track = g_object_get_data(G_OBJECT(widget), "track");
+    if (!track)
+        return NULL;
     return gdk_content_provider_new_typed(QJ_TYPE_TRACK, track);
 }
 
-static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, double y, GtkWidget *widget) {
-    (void)target; (void)x; (void)y;
-    QjTrack *source_track = g_value_get_object(value);
-    QjTrack *target_track = g_object_get_data(G_OBJECT(widget), "track");
+static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, double y,
+                        GtkWidget *widget) {
+    (void)target;
+    (void)x;
+    (void)y;
+    QJTrack *source_track = g_value_get_object(value);
+    QJTrack *target_track = g_object_get_data(G_OBJECT(widget), "track");
 
-    if (!source_track || !target_track || source_track == target_track) return FALSE;
+    if (!source_track || !target_track || source_track == target_track)
+        return FALSE;
 
     guint src_pos = 0, dest_pos = 0;
     gboolean found_src = FALSE, found_dest = FALSE;
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
 
     for (guint i = 0; i < n_items; i++) {
-        QjTrack *t = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
-        if (t == source_track) { src_pos = i; found_src = TRUE; }
-        if (t == target_track) { dest_pos = i; found_dest = TRUE; }
+        QJTrack *t = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
+        if (t == source_track) {
+            src_pos = i;
+            found_src = TRUE;
+        }
+        if (t == target_track) {
+            dest_pos = i;
+            found_dest = TRUE;
+        }
         g_object_unref(t);
     }
 
     if (found_src && found_dest) {
         g_object_ref(source_track);
         g_list_store_remove(track_list_store, src_pos);
-        if (src_pos < dest_pos) dest_pos--;
+        if (src_pos < dest_pos)
+            dest_pos--;
         g_list_store_insert(track_list_store, dest_pos, source_track);
         g_object_unref(source_track);
         is_playlist_custom_ordered = true;
@@ -755,8 +738,10 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
     return FALSE;
 }
 
-static void on_setup_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item, gpointer user_data) {
-    (void)factory; (void)user_data;
+static void on_setup_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item,
+                               gpointer user_data) {
+    (void)factory;
+    (void)user_data;
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_widget_set_margin_start(box, 5);
@@ -773,7 +758,7 @@ static void on_setup_list_item(GtkSignalListItemFactory *factory, GtkListItem *l
     gtk_box_append(GTK_BOX(box), label);
 
     GtkDragSource *drag_source = gtk_drag_source_new();
-    gtk_drag_source_set_actions(drag_source, GDK_ACTION_MOVE);
+    gtk_drag_source_set_actions(drag_source, GDK_ACTION_COPY | GDK_ACTION_MOVE);
     g_signal_connect(drag_source, "prepare", G_CALLBACK(on_drag_prepare), box);
     gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(drag_source));
 
@@ -786,9 +771,11 @@ static void on_setup_list_item(GtkSignalListItemFactory *factory, GtkListItem *l
     gtk_list_item_set_child(list_item, box);
 }
 
-static void on_bind_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item, gpointer user_data) {
-    (void)factory; (void)user_data;
-    QjTrack *track = QJ_TRACK(gtk_list_item_get_item(list_item));
+static void on_bind_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item,
+                              gpointer user_data) {
+    (void)factory;
+    (void)user_data;
+    QJTrack *track = QJ_TRACK(gtk_list_item_get_item(list_item));
     GtkWidget *box = gtk_list_item_get_child(list_item);
 
     GtkWidget *icon = g_object_get_data(G_OBJECT(box), "icon");
@@ -805,7 +792,7 @@ static void on_bind_list_item(GtkSignalListItemFactory *factory, GtkListItem *li
 }
 
 typedef struct {
-    QjTrack *track;
+    QJTrack *track;
     GtkWidget *entry;
     GtkWidget *dialog;
 } RenameData;
@@ -816,6 +803,132 @@ static void free_rename_data(gpointer data) {
     free(rd);
 }
 
+typedef struct {
+    char *old_path;
+    char *new_path;
+    char *new_name;
+    QJTrack *track;
+    bool is_audio_rewrite;
+    bool success;
+} AsyncRenameData;
+
+static void free_async_rename_data(gpointer data) {
+    AsyncRenameData *ard = (AsyncRenameData *)data;
+    g_free(ard->old_path);
+    g_free(ard->new_path);
+    g_free(ard->new_name);
+    g_free(ard);
+}
+
+/**
+ * @brief Background worker that renames a track file on disk and updates its title tag
+ *        via FFmpeg stream copy when applicable. Uses an atomic staging path if the
+ *        source and destination paths are identical to prevent in-place truncation.
+ */
+static void rename_track_thread(GTask *task, gpointer source_object, gpointer task_data,
+                                GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    AsyncRenameData *ard = (AsyncRenameData *)task_data;
+    bool same_path = (g_strcmp0(ard->old_path, ard->new_path) == 0);
+    if (ard->is_audio_rewrite) {
+        const char *ext = strrchr(ard->new_path, '.');
+        if (!ext)
+            ext = "";
+        char *target_out = same_path ? g_strdup_printf("%s.ren_tmp%s", ard->new_path, ext)
+                                     : g_strdup(ard->new_path);
+        char *meta_title = g_strdup_printf("title=%s", ard->new_name);
+        char *argv[] = {"ffmpeg", "-y",   "-loglevel", "error",    "-i",       ard->old_path,
+                        "-c",     "copy", "-metadata", meta_title, target_out, NULL};
+        int exit_status = 0;
+        g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL, &exit_status,
+                     NULL);
+        g_free(meta_title);
+        if (exit_status == 0 && g_file_test(target_out, G_FILE_TEST_IS_REGULAR)) {
+            if (same_path) {
+                ard->success = (rename(target_out, ard->new_path) == 0);
+                if (!ard->success)
+                    remove(target_out);
+            } else {
+                remove(ard->old_path);
+                ard->success = true;
+            }
+        } else {
+            if (same_path)
+                remove(target_out);
+            ard->success = false;
+        }
+        g_free(target_out);
+    } else {
+        if (same_path) {
+            ard->success = true;
+        } else if (rename(ard->old_path, ard->new_path) == 0) {
+            ard->success = true;
+        } else {
+            ard->success = false;
+        }
+    }
+    g_task_return_boolean(task, ard->success);
+}
+
+static void rename_track_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object;
+    (void)user_data;
+    GError *error = NULL;
+    gboolean success = g_task_propagate_boolean(G_TASK(res), &error);
+    AsyncRenameData *ard = (AsyncRenameData *)g_task_get_task_data(G_TASK(res));
+
+    extern GtkWidget *main_spinner;
+    if (main_spinner)
+        gtk_spinner_stop(GTK_SPINNER(main_spinner));
+
+    GtkWindow *win =
+        gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    if (win) {
+        GtkWidget *master_box = gtk_window_get_child(win);
+        if (master_box)
+            gtk_widget_set_sensitive(master_box, TRUE);
+    }
+    set_app_waiting_state(false);
+
+    if (success) {
+        g_free(ard->track->filepath);
+        ard->track->filepath = g_strdup(ard->new_path);
+
+        g_free(ard->track->display_name);
+        char display_buf[512];
+        extract_track_metadata(ard->new_path, display_buf, sizeof(display_buf));
+        ard->track->display_name = g_strdup(display_buf);
+
+        guint pos = find_track_index_by_path(ard->new_path);
+        if (pos != GTK_INVALID_LIST_POSITION) {
+            g_object_ref(ard->track);
+            g_list_store_remove(track_list_store, pos);
+            g_list_store_insert(track_list_store, pos, ard->track);
+            gtk_selection_model_select_item(GTK_SELECTION_MODEL(track_selection_model), pos, TRUE);
+            g_object_unref(ard->track);
+        }
+
+        save_current_playlist();
+
+        if (g_strcmp0(ui_state.selected_track_path, ard->old_path) == 0) {
+            strncpy(ui_state.selected_track_path, ard->track->filepath,
+                    sizeof(ui_state.selected_track_path) - 1);
+            ui_state.selected_track_path[sizeof(ui_state.selected_track_path) - 1] = '\0';
+            char ui_text[600];
+            snprintf(ui_text, sizeof(ui_text), "Track: %s", display_buf);
+            extern GtkWidget *lbl_track;
+            if (lbl_track)
+                gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
+        }
+        log_and_notify(1, "Status: Track Renamed");
+    } else {
+        log_and_notify(1, "Status: Rename Failed");
+    }
+
+    g_object_unref(ard->track);
+}
+
 static void on_rename_confirm(GtkButton *btn, gpointer user_data) {
     (void)btn;
     RenameData *rd = (RenameData *)user_data;
@@ -824,54 +937,48 @@ static void on_rename_confirm(GtkButton *btn, gpointer user_data) {
     if (strlen(new_name) > 0) {
         char *dir = g_path_get_dirname(rd->track->filepath);
         char *ext = strrchr(rd->track->filepath, '.');
-        if (!ext) ext = "";
+        if (!ext)
+            ext = "";
 
         char *new_path = g_strdup_printf("%s/%s%s", dir, new_name, ext);
 
+        bool is_audio = false;
         if (g_str_has_suffix(rd->track->filepath, ".flac") ||
-            g_str_has_suffix(rd->track->filepath, ".wav")  ||
-            g_str_has_suffix(rd->track->filepath, ".mp3")  ||
+            g_str_has_suffix(rd->track->filepath, ".wav") ||
+            g_str_has_suffix(rd->track->filepath, ".mp3") ||
             g_str_has_suffix(rd->track->filepath, ".ogg")) {
-
-            char *meta_title = g_strdup_printf("title=%s", new_name);
-        char *argv[] = {"ffmpeg", "-y", "-i", rd->track->filepath, "-c", "copy", "-metadata", meta_title, new_path, NULL};
-        int exit_status = 0;
-        g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL, &exit_status, NULL);
-        g_free(meta_title);
-        if (exit_status == 0 && g_file_test(new_path, G_FILE_TEST_IS_REGULAR)) {
-            remove(rd->track->filepath);
+            is_audio = true;
         }
-            } else {
-                rename(rd->track->filepath, new_path);
-            }
 
-            g_free(rd->track->filepath);
-            rd->track->filepath = new_path;
+        AsyncRenameData *ard = g_new0(AsyncRenameData, 1);
+        ard->old_path = g_strdup(rd->track->filepath);
+        ard->new_path = g_strdup(new_path);
+        ard->new_name = g_strdup(new_name);
+        ard->track = rd->track;
+        ard->is_audio_rewrite = is_audio;
 
-            g_free(rd->track->display_name);
-            char display_buf[512];
-            extract_track_metadata(new_path, display_buf, sizeof(display_buf));
-            rd->track->display_name = g_strdup(display_buf);
+        g_object_ref(ard->track);
 
-            guint pos = find_track_index_by_path(new_path);
-            if (pos != GTK_INVALID_LIST_POSITION) {
-                g_object_ref(rd->track);
-                g_list_store_remove(track_list_store, pos);
-                g_list_store_insert(track_list_store, pos, rd->track);
-                gtk_selection_model_select_item(GTK_SELECTION_MODEL(track_selection_model), pos, TRUE);
-                g_object_unref(rd->track);
-            }
+        extern GtkWidget *main_spinner;
+        if (main_spinner)
+            gtk_spinner_start(GTK_SPINNER(main_spinner));
 
-            save_current_playlist();
-            g_free(dir);
+        GtkWindow *win_main =
+            gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+        if (win_main) {
+            GtkWidget *master_box = gtk_window_get_child(win_main);
+            if (master_box)
+                gtk_widget_set_sensitive(master_box, FALSE);
+        }
+        set_app_waiting_state(true);
 
-            if (g_strcmp0(ui_state.selected_track_path, rd->track->filepath) != 0) {
-                strncpy(ui_state.selected_track_path, rd->track->filepath, sizeof(ui_state.selected_track_path) - 1);
-                char ui_text[600];
-                snprintf(ui_text, sizeof(ui_text), "Track: %s", display_buf);
-                extern GtkWidget *lbl_track;
-                gtk_label_set_text(GTK_LABEL(lbl_track), ui_text);
-            }
+        GTask *task = g_task_new(NULL, NULL, rename_track_ready, NULL);
+        g_task_set_task_data(task, ard, free_async_rename_data);
+        g_task_run_in_thread(task, rename_track_thread);
+        g_object_unref(task);
+
+        g_free(new_path);
+        g_free(dir);
     }
 
     GtkWidget *win = rd->dialog;
@@ -880,7 +987,8 @@ static void on_rename_confirm(GtkButton *btn, gpointer user_data) {
 
 static void on_rename_track_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
-    GtkBitset *selections = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(track_selection_model));
+    GtkBitset *selections =
+        gtk_selection_model_get_selection(GTK_SELECTION_MODEL(track_selection_model));
     if (gtk_bitset_is_empty(selections)) {
         gtk_bitset_unref(selections);
         return;
@@ -890,13 +998,15 @@ static void on_rename_track_clicked(GtkButton *button, gpointer user_data) {
     gtk_bitset_unref(selections);
 
     gpointer item = g_list_model_get_item(G_LIST_MODEL(track_list_store), pos);
-    if (!item) return;
+    if (!item)
+        return;
 
-    QjTrack *track = QJ_TRACK(item);
+    QJTrack *track = QJ_TRACK(item);
 
     GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Rename Track");
-    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));
+    gtk_window_set_transient_for(GTK_WINDOW(dialog),
+                                 GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));
     gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 100);
 
@@ -908,7 +1018,8 @@ static void on_rename_track_clicked(GtkButton *button, gpointer user_data) {
 
     char *basename = g_path_get_basename(track->filepath);
     char *dot = strrchr(basename, '.');
-    if (dot) *dot = '\0';
+    if (dot)
+        *dot = '\0';
 
     GtkWidget *entry = gtk_entry_new();
     gtk_editable_set_text(GTK_EDITABLE(entry), basename);
@@ -924,6 +1035,7 @@ static void on_rename_track_clicked(GtkButton *button, gpointer user_data) {
 
     g_object_set_data_full(G_OBJECT(dialog), "rename_data", rd, free_rename_data);
     g_signal_connect(btn_confirm, "clicked", G_CALLBACK(on_rename_confirm), rd);
+    g_signal_connect(entry, "activate", G_CALLBACK(on_rename_confirm), rd);
 
     gtk_box_append(GTK_BOX(vbox), gtk_label_new("Enter new track name:"));
     gtk_box_append(GTK_BOX(vbox), entry);
@@ -934,29 +1046,27 @@ static void on_rename_track_clicked(GtkButton *button, gpointer user_data) {
 }
 
 static gboolean is_supported_media_file(const char *path) {
-    if (!path) return FALSE;
-    const char *ext = strrchr(path, '.');
-    if (!ext) return FALSE;
-    if (g_ascii_strcasecmp(ext, ".flac") == 0 || g_ascii_strcasecmp(ext, ".wav") == 0 ||
-        g_ascii_strcasecmp(ext, ".ogg") == 0 || g_ascii_strcasecmp(ext, ".mp3") == 0 ||
-        g_ascii_strcasecmp(ext, ".mkv") == 0 || g_ascii_strcasecmp(ext, ".qjams") == 0) {
-        return TRUE;
-        }
+    if (!path)
         return FALSE;
+    const char *ext = strrchr(path, '.');
+    if (!ext)
+        return FALSE;
+    if (g_ascii_strcasecmp(ext, ".qjams") == 0)
+        return TRUE;
+    return is_audio_file(path) || is_video_file(path);
 }
 
 static void on_track_activated(GtkListView *list, guint position, gpointer user_data) {
-    (void)list; (void)user_data;
-    QjTrack *track = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), position));
-    if (!track) return;
-
-    extern GtkWidget *lbl_track;
-    request_track_activation(track->filepath, GTK_WIDGET(gtk_widget_get_root(lbl_track)));
-    g_object_unref(track);
+    (void)list;
+    (void)user_data;
+    execute_jukebox_load(position);
 }
 
-static void on_playlist_selection_changed(GtkSelectionModel *model, guint position, guint n_items, gpointer user_data) {
-    (void)position; (void)n_items; (void)user_data;
+static void on_playlist_selection_changed(GtkSelectionModel *model, guint position, guint n_items,
+                                          gpointer user_data) {
+    (void)position;
+    (void)n_items;
+    (void)user_data;
     GtkBitset *selections = gtk_selection_model_get_selection(model);
     guint count = gtk_bitset_get_size(selections);
     gtk_bitset_unref(selections);
@@ -971,7 +1081,7 @@ static int get_unique_name_suffix(const char *base_title) {
     guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
 
     for (guint i = 0; i < n_items; i++) {
-        QjTrack *t = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
+        QJTrack *t = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
         const char *title = t->display_name;
 
         if (title) {
@@ -982,7 +1092,8 @@ static int get_unique_name_suffix(const char *base_title) {
                 } else if (g_str_has_prefix(remainder, " (")) {
                     int suffix = 0;
                     if (sscanf(remainder, " (%d) [", &suffix) == 1) {
-                        if (suffix > max_suffix) max_suffix = suffix;
+                        if (suffix > max_suffix)
+                            max_suffix = suffix;
                     }
                 }
             }
@@ -990,7 +1101,8 @@ static int get_unique_name_suffix(const char *base_title) {
         g_object_unref(t);
     }
 
-    if (!exact_found) return 0;
+    if (!exact_found)
+        return 0;
     return max_suffix + 1;
 }
 
@@ -1014,13 +1126,16 @@ static void free_playlist_drop_data(gpointer data) {
     }
 }
 
-static void playlist_drop_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
-    (void)source_object; (void)cancellable;
+static void playlist_drop_thread(GTask *task, gpointer source_object, gpointer task_data,
+                                 GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
     PlaylistDropData *data = (PlaylistDropData *)task_data;
 
     for (int i = 0; i < data->count; i++) {
         if (is_supported_media_file(data->items[i].path)) {
-            data->items[i].is_native = extract_track_metadata(data->items[i].path, data->items[i].display, sizeof(data->items[i].display));
+            data->items[i].is_native = extract_track_metadata(
+                data->items[i].path, data->items[i].display, sizeof(data->items[i].display));
             data->items[i].is_valid = true;
         } else {
             data->items[i].is_valid = false;
@@ -1030,20 +1145,22 @@ static void playlist_drop_thread(GTask *task, gpointer source_object, gpointer t
 }
 
 static void playlist_drop_ready(GObject *source_object, GAsyncResult *res, gpointer user_data) {
-    (void)source_object; (void)user_data;
+    (void)source_object;
+    (void)user_data;
     GError *error = NULL;
     g_task_propagate_boolean(G_TASK(res), &error);
 
     PlaylistDropData *data = g_task_get_task_data(G_TASK(res));
-    if (!data) return;
+    if (!data)
+        return;
 
-    extern GtkWidget *main_spinner;
 
     int valid_count = 0;
-    QjTrack **pending_tracks = malloc(sizeof(QjTrack*) * data->count);
+    QJTrack **pending_tracks = malloc(sizeof(QJTrack *) * data->count);
 
     for (int i = 0; i < data->count; i++) {
-        if (!data->items[i].is_valid) continue;
+        if (!data->items[i].is_valid)
+            continue;
 
         if (find_track_index_by_path(data->items[i].path) == GTK_INVALID_LIST_POSITION) {
             char base_name[512] = {0};
@@ -1052,7 +1169,8 @@ static void playlist_drop_ready(GObject *source_object, GAsyncResult *res, gpoin
 
             if (bracket && bracket > data->items[i].display && *(bracket - 1) == ' ') {
                 size_t len = bracket - data->items[i].display - 1;
-                if (len >= sizeof(base_name)) len = sizeof(base_name) - 1;
+                if (len >= sizeof(base_name))
+                    len = sizeof(base_name) - 1;
                 strncpy(base_name, data->items[i].display, len);
                 base_name[len] = '\0';
                 strncpy(duration_part, bracket, sizeof(duration_part) - 1);
@@ -1067,7 +1185,8 @@ static void playlist_drop_ready(GObject *source_object, GAsyncResult *res, gpoin
 
             if (suffix > 0) {
                 if (strlen(duration_part) > 0) {
-                    snprintf(final_display, sizeof(final_display), "%s (%d) %s", base_name, suffix, duration_part);
+                    snprintf(final_display, sizeof(final_display), "%s (%d) %s", base_name, suffix,
+                             duration_part);
                 } else {
                     snprintf(final_display, sizeof(final_display), "%s (%d)", base_name, suffix);
                 }
@@ -1075,14 +1194,15 @@ static void playlist_drop_ready(GObject *source_object, GAsyncResult *res, gpoin
                 snprintf(final_display, sizeof(final_display), "%s", data->items[i].display);
             }
 
-            QjTrack *new_track = qj_track_new(data->items[i].path, final_display, data->items[i].is_native);
+            QJTrack *new_track =
+                qj_track_new(data->items[i].path, final_display, data->items[i].is_native);
             pending_tracks[valid_count++] = new_track;
         }
     }
 
     if (valid_count > 0) {
-        extern GtkWidget *lbl_track;
-        request_append_tracks(pending_tracks, valid_count, GTK_WIDGET(gtk_widget_get_root(lbl_track)));
+        request_append_tracks(pending_tracks, valid_count,
+                              GTK_WIDGET(gtk_widget_get_root(lbl_track)));
     } else {
         log_and_notify(1, "Status: Playlist up to date");
     }
@@ -1091,20 +1211,27 @@ static void playlist_drop_ready(GObject *source_object, GAsyncResult *res, gpoin
     gtk_spinner_stop(GTK_SPINNER(main_spinner));
 }
 
-static gboolean on_playlist_file_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
-    (void)target; (void)x; (void)y; (void)user_data;
-    if (!G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST)) return FALSE;
+static gboolean on_playlist_file_drop(GtkDropTarget *target, const GValue *value, double x,
+                                      double y, gpointer user_data) {
+    (void)target;
+    (void)x;
+    (void)y;
+    (void)user_data;
+    if (!G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST))
+        return FALSE;
 
     GdkFileList *file_list = g_value_get_boxed(value);
-    if (!file_list) return FALSE;
+    if (!file_list)
+        return FALSE;
 
     GSList *files = gdk_file_list_get_files(file_list);
-    if (!files) return FALSE;
+    if (!files)
+        return FALSE;
 
     char **paths = NULL;
     int path_count = 0;
     int path_capacity = 32;
-    paths = malloc(path_capacity * sizeof(char*));
+    paths = malloc(path_capacity * sizeof(char *));
 
     for (GSList *l = files; l != NULL; l = l->next) {
         GFile *file = G_FILE(l->data);
@@ -1118,12 +1245,19 @@ static gboolean on_playlist_file_drop(GtkDropTarget *target, const GValue *value
 
                     while (fgets(line, sizeof(line), f)) {
                         line[strcspn(line, "\r\n")] = 0;
-                        if (strlen(line) == 0 || line[0] == '#') continue;
-                        if (!is_supported_media_file(line)) continue;
+                        if (strlen(line) == 0 || line[0] == '#')
+                            continue;
+                        if (!is_supported_media_file(line))
+                            continue;
 
                         if (path_count >= path_capacity) {
                             path_capacity *= 2;
-                            paths = realloc(paths, path_capacity * sizeof(char*));
+                            char **tmp_paths = realloc(paths, path_capacity * sizeof(char *));
+                            if (!tmp_paths) {
+                                log_and_notify(1, "Status: Playlist load aborted (Out of memory)");
+                                break;
+                            }
+                            paths = tmp_paths;
                         }
 
                         if (g_path_is_absolute(line)) {
@@ -1139,7 +1273,13 @@ static gboolean on_playlist_file_drop(GtkDropTarget *target, const GValue *value
             } else {
                 if (path_count >= path_capacity) {
                     path_capacity *= 2;
-                    paths = realloc(paths, path_capacity * sizeof(char*));
+                    char **tmp_paths = realloc(paths, path_capacity * sizeof(char *));
+                    if (!tmp_paths) {
+                        g_free(path);
+                        log_and_notify(1, "Status: Playlist load aborted (Out of memory)");
+                        break;
+                    }
+                    paths = tmp_paths;
                 }
                 paths[path_count++] = path;
             }
@@ -1163,7 +1303,6 @@ static gboolean on_playlist_file_drop(GtkDropTarget *target, const GValue *value
     }
     free(paths);
 
-    extern GtkWidget *main_spinner;
     gtk_spinner_start(GTK_SPINNER(main_spinner));
 
     log_and_notify(1, "Status: Inspecting %d file(s)...", path_count);
@@ -1191,13 +1330,15 @@ static void on_rename_playlist_confirm(GtkButton *btn, gpointer user_data) {
         char *new_path = g_strdup_printf("%s/%s.m3u", dir, new_name);
 
         if (rename(ui_state.playlist_path, new_path) == 0) {
-            for (int i = 0; i < 10; i++) {
+            for (int i = 0; i < 22; i++) {
                 if (g_strcmp0(ui_state.config.playlist_slots[i], ui_state.playlist_path) == 0) {
-                    strncpy(ui_state.config.playlist_slots[i], new_path, sizeof(ui_state.config.playlist_slots[0]) - 1);
+                    strncpy(ui_state.config.playlist_slots[i], new_path,
+                            sizeof(ui_state.config.playlist_slots[0]) - 1);
                 }
             }
             strncpy(ui_state.playlist_path, new_path, sizeof(ui_state.playlist_path) - 1);
-            strncpy(ui_state.config.last_playlist_path, new_path, sizeof(ui_state.config.last_playlist_path) - 1);
+            strncpy(ui_state.config.last_playlist_path, new_path,
+                    sizeof(ui_state.config.last_playlist_path) - 1);
 
             save_qjams_config(ui_state.config_path, &ui_state.config);
             update_playlist_title_ui(ui_state.playlist_path);
@@ -1213,11 +1354,13 @@ static void on_rename_playlist_confirm(GtkButton *btn, gpointer user_data) {
 
 static void on_rename_playlist_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
-    if (strlen(ui_state.playlist_path) == 0) return;
+    if (strlen(ui_state.playlist_path) == 0)
+        return;
 
     GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Rename Playlist");
-    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));
+    gtk_window_set_transient_for(GTK_WINDOW(dialog),
+                                 GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));
     gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 100);
 
@@ -1229,7 +1372,8 @@ static void on_rename_playlist_clicked(GtkButton *button, gpointer user_data) {
 
     char *basename = g_path_get_basename(ui_state.playlist_path);
     char *dot = strrchr(basename, '.');
-    if (dot) *dot = '\0';
+    if (dot)
+        *dot = '\0';
 
     GtkWidget *entry = gtk_entry_new();
     gtk_editable_set_text(GTK_EDITABLE(entry), basename);
@@ -1244,6 +1388,7 @@ static void on_rename_playlist_clicked(GtkButton *button, gpointer user_data) {
 
     g_object_set_data_full(G_OBJECT(dialog), "rename_data", rd, free);
     g_signal_connect(btn_confirm, "clicked", G_CALLBACK(on_rename_playlist_confirm), rd);
+    g_signal_connect(entry, "activate", G_CALLBACK(on_rename_playlist_confirm), rd);
 
     gtk_box_append(GTK_BOX(vbox), gtk_label_new("Enter new playlist name:"));
     gtk_box_append(GTK_BOX(vbox), entry);
@@ -1253,11 +1398,12 @@ static void on_rename_playlist_clicked(GtkButton *button, gpointer user_data) {
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
-static void on_clear_playlist_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+static void on_clear_playlist_confirm(GObject *source_object, GAsyncResult *res,
+                                      gpointer user_data) {
     (void)user_data;
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
-        if (current_preset_slot >= 0 && current_preset_slot < 10) {
+        if (current_preset_slot >= 0 && current_preset_slot < 22) {
             ui_state.config.playlist_slots[current_preset_slot][0] = '\0';
             save_qjams_config(ui_state.config_path, &ui_state.config);
         }
@@ -1272,11 +1418,14 @@ static void on_clear_playlist_confirm(GObject *source_object, GAsyncResult *res,
 
 static void on_clear_playlist_clicked(GtkButton *btn, gpointer user_data) {
     (void)user_data;
-    if (current_preset_slot == -1 && strlen(ui_state.playlist_path) == 0) return;
+    if (current_preset_slot == -1 && strlen(ui_state.playlist_path) == 0)
+        return;
 
     GtkAlertDialog *alert = gtk_alert_dialog_new("Clear Active Playlist?");
-    gtk_alert_dialog_set_detail(alert, "This will clear the active playlist from memory and unbind the preset slot. The .m3u file on your disk will NOT be deleted.");
-    const char *buttons[] = { "Clear Playlist", "Cancel", NULL };
+    gtk_alert_dialog_set_detail(alert,
+                                "This will clear the active playlist from memory and unbind the "
+                                "preset slot. The .m3u file on your disk will NOT be deleted.");
+    const char *buttons[] = {"Clear Playlist", "Cancel", NULL};
     gtk_alert_dialog_set_buttons(alert, buttons);
     gtk_alert_dialog_set_cancel_button(alert, 1);
     gtk_alert_dialog_set_default_button(alert, 1);
@@ -1286,14 +1435,15 @@ static void on_clear_playlist_clicked(GtkButton *btn, gpointer user_data) {
     g_object_unref(alert);
 }
 
-static void on_delete_playlist_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+static void on_delete_playlist_confirm(GObject *source_object, GAsyncResult *res,
+                                       gpointer user_data) {
     (void)user_data;
     GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
     if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
         if (strlen(ui_state.playlist_path) > 0) {
             remove(ui_state.playlist_path);
 
-            if (current_preset_slot >= 0 && current_preset_slot < 10) {
+            if (current_preset_slot >= 0 && current_preset_slot < 22) {
                 ui_state.config.playlist_slots[current_preset_slot][0] = '\0';
                 save_qjams_config(ui_state.config_path, &ui_state.config);
             }
@@ -1310,17 +1460,21 @@ static void on_delete_playlist_confirm(GObject *source_object, GAsyncResult *res
 
 static void on_delete_playlist_clicked(GtkButton *btn, gpointer user_data) {
     (void)user_data;
-    if (strlen(ui_state.playlist_path) == 0) return;
+    if (strlen(ui_state.playlist_path) == 0)
+        return;
 
     char *basename = g_path_get_basename(ui_state.playlist_path);
     char detail_msg[512];
-    snprintf(detail_msg, sizeof(detail_msg), "Are you sure you want to permanently delete '%s' from your disk? This action cannot be undone.", basename);
+    snprintf(detail_msg, sizeof(detail_msg),
+             "Are you sure you want to permanently delete '%s' from your disk? This action cannot "
+             "be undone.",
+             basename);
 
     GtkAlertDialog *alert = gtk_alert_dialog_new("Delete Playlist File?");
     gtk_alert_dialog_set_detail(alert, detail_msg);
     g_free(basename);
 
-    const char *buttons[] = { "Delete from Disk", "Cancel", NULL };
+    const char *buttons[] = {"Delete from Disk", "Cancel", NULL};
     gtk_alert_dialog_set_buttons(alert, buttons);
     gtk_alert_dialog_set_cancel_button(alert, 1);
     gtk_alert_dialog_set_default_button(alert, 1);
@@ -1330,16 +1484,156 @@ static void on_delete_playlist_clicked(GtkButton *btn, gpointer user_data) {
     g_object_unref(alert);
 }
 
-GtkWidget* create_playlist_widget(void) {
+// Safety [Moderate]: Uses strict GtkBitset iterators to prevent memory faults during
+// multi-selection processing.
+static gboolean on_preset_track_drop(GtkDropTarget *target, const GValue *value, double x, double y,
+                                     gpointer user_data) {
+    if (G_VALUE_HOLDS(value, G_TYPE_INT)) {
+        return on_preset_drop(target, value, x, y, user_data);
+    }
+    (void)target;
+    (void)x;
+    (void)y;
+    int dest_slot = GPOINTER_TO_INT(user_data);
+    if (dest_slot < 0 || dest_slot >= 22)
+        return FALSE;
+
+    char target_m3u[1024];
+    if (strlen(ui_state.config.playlist_slots[dest_slot]) == 0) {
+        snprintf(target_m3u, sizeof(target_m3u), "%s/Playlist_%d.m3u",
+                 ui_state.config.recordings_dir, dest_slot + 1);
+        strncpy(ui_state.config.playlist_slots[dest_slot], target_m3u,
+                sizeof(ui_state.config.playlist_slots[0]) - 1);
+        ui_state.config.playlist_slots[dest_slot][sizeof(ui_state.config.playlist_slots[0]) - 1] =
+            '\0';
+        save_qjams_config(ui_state.config_path, &ui_state.config);
+
+        update_preset_buttons();
+    } else {
+        strncpy(target_m3u, ui_state.config.playlist_slots[dest_slot], sizeof(target_m3u) - 1);
+        target_m3u[sizeof(target_m3u) - 1] = '\0';
+    }
+
+    bool is_same_playlist = (current_preset_slot == dest_slot);
+    int added_count = 0;
+
+    if (G_VALUE_HOLDS(value, GDK_TYPE_FILE_LIST)) {
+        GdkFileList *file_list = g_value_get_boxed(value);
+        if (file_list) {
+            FILE *f = fopen(target_m3u, "a");
+            GSList *files = gdk_file_list_get_files(file_list);
+            for (GSList *l = files; l != NULL; l = l->next) {
+                GFile *file = G_FILE(l->data);
+                char *path = g_file_get_path(file);
+                if (path) {
+                    if (f)
+                        fprintf(f, "%s\n", path);
+                    if (is_same_playlist) {
+                        char display_buf[512];
+                        bool is_native =
+                            extract_track_metadata(path, display_buf, sizeof(display_buf));
+                        QJTrack *trk = qj_track_new(path, display_buf, is_native);
+                        g_list_store_append(track_list_store, trk);
+                        g_object_unref(trk);
+                    }
+                    g_free(path);
+                    added_count++;
+                }
+            }
+            if (f)
+                fclose(f);
+            g_slist_free(files);
+        }
+    } else if (G_VALUE_HOLDS(value, QJ_TYPE_TRACK)) {
+        QJTrack *dropped_track = g_value_get_object(value);
+        if (!dropped_track || !dropped_track->filepath)
+            return FALSE;
+
+        GtkBitset *selections =
+            gtk_selection_model_get_selection(GTK_SELECTION_MODEL(track_selection_model));
+        bool is_in_selection = false;
+
+        guint n_items = g_list_model_get_n_items(G_LIST_MODEL(track_list_store));
+        for (guint i = 0; i < n_items; i++) {
+            if (gtk_bitset_contains(selections, i)) {
+                QJTrack *t = QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), i));
+                if (t == dropped_track)
+                    is_in_selection = true;
+                g_object_unref(t);
+                if (is_in_selection)
+                    break;
+            }
+        }
+
+        FILE *f = fopen(target_m3u, "a");
+
+        if (is_in_selection) {
+            GtkBitsetIter iter;
+            guint index;
+            if (gtk_bitset_iter_init_first(&iter, selections, &index)) {
+                do {
+                    QJTrack *t =
+                        QJ_TRACK(g_list_model_get_item(G_LIST_MODEL(track_list_store), index));
+                    if (t && t->filepath) {
+                        if (f)
+                            fprintf(f, "%s\n", t->filepath);
+                        if (is_same_playlist) {
+                            QJTrack *dup =
+                                qj_track_new(t->filepath, t->display_name, t->is_qjams_native);
+                            g_list_store_append(track_list_store, dup);
+                            g_object_unref(dup);
+                        }
+                        added_count++;
+                    }
+                    if (t)
+                        g_object_unref(t);
+                } while (gtk_bitset_iter_next(&iter, &index));
+            }
+            if (f)
+                fclose(f);
+
+            if (!is_same_playlist) {
+                remove_playlist_tracks(selections);
+            }
+        } else {
+            if (f) {
+                fprintf(f, "%s\n", dropped_track->filepath);
+                fclose(f);
+            }
+            if (is_same_playlist) {
+                QJTrack *dup = qj_track_new(dropped_track->filepath, dropped_track->display_name,
+                                            dropped_track->is_qjams_native);
+                g_list_store_append(track_list_store, dup);
+                g_object_unref(dup);
+            }
+            added_count++;
+
+            if (!is_same_playlist) {
+                remove_active_track_from_playlist(dropped_track->filepath);
+            }
+        }
+        gtk_bitset_unref(selections);
+    }
+
+    if (added_count > 0) {
+        log_and_notify(1, "Status: Appended %d track(s) to Preset %d", added_count, dest_slot + 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+GtkWidget *create_playlist_widget(void) {
     track_list_store = g_list_store_new(QJ_TYPE_TRACK);
-    track_selection_model = GTK_MULTI_SELECTION(gtk_multi_selection_new(G_LIST_MODEL(track_list_store)));
+    track_selection_model =
+        GTK_MULTI_SELECTION(gtk_multi_selection_new(G_LIST_MODEL(track_list_store)));
 
     GtkListItemFactory *factory = gtk_signal_list_item_factory_new();
     g_signal_connect(factory, "setup", G_CALLBACK(on_setup_list_item), NULL);
     g_signal_connect(factory, "bind", G_CALLBACK(on_bind_list_item), NULL);
 
     track_list_view = gtk_list_view_new(GTK_SELECTION_MODEL(track_selection_model), factory);
-    g_signal_connect(track_selection_model, "selection-changed", G_CALLBACK(on_playlist_selection_changed), NULL);
+    g_signal_connect(track_selection_model, "selection-changed",
+                     G_CALLBACK(on_playlist_selection_changed), NULL);
 
     GtkEventController *key_ctrl = gtk_event_controller_key_new();
     g_signal_connect(key_ctrl, "key-pressed", G_CALLBACK(on_playlist_key_pressed), NULL);
@@ -1352,7 +1646,8 @@ GtkWidget* create_playlist_widget(void) {
     gtk_widget_set_valign(scrolled_window, GTK_ALIGN_FILL);
     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled_window), 250);
     gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(scrolled_window), FALSE);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window), GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
 
     GtkDropTarget *file_drop_target = gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
     g_signal_connect(file_drop_target, "drop", G_CALLBACK(on_playlist_file_drop), NULL);
@@ -1445,36 +1740,44 @@ GtkWidget* create_playlist_widget(void) {
     GtkWidget *preset_box_2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_widget_set_halign(preset_box_2, GTK_ALIGN_CENTER);
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 22; i++) {
         preset_btns[i] = gtk_button_new_with_label("-");
         gtk_widget_set_size_request(preset_btns[i], 30, 30);
         gtk_widget_add_css_class(preset_btns[i], "flat");
 
-        g_signal_connect(preset_btns[i], "clicked", G_CALLBACK(on_preset_button_clicked), GINT_TO_POINTER(i));
+        g_signal_connect(preset_btns[i], "clicked", G_CALLBACK(on_preset_button_clicked),
+                         GINT_TO_POINTER(i));
 
         GtkDragSource *drag_src = gtk_drag_source_new();
         gtk_drag_source_set_actions(drag_src, GDK_ACTION_MOVE);
-        g_signal_connect(drag_src, "prepare", G_CALLBACK(on_preset_drag_prepare), GINT_TO_POINTER(i));
+        g_signal_connect(drag_src, "prepare", G_CALLBACK(on_preset_drag_prepare),
+                         GINT_TO_POINTER(i));
         gtk_widget_add_controller(preset_btns[i], GTK_EVENT_CONTROLLER(drag_src));
 
-        GtkDropTarget *drop_target = gtk_drop_target_new(G_TYPE_INT, GDK_ACTION_MOVE);
-        g_signal_connect(drop_target, "drop", G_CALLBACK(on_preset_drop), GINT_TO_POINTER(i));
-        gtk_widget_add_controller(preset_btns[i], GTK_EVENT_CONTROLLER(drop_target));
+        GType preset_drop_types[] = {G_TYPE_INT, GDK_TYPE_FILE_LIST, QJ_TYPE_TRACK};
+        GtkDropTarget *track_drop_target =
+            gtk_drop_target_new(G_TYPE_INVALID, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        gtk_drop_target_set_gtypes(track_drop_target, preset_drop_types, 3);
+        g_signal_connect(track_drop_target, "drop", G_CALLBACK(on_preset_track_drop),
+                         GINT_TO_POINTER(i));
+        gtk_widget_add_controller(preset_btns[i], GTK_EVENT_CONTROLLER(track_drop_target));
 
-        if (i < 5) gtk_box_append(GTK_BOX(preset_box_1), preset_btns[i]);
-        else gtk_box_append(GTK_BOX(preset_box_2), preset_btns[i]);
+        if (i < 11)
+            gtk_box_append(GTK_BOX(preset_box_1), preset_btns[i]);
+        else
+            gtk_box_append(GTK_BOX(preset_box_2), preset_btns[i]);
     }
 
     gtk_box_append(GTK_BOX(preset_vbox), preset_box_1);
     gtk_box_append(GTK_BOX(preset_vbox), preset_box_2);
 
     current_preset_slot = -1;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 22; i++) {
         if (strlen(ui_state.config.playlist_slots[i]) > 0 &&
             g_strcmp0(ui_state.config.playlist_slots[i], ui_state.playlist_path) == 0) {
             current_preset_slot = i;
-        break;
-            }
+            break;
+        }
     }
     update_preset_buttons();
 
@@ -1507,8 +1810,10 @@ GtkWidget* create_playlist_widget(void) {
 
         while (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\r\n")] = 0;
-            if (strlen(line) == 0 || line[0] == '#') continue;
-            if (!is_supported_media_file(line)) continue;
+            if (strlen(line) == 0 || line[0] == '#')
+                continue;
+            if (!is_supported_media_file(line))
+                continue;
 
             char *abs_path = NULL;
             if (g_path_is_absolute(line)) {
@@ -1524,7 +1829,7 @@ GtkWidget* create_playlist_widget(void) {
 
             char display_buf[512];
             bool is_native = extract_track_metadata(abs_path, display_buf, sizeof(display_buf));
-            QjTrack *trk = qj_track_new(abs_path, display_buf, is_native);
+            QJTrack *trk = qj_track_new(abs_path, display_buf, is_native);
             g_list_store_append(track_list_store, trk);
 
             g_object_unref(trk);

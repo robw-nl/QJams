@@ -1,17 +1,19 @@
 #ifndef QJAMS_RINGBUFFER_H
 #define QJAMS_RINGBUFFER_H
 
-#include <stddef.h>
-#include <stdatomic.h>
 #include <stdalign.h>
-#include <stdlib.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 // Align structures to 64 bytes to match the typical L1 cache line size
 // This physically separates the read and write indices in the CPU cache,
 // eliminating false-sharing latency when the encoder thread reads from the buffer.
 #define CACHE_LINE_SIZE 64
+#ifndef QJ_MAX_TRACKS
 #define QJ_MAX_TRACKS 12
+#endif
 
 typedef struct {
     float mix_l;
@@ -23,7 +25,7 @@ typedef struct {
 } AudioFrame;
 
 typedef struct {
-    AudioFrame* buffer;
+    AudioFrame *buffer;
     size_t capacity; // Must be a power of 2
 
     alignas(CACHE_LINE_SIZE) atomic_size_t write_index;
@@ -34,37 +36,45 @@ typedef struct {
  * @brief Opcodes for lock-free commands dispatched from the GTK UI thread to the JACK RT thread.
  * Legacy O(N) array mutation commands have been purged to enforce strict RT safety.
  */
-typedef enum {
-    CMD_NONE = 0,
-    CMD_NEXT_TRACK,
-    CMD_PLAY_CLICK
-} EngineCommandType;
+typedef enum { CMD_NONE = 0, CMD_PLAY_CLICK } EngineCommandType;
 
 // Initialize the queue (called once during setup, before RT thread starts)
 /**
  * @brief Initializes the lock-free single-producer single-consumer audio queue.
+ * Allocates cache-line aligned memory to prevent split-line cache penalties.
  * @param q Pointer to the queue structure.
  * @param capacity The maximum number of frames (must be a power of two).
  * @return void
  */
-static inline void init_spsc_queue(SPSC_Audio_Queue* q, size_t capacity) {
-    q->buffer = (AudioFrame*)calloc(capacity, sizeof(AudioFrame));
-    q->capacity = capacity;
+static inline void init_spsc_queue(SPSC_Audio_Queue *q, size_t capacity) {
+    if (capacity == 0 || (capacity & (capacity - 1)) != 0)
+        capacity = 16384;
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, CACHE_LINE_SIZE, capacity * sizeof(AudioFrame)) != 0 || !ptr) {
+        q->buffer = NULL;
+        q->capacity = 0;
+    } else {
+        __builtin_memset(ptr, 0, capacity * sizeof(AudioFrame));
+        q->buffer = (AudioFrame *)ptr;
+        q->capacity = capacity;
+    }
     atomic_init(&q->write_index, 0);
     atomic_init(&q->read_index, 0);
 }
 
 // Producer (Called strictly by the JACK process() callback)
 /**
- * @brief Acquires a pointer to the next available ringbuffer slot to write data directly without copying.
+ * @brief Acquires a pointer to the next available ringbuffer slot to write data directly without
+ * copying.
  * @param q Pointer to the queue structure.
  * @return Pointer to an AudioFrame, or NULL if the buffer is full.
  */
-static inline AudioFrame* acquire_audio_frame(SPSC_Audio_Queue* q) {
+static inline AudioFrame *acquire_audio_frame(SPSC_Audio_Queue *q) {
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_relaxed);
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_acquire);
 
-    if (current_write - current_read >= q->capacity) return NULL;
+    if (current_write - current_read >= q->capacity)
+        return NULL;
     return &q->buffer[current_write & (q->capacity - 1)];
 }
 
@@ -73,7 +83,7 @@ static inline AudioFrame* acquire_audio_frame(SPSC_Audio_Queue* q) {
  * @param q Pointer to the queue structure.
  * @return void
  */
-static inline void commit_audio_frame(SPSC_Audio_Queue* q) {
+static inline void commit_audio_frame(SPSC_Audio_Queue *q) {
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_relaxed);
     atomic_store_explicit(&q->write_index, current_write + 1, memory_order_release);
 }
@@ -85,7 +95,7 @@ static inline void commit_audio_frame(SPSC_Audio_Queue* q) {
  * @param frame Pointer to store the retrieved audio frame.
  * @return 1 on success, 0 if the buffer is empty.
  */
-static inline int pop_audio_frame(SPSC_Audio_Queue* q, AudioFrame* frame) {
+static inline int pop_audio_frame(SPSC_Audio_Queue *q, AudioFrame *frame) {
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_relaxed);
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_acquire);
 
@@ -104,7 +114,7 @@ typedef struct {
 } StereoFrame;
 
 typedef struct {
-    StereoFrame* buffer;
+    StereoFrame *buffer;
     size_t capacity;
     alignas(CACHE_LINE_SIZE) atomic_size_t write_index;
     alignas(CACHE_LINE_SIZE) atomic_size_t read_index;
@@ -112,27 +122,39 @@ typedef struct {
 
 /**
  * @brief Initializes the lock-free single-producer single-consumer stereo queue.
+ * Allocates cache-line aligned memory for deterministic RT consumption.
  * @param q Pointer to the queue structure.
  * @param capacity The maximum number of frames (must be a power of two).
  * @return void
  */
-static inline void init_stereo_queue(SPSC_Stereo_Queue* q, size_t capacity) {
-    q->buffer = (StereoFrame*)calloc(capacity, sizeof(StereoFrame));
-    q->capacity = capacity;
+static inline void init_stereo_queue(SPSC_Stereo_Queue *q, size_t capacity) {
+    if (capacity == 0 || (capacity & (capacity - 1)) != 0)
+        capacity = 65536;
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, CACHE_LINE_SIZE, capacity * sizeof(StereoFrame)) != 0 || !ptr) {
+        q->buffer = NULL;
+        q->capacity = 0;
+    } else {
+        __builtin_memset(ptr, 0, capacity * sizeof(StereoFrame));
+        q->buffer = (StereoFrame *)ptr;
+        q->capacity = capacity;
+    }
     atomic_init(&q->write_index, 0);
     atomic_init(&q->read_index, 0);
 }
 
 /**
- * @brief Acquires a pointer to the next available ringbuffer slot to write data directly without copying.
+ * @brief Acquires a pointer to the next available ringbuffer slot to write data directly without
+ * copying.
  * @param q Pointer to the queue structure.
  * @return Pointer to a StereoFrame, or NULL if the buffer is full.
  */
-static inline StereoFrame* acquire_stereo_frame(SPSC_Stereo_Queue* q) {
+static inline StereoFrame *acquire_stereo_frame(SPSC_Stereo_Queue *q) {
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_relaxed);
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_acquire);
 
-    if (current_write - current_read >= q->capacity) return NULL;
+    if (current_write - current_read >= q->capacity)
+        return NULL;
     return &q->buffer[current_write & (q->capacity - 1)];
 }
 
@@ -141,7 +163,7 @@ static inline StereoFrame* acquire_stereo_frame(SPSC_Stereo_Queue* q) {
  * @param q Pointer to the queue structure.
  * @return void
  */
-static inline void commit_stereo_frame(SPSC_Stereo_Queue* q) {
+static inline void commit_stereo_frame(SPSC_Stereo_Queue *q) {
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_relaxed);
     atomic_store_explicit(&q->write_index, current_write + 1, memory_order_release);
 }
@@ -152,15 +174,26 @@ static inline void commit_stereo_frame(SPSC_Stereo_Queue* q) {
  * @param frame Pointer to store the retrieved stereo frame.
  * @return 1 on success, 0 if the buffer is empty.
  */
-static inline int pop_stereo_frame(SPSC_Stereo_Queue* q, StereoFrame* frame) {
+static inline int pop_stereo_frame(SPSC_Stereo_Queue *q, StereoFrame *frame) {
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_relaxed);
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_acquire);
 
-    if (current_write == current_read) return 0;
+    if (current_write == current_read)
+        return 0;
 
     *frame = q->buffer[current_read & (q->capacity - 1)];
     atomic_store_explicit(&q->read_index, current_read + 1, memory_order_release);
     return 1;
+}
+
+/**
+ * @brief Drains all queued stereo frames from the consumer side with acquire-release ordering.
+ * @param q Pointer to the stereo queue structure.
+ * @return void
+ */
+static inline void flush_stereo_queue_consumer(SPSC_Stereo_Queue *q) {
+    size_t current_write = atomic_load_explicit(&q->write_index, memory_order_acquire);
+    atomic_store_explicit(&q->read_index, current_write, memory_order_release);
 }
 
 /**
@@ -175,7 +208,7 @@ typedef struct {
  * @brief Lock-free Single-Producer Single-Consumer queue for UI to RT engine commands.
  */
 typedef struct {
-    EngineCommand* buffer;
+    EngineCommand *buffer;
     size_t capacity; ///< Must be a power of 2
     alignas(CACHE_LINE_SIZE) atomic_size_t write_index;
     alignas(CACHE_LINE_SIZE) atomic_size_t read_index;
@@ -183,13 +216,23 @@ typedef struct {
 
 /**
  * @brief Initializes the lock-free command queue.
+ * Allocates cache-line aligned memory for UI-to-RT command dispatch.
  * @param q Pointer to the command queue structure.
  * @param capacity The maximum number of commands (must be a power of two).
  * @return void
  */
-static inline void init_command_queue(SPSC_Command_Queue* q, size_t capacity) {
-    q->buffer = (EngineCommand*)calloc(capacity, sizeof(EngineCommand));
-    q->capacity = capacity;
+static inline void init_command_queue(SPSC_Command_Queue *q, size_t capacity) {
+    if (capacity == 0 || (capacity & (capacity - 1)) != 0)
+        capacity = 32;
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, CACHE_LINE_SIZE, capacity * sizeof(EngineCommand)) != 0 || !ptr) {
+        q->buffer = NULL;
+        q->capacity = 0;
+    } else {
+        __builtin_memset(ptr, 0, capacity * sizeof(EngineCommand));
+        q->buffer = (EngineCommand *)ptr;
+        q->capacity = capacity;
+    }
     atomic_init(&q->write_index, 0);
     atomic_init(&q->read_index, 0);
 }
@@ -200,11 +243,12 @@ static inline void init_command_queue(SPSC_Command_Queue* q, size_t capacity) {
  * @param cmd The command payload to dispatch.
  * @return 1 on success, 0 if the queue is full.
  */
-static inline int push_command(SPSC_Command_Queue* q, EngineCommand cmd) {
+static inline int push_command(SPSC_Command_Queue *q, EngineCommand cmd) {
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_relaxed);
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_acquire);
 
-    if (current_write - current_read >= q->capacity) return 0;
+    if (current_write - current_read >= q->capacity)
+        return 0;
 
     q->buffer[current_write & (q->capacity - 1)] = cmd;
     atomic_store_explicit(&q->write_index, current_write + 1, memory_order_release);
@@ -217,11 +261,12 @@ static inline int push_command(SPSC_Command_Queue* q, EngineCommand cmd) {
  * @param out_cmd Pointer to store the retrieved command.
  * @return 1 on success, 0 if the queue is empty.
  */
-static inline int pop_command(SPSC_Command_Queue* q, EngineCommand* out_cmd) {
+static inline int pop_command(SPSC_Command_Queue *q, EngineCommand *out_cmd) {
     size_t current_read = atomic_load_explicit(&q->read_index, memory_order_relaxed);
     size_t current_write = atomic_load_explicit(&q->write_index, memory_order_acquire);
 
-    if (current_write == current_read) return 0;
+    if (current_write == current_read)
+        return 0;
 
     *out_cmd = q->buffer[current_read & (q->capacity - 1)];
     atomic_store_explicit(&q->read_index, current_read + 1, memory_order_release);

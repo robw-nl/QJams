@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define MAX_SAVED_DEVICES 32
+#define QJ_MAX_SAVED_DEVICES 32
 
 /**
  * @brief Unified profile for an audio capture device, storing gain memory and routing roles.
@@ -12,7 +12,7 @@ typedef struct {
     int is_primary;
     int is_fallback;
     int in_pref;
-} AudioDeviceProfile;
+} QJQJAudioDeviceProfile;
 
 typedef struct {
     float input_gain_multiplier;
@@ -28,13 +28,18 @@ typedef struct {
     int multitrack_blank_canvas;
     int multitrack_mode_active; // Persist multitrack mode state
     int default_canvas_limit_min;
-    int export_format; // 0 = FLAC, 1 = WAV, 2 = BOTH
+    int export_format;
     int enable_logging;
+    int loop_countdown_active;
+    int overlay_soft_clip;
 
-    char playlist_slots[10][1024]; // Expanded to 10 Car Radio Presets
+    int video_width_default;
+    int video_width_expanded;
+
+    char playlist_slots[22][1024]; // Expanded to 10 Car Radio Presets
 
     // Dynamic Hardware Memory
-    AudioDeviceProfile audio_profiles[MAX_SAVED_DEVICES];
+    QJQJAudioDeviceProfile audio_profiles[QJ_MAX_SAVED_DEVICES];
     int num_audio_profiles;
 } QJamsConfig;
 
@@ -43,7 +48,7 @@ typedef struct {
  * @param filepath The path to the configuration file.
  * @return A populated QJamsConfig structure.
  */
-QJamsConfig load_qjams_config(const char* filepath);
+QJamsConfig load_qjams_config(const char *filepath);
 
 /**
  * @brief Saves the current QJams configuration to the specified file.
@@ -51,7 +56,7 @@ QJamsConfig load_qjams_config(const char* filepath);
  * @param config Pointer to the QJamsConfig structure to save.
  * @return void
  */
-void save_qjams_config(const char* filepath, const QJamsConfig* config);
+void save_qjams_config(const char *filepath, const QJamsConfig *config);
 
 void init_qjams_logger(const char *qjams_dir, int enable_logging);
 void close_qjams_logger(void);

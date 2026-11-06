@@ -6,9 +6,9 @@
 
 // --- EXPOSED TRACK LIST GOBJECT ---
 #define QJ_TYPE_TRACK (qj_track_get_type())
-G_DECLARE_FINAL_TYPE(QjTrack, qj_track, QJ, TRACK, GObject)
+G_DECLARE_FINAL_TYPE(QJTrack, qj_track, QJ, TRACK, GObject)
 
-struct _QjTrack {
+struct _QJTrack {
     GObject parent_instance;
     char *filepath;
     char *display_name;
@@ -19,7 +19,7 @@ struct _QjTrack {
  * @brief Creates and initializes the main GTK playlist widget structure.
  * @return A pointer to the created GtkWidget (scrolled window containing the list).
  */
-GtkWidget* create_playlist_widget(void);
+GtkWidget *create_playlist_widget(void);
 
 /**
  * @brief Loads track entries into the playlist from a given .m3u file.
@@ -41,13 +41,6 @@ void save_current_playlist(void);
 void update_playlist_toggle_state(void);
 
 /**
- * @brief Removes a track from the playlist and saves the updated list to disk.
- * @param filepath The absolute path to the track.
- * @return void
- */
-void remove_track_from_playlist(const char* filepath);
-
-/**
  * @brief Callback that adds or removes the currently selected track from the active playlist.
  * @param button The GTK button triggering the callback.
  * @param user_data Optional user data passed to the callback.
@@ -65,5 +58,6 @@ bool cycle_playlist_track(int direction);
 void remove_active_track_from_playlist(const char *path);
 
 void activate_playlist_preset(int slot);
+bool playlist_handle_ctrl_a(void);
 
 #endif // UI_PLAYLIST_H

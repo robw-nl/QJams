@@ -1,17 +1,19 @@
 #include "ui_settings.h"
-#include "ui_globals.h"
-#include "audio_engine.h"
-#include "video_engine.h"
+#include "audio_core.h"
+#include "audio_memory.h"
+#include "audio_routing.h"
 #include "scanner.h"
 #include "ui_dashboard.h"
-#include <string.h>
+#include "ui_globals.h"
+#include "ui_transport.h"
+#include "ui_waveforms.h"
+#include "video_engine.h"
 #include <stdio.h>
+#include <string.h>
 
-extern jack_client_t *client;
-extern SPSC_Video_Queue video_queue;
 
 typedef struct {
-    AudioDevice dev;
+    QJAudioDevice dev;
     GtkWidget *rb_primary;
     GtkWidget *rb_fallback;
     GtkWidget *cb_pref;
@@ -22,19 +24,32 @@ typedef struct {
     GtkWidget *v_drop;
     GtkWidget *p_drop;
     GtkWidget *f_drop;
+    GtkStringList *v_list;
+    GtkStringList *p_list;
+    GtkStringList *f_list;
     GtkWidget *spin_canvas_limit;
     GtkWidget *cb_logging;
-    AudioRowData audio_rows[MAX_AUDIO_DEVICES];
+    AudioRowData audio_rows[QJ_MAX_AUDIO_DEVICES];
     int num_audio_rows;
     int a_count_online;
-    VideoDevice v_devs[MAX_CAMERAS];
-    AudioDevice a_devs[MAX_AUDIO_DEVICES];
-    AudioDevice p_devs[MAX_AUDIO_DEVICES];
+    QJVideoDevice v_devs[QJ_MAX_CAMERAS];
+    QJAudioDevice a_devs[QJ_MAX_AUDIO_DEVICES];
+    QJAudioDevice p_devs[QJ_MAX_AUDIO_DEVICES];
+    GtkWidget *rb_default[4];
+    GtkWidget *rb_expanded[4];
 } SettingsData;
 
+static void free_settings_data(gpointer data) {
+    SettingsData *sd = (SettingsData *)data;
+    g_free(sd);
+}
+
 static void apply_hardware_changes(QJamsConfig *new_config) {
-    log_and_notify(0, "State Manager: Re-patching Audio Capture to %s\n", new_config->audio_device);
-    patch_audio_ports(new_config->audio_device);
+    if (strcmp(ui_state.config.audio_device, new_config->audio_device) != 0) {
+        log_and_notify(0, "State Manager: Re-patching Audio Capture to %s\n",
+                       new_config->audio_device);
+        patch_audio_ports(new_config->audio_device);
+    }
 
     float target_multiplier = 1.0f;
     for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
@@ -49,8 +64,11 @@ static void apply_hardware_changes(QJamsConfig *new_config) {
     float loaded_db = (target_multiplier <= 0.001f) ? -24.0f : 20.0f * log10f(target_multiplier);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(input_gain_spinner), loaded_db);
 
-    log_and_notify(0, "State Manager: Re-patching Audio Playback to %s\n", new_config->playback_target);
-    patch_playback_ports(new_config->playback_target);
+    if (strcmp(ui_state.config.playback_target, new_config->playback_target) != 0) {
+        log_and_notify(0, "State Manager: Re-patching Audio Playback to %s\n",
+                       new_config->playback_target);
+        patch_playback_ports(new_config->playback_target);
+    }
 
     if (strcmp(ui_state.config.video_device, new_config->video_device) != 0) {
         log_and_notify(0, "State Manager: Video Capture device changed.\n");
@@ -66,7 +84,7 @@ static void apply_hardware_changes(QJamsConfig *new_config) {
 
 static void on_settings_save(GtkButton *btn, gpointer user_data) {
     (void)btn;
-    SettingsData *sd = (SettingsData*)user_data;
+    SettingsData *sd = (SettingsData *)user_data;
 
     guint v_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(sd->v_drop));
     guint p_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(sd->p_drop));
@@ -78,13 +96,16 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
         new_config.export_format = f_idx;
     }
 
-    new_config.enable_logging = gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->cb_logging)) ? 1 : 0;
+    new_config.enable_logging =
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->cb_logging)) ? 1 : 0;
 
     if (v_idx != GTK_INVALID_LIST_POSITION) {
-        strncpy(new_config.video_device, sd->v_devs[v_idx].device_path, sizeof(new_config.video_device) - 1);
+        strncpy(new_config.video_device, sd->v_devs[v_idx].device_path,
+                sizeof(new_config.video_device) - 1);
     }
     if (p_idx != GTK_INVALID_LIST_POSITION) {
-        strncpy(new_config.playback_target, sd->p_devs[p_idx].display_name, sizeof(new_config.playback_target) - 1);
+        strncpy(new_config.playback_target, sd->p_devs[p_idx].display_name,
+                sizeof(new_config.playback_target) - 1);
     }
 
     char target_device[128] = "";
@@ -92,7 +113,8 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
     char pri_name[128] = "", fall_name[128] = "";
 
     for (int i = 0; i < sd->num_audio_rows; i++) {
-        if (!gtk_widget_get_visible(sd->audio_rows[i].rb_primary)) continue;
+        if (!gtk_widget_get_visible(sd->audio_rows[i].rb_primary))
+            continue;
 
         bool is_pri = gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->audio_rows[i].rb_primary));
         bool is_fall = gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->audio_rows[i].rb_fallback));
@@ -100,14 +122,16 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
 
         int p_idx_audio = -1;
         for (int p = 0; p < new_config.num_audio_profiles; p++) {
-            if (strcmp(new_config.audio_profiles[p].device_name, sd->audio_rows[i].dev.display_name) == 0) {
+            if (strcmp(new_config.audio_profiles[p].device_name,
+                       sd->audio_rows[i].dev.display_name) == 0) {
                 p_idx_audio = p;
                 break;
             }
         }
-        if (p_idx_audio == -1 && new_config.num_audio_profiles < MAX_SAVED_DEVICES) {
+        if (p_idx_audio == -1 && new_config.num_audio_profiles < QJ_MAX_SAVED_DEVICES) {
             p_idx_audio = new_config.num_audio_profiles++;
-            strncpy(new_config.audio_profiles[p_idx_audio].device_name, sd->audio_rows[i].dev.display_name, 127);
+            strncpy(new_config.audio_profiles[p_idx_audio].device_name,
+                    sd->audio_rows[i].dev.display_name, 127);
             new_config.audio_profiles[p_idx_audio].gain_multiplier = 1.0f;
         }
 
@@ -119,57 +143,124 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
 
         if (is_pri) {
             strncpy(pri_name, sd->audio_rows[i].dev.display_name, 127);
-            if (sd->audio_rows[i].dev.channel_count > 0) pri_online = 1;
+            if (sd->audio_rows[i].dev.channel_count > 0)
+                pri_online = 1;
         }
         if (is_fall) {
             strncpy(fall_name, sd->audio_rows[i].dev.display_name, 127);
-            if (sd->audio_rows[i].dev.channel_count > 0) fall_online = 1;
+            if (sd->audio_rows[i].dev.channel_count > 0)
+                fall_online = 1;
         }
     }
 
-    if (pri_online) strncpy(target_device, pri_name, 127);
-    else if (fall_online) strncpy(target_device, fall_name, 127);
-    else if (sd->a_count_online > 0) strncpy(target_device, sd->a_devs[0].display_name, 127);
+    if (pri_online)
+        strncpy(target_device, pri_name, 127);
+    else if (fall_online)
+        strncpy(target_device, fall_name, 127);
+    else {
+        bool cur_online = false;
+        for (int i = 0; i < sd->a_count_online; i++) {
+            if (strcmp(ui_state.config.audio_device, sd->a_devs[i].display_name) == 0) {
+                cur_online = true;
+                break;
+            }
+        }
+        if (cur_online)
+            strncpy(target_device, ui_state.config.audio_device, 127);
+        else if (sd->a_count_online > 0)
+            strncpy(target_device, sd->a_devs[0].display_name, 127);
+    }
 
     if (strlen(target_device) > 0) {
         strncpy(new_config.audio_device, target_device, 127);
+        new_config.audio_device[127] = '\0';
     }
 
-    new_config.default_canvas_limit_min = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(sd->spin_canvas_limit));
-    bool limits_changed = (ui_state.config.default_canvas_limit_min != new_config.default_canvas_limit_min);
+    int old_limit = ui_state.config.default_canvas_limit_min;
+    new_config.default_canvas_limit_min =
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(sd->spin_canvas_limit));
+    bool limits_changed = (old_limit != new_config.default_canvas_limit_min);
 
-    apply_hardware_changes(&new_config);
+    int temp_def = ui_state.config.video_width_default;
+    int temp_exp = ui_state.config.video_width_expanded;
 
-    if (limits_changed) {
-        extern int resize_loop_canvas_seconds(int);
-        extern void update_zoom_button_label_to_length(void);
-        extern void invalidate_waveform_caches(void);
-        extern GtkWidget *waveform_area_bt;
-        extern GtkWidget *waveform_area_input;
+    int vid_widths[4] = {480, 640, 768, 1024};
+    for (int i = 0; i < 4; i++) {
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->rb_default[i])))
+            temp_def = vid_widths[i];
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->rb_expanded[i])))
+            temp_exp = vid_widths[i];
+    }
 
-        int new_limit = new_config.default_canvas_limit_min;
-        int resize_result = resize_loop_canvas_seconds(new_limit * 60);
+    // Failsafe: Prevent dimensions from becoming identical if GTK active states are ambiguous on
+    // exit
+    if (temp_def == temp_exp) {
+        temp_def = ui_state.config.video_width_default;
+        temp_exp = ui_state.config.video_width_expanded;
+    }
 
-        if (resize_result == 0) {
-            update_zoom_button_label_to_length();
-            invalidate_waveform_caches();
-            if (waveform_area_bt) gtk_widget_queue_draw(waveform_area_bt);
-            if (waveform_area_input) gtk_widget_queue_draw(waveform_area_input);
+    new_config.video_width_default = temp_def;
+    new_config.video_width_expanded = temp_exp;
 
-            if (strlen(ui_state.selected_track_path) == 0) {
-                char track_lbl[128];
-                snprintf(track_lbl, sizeof(track_lbl), "Track: Blank Loop Canvas [%02d:00 limit]", new_limit);
-                extern GtkWidget *lbl_track;
-                gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
+    if (ui_state.config.video_width_default != new_config.video_width_default ||
+        ui_state.config.video_width_expanded != new_config.video_width_expanded) {
+        int active_w = atomic_load_explicit(&is_video_expanded, memory_order_acquire)
+                           ? new_config.video_width_expanded
+                           : new_config.video_width_default;
+        int active_h = (int)(active_w * (9.0 / 16.0));
+
+        if (video_preview_frame) {
+            int current_frame_w = gtk_widget_get_width(video_preview_frame);
+            if (current_frame_w != active_w) {
+                gtk_widget_set_size_request(video_preview_frame, active_w, active_h);
+                gtk_widget_queue_resize(video_preview_frame);
+
+                GtkWidget *picture = gtk_widget_get_first_child(video_preview_frame);
+                if (picture) {
+                    gtk_widget_set_size_request(picture, active_w, active_h);
+                    gtk_widget_queue_resize(picture);
+                    gtk_widget_queue_draw(picture);
+                }
+
+                GtkRoot *root = gtk_widget_get_root(video_preview_frame);
+                if (root)
+                    gtk_widget_queue_draw(GTK_WIDGET(root));
             }
-        } else if (resize_result == -2) {
-            log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to apply new duration limits!</b></span>");
-            ui_state.config.default_canvas_limit_min = ui_state.config.default_canvas_limit_min;
-            save_qjams_config(ui_state.config_path, &ui_state.config);
         }
     }
 
-    extern void update_dashboard_pref_ui(void);
+    apply_hardware_changes(&new_config);
+    if (limits_changed) {
+        int new_limit = new_config.default_canvas_limit_min;
+        size_t target_frames =
+            (size_t)atomic_load_explicit(&get_transport_state()->active_sample_rate,
+                                         memory_order_acquire) *
+            (size_t)(new_limit * 60);
+        bool is_untouched_blank =
+            (!is_session_dirty() && !ui_state.is_existing_session && get_last_audible_frame() == 0);
+        if (is_untouched_blank || target_frames > pristine_frames) {
+            int resize_result = resize_loop_canvas_seconds(new_limit * 60);
+            if (resize_result == 0) {
+                update_zoom_button_label_to_length();
+                invalidate_waveform_caches();
+                if (waveform_area_bt)
+                    gtk_widget_queue_draw(waveform_area_bt);
+                if (waveform_area_input)
+                    gtk_widget_queue_draw(waveform_area_input);
+                if (strlen(ui_state.selected_track_path) == 0) {
+                    char track_lbl[128];
+                    snprintf(track_lbl, sizeof(track_lbl),
+                             "Track: Blank Loop Canvas [%02d:00 limit]", new_limit);
+                    gtk_label_set_text(GTK_LABEL(lbl_track), track_lbl);
+                }
+            } else if (resize_result == -2) {
+                log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM to apply "
+                                  "new duration limits!</b></span>");
+                ui_state.config.default_canvas_limit_min = old_limit;
+                save_qjams_config(ui_state.config_path, &ui_state.config);
+            }
+        }
+    }
     update_dashboard_pref_ui();
 
     GtkWidget *win = sd->win;
@@ -178,7 +269,8 @@ static void on_settings_save(GtkButton *btn, gpointer user_data) {
     log_and_notify(0, "Hardware Matrix and Workflow settings applied dynamically.\n");
 }
 
-static void on_recordings_dir_chosen(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+static void on_recordings_dir_chosen(GObject *source_object, GAsyncResult *res,
+                                     gpointer user_data) {
     GtkFileDialog *dialog = GTK_FILE_DIALOG(source_object);
     GtkWidget *lbl_recordings_dir = GTK_WIDGET(user_data);
     GError *error = NULL;
@@ -194,6 +286,8 @@ static void on_recordings_dir_chosen(GObject *source_object, GAsyncResult *res, 
         gtk_label_set_text(GTK_LABEL(lbl_recordings_dir), path);
         g_free(path);
         g_object_unref(folder);
+    } else if (error) {
+        g_error_free(error);
     }
 }
 
@@ -205,7 +299,9 @@ static void on_select_recordings_dir(GtkButton *btn, gpointer user_data) {
         gtk_file_dialog_set_initial_folder(dialog, initial);
         g_object_unref(initial);
     }
-    gtk_file_dialog_select_folder(dialog, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(btn))), NULL, on_recordings_dir_chosen, user_data);
+    gtk_file_dialog_select_folder(dialog, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(btn))), NULL,
+                                  on_recordings_dir_chosen, user_data);
+    g_object_unref(dialog);
 }
 
 typedef struct {
@@ -217,7 +313,8 @@ typedef struct {
     GtkWidget *w_del;
 } AudioRowDeleteData;
 
-// Memory Safety (Low Risk): Provides strict signature matching for GClosureNotify to prevent ABI mismatch during g_free.
+// Memory Safety (Low Risk): Provides strict signature matching for GClosureNotify to prevent ABI
+// mismatch during g_free.
 static void free_audio_row_delete_data(gpointer data, GClosure *closure) {
     (void)closure;
     g_free(data);
@@ -228,10 +325,12 @@ static gboolean execute_delete_profile_idle(gpointer user_data) {
 
     int found_idx = -1;
     for (int i = 0; i < ui_state.config.num_audio_profiles; i++) {
-        // Memory Safety (Low Risk): Use strcspn/strncmp to guarantee matches even if config struct retains trailing \r\n
+        // Memory Safety (Low Risk): Use strcspn/strncmp to guarantee matches even if config struct
+        // retains trailing \r\n
         size_t cfg_len = strcspn(ui_state.config.audio_profiles[i].device_name, "\r\n");
         size_t dat_len = strlen(data->device_name);
-        if (cfg_len == dat_len && strncmp(ui_state.config.audio_profiles[i].device_name, data->device_name, dat_len) == 0) {
+        if (cfg_len == dat_len && strncmp(ui_state.config.audio_profiles[i].device_name,
+                                          data->device_name, dat_len) == 0) {
             found_idx = i;
             break;
         }
@@ -256,10 +355,34 @@ static gboolean execute_delete_profile_idle(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-static void on_delete_profile_clicked(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
-    (void)gesture; (void)n_press; (void)x; (void)y;
-    // Memory Safety (Critical): Defer UI unmapping to prevent Wayland/GTK event grab segfaults
-    g_idle_add(execute_delete_profile_idle, user_data);
+static void on_delete_profile_clicked(GtkGestureClick *gesture, int n_press, double x, double y,
+                                      gpointer user_data) {
+    (void)gesture;
+    (void)n_press;
+    (void)x;
+    (void)y;
+    execute_delete_profile_idle(user_data);
+}
+
+static void on_video_size_radio_toggled(GtkCheckButton *button, gpointer user_data) {
+    SettingsData *sd = (SettingsData *)user_data;
+
+    // Only process the newly activated radio button, ignore the one being deactivated
+    if (!gtk_check_button_get_active(button))
+        return;
+
+    // Find which button triggered the event and disable the corresponding opposite option
+    for (int i = 0; i < 4; i++) {
+        if (button == GTK_CHECK_BUTTON(sd->rb_default[i])) {
+            for (int j = 0; j < 4; j++) {
+                gtk_widget_set_sensitive(sd->rb_expanded[j], i != j);
+            }
+        } else if (button == GTK_CHECK_BUTTON(sd->rb_expanded[i])) {
+            for (int j = 0; j < 4; j++) {
+                gtk_widget_set_sensitive(sd->rb_default[j], i != j);
+            }
+        }
+    }
 }
 
 void on_settings_clicked(GtkButton *button, gpointer user_data) {
@@ -280,20 +403,23 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     SettingsData *sd = g_new0(SettingsData, 1);
     sd->win = settings_win;
 
-    int v_count = scan_video_devices(sd->v_devs, MAX_CAMERAS);
-    int a_count = scan_audio_devices(client, sd->a_devs, MAX_AUDIO_DEVICES);
-    int p_count = scan_playback_devices(client, sd->p_devs, MAX_AUDIO_DEVICES);
+    int v_count = scan_video_devices(sd->v_devs, QJ_MAX_CAMERAS);
+    int a_count = scan_audio_devices(client, sd->a_devs, QJ_MAX_AUDIO_DEVICES);
+    int p_count = scan_playback_devices(client, sd->p_devs, QJ_MAX_AUDIO_DEVICES);
 
     gtk_box_append(GTK_BOX(vbox), gtk_label_new("Camera Source:"));
     GtkStringList *v_list = gtk_string_list_new(NULL);
     int v_active = 0;
     for (int i = 0; i < v_count; i++) {
         char label[256];
-        snprintf(label, sizeof(label), "%s (%s)", sd->v_devs[i].device_name, sd->v_devs[i].device_path);
+        snprintf(label, sizeof(label), "%s (%s)", sd->v_devs[i].device_name,
+                 sd->v_devs[i].device_path);
         gtk_string_list_append(v_list, label);
-        if (strcmp(sd->v_devs[i].device_path, ui_state.config.video_device) == 0) v_active = i;
+        if (strcmp(sd->v_devs[i].device_path, ui_state.config.video_device) == 0)
+            v_active = i;
     }
     GtkWidget *v_drop = gtk_drop_down_new(G_LIST_MODEL(v_list), NULL);
+    sd->v_list = v_list;
     gtk_drop_down_set_selected(GTK_DROP_DOWN(v_drop), v_active);
     gtk_box_append(GTK_BOX(vbox), v_drop);
 
@@ -301,7 +427,8 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     GtkWidget *audio_frame = gtk_frame_new(NULL);
     GtkWidget *audio_scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(audio_scroll), 245);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(audio_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(audio_scroll), GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
 
     GtkWidget *audio_grid = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(audio_grid), 25);
@@ -311,11 +438,16 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     gtk_widget_set_margin_top(audio_grid, 10);
     gtk_widget_set_margin_bottom(audio_grid, 10);
 
-    GtkWidget *h_dev = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(h_dev), "<b>Device</b>");
-    GtkWidget *h_pri = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(h_pri), "<b>Primary</b>");
-    GtkWidget *h_fall = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(h_fall), "<b>Fallback</b>");
-    GtkWidget *h_pref = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(h_pref), "<b>Selector</b>");
-    GtkWidget *h_del = gtk_label_new(NULL); gtk_label_set_markup(GTK_LABEL(h_del), "<b>Del </b>");
+    GtkWidget *h_dev = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(h_dev), "<b>Device</b>");
+    GtkWidget *h_pri = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(h_pri), "<b>Primary</b>");
+    GtkWidget *h_fall = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(h_fall), "<b>Fallback</b>");
+    GtkWidget *h_pref = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(h_pref), "<b>Selector</b>");
+    GtkWidget *h_del = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(h_del), "<b>Del </b>");
 
     gtk_widget_set_halign(h_dev, GTK_ALIGN_START);
     gtk_widget_set_hexpand(h_dev, TRUE);
@@ -326,19 +458,48 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     gtk_grid_attach(GTK_GRID(audio_grid), h_pref, 3, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(audio_grid), h_del, 4, 0, 1, 1);
 
+    // Scrub newlines from the global struct to permanently heal all downstream strcmp operations
+    int unique_profiles = 0;
+    for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
+        ui_state.config.audio_profiles[p]
+            .device_name[strcspn(ui_state.config.audio_profiles[p].device_name, "\r\n")] = '\0';
+
+        bool is_dup = false;
+        for (int u = 0; u < unique_profiles; u++) {
+            if (strcmp(ui_state.config.audio_profiles[u].device_name,
+                       ui_state.config.audio_profiles[p].device_name) == 0) {
+                // Inherit true flags from the duplicate before discarding it to preserve user
+                // intent
+                if (ui_state.config.audio_profiles[p].is_primary)
+                    ui_state.config.audio_profiles[u].is_primary = 1;
+                if (ui_state.config.audio_profiles[p].is_fallback)
+                    ui_state.config.audio_profiles[u].is_fallback = 1;
+                if (ui_state.config.audio_profiles[p].in_pref)
+                    ui_state.config.audio_profiles[u].in_pref = 1;
+                is_dup = true;
+                break;
+            }
+        }
+        if (!is_dup && unique_profiles < QJ_MAX_SAVED_DEVICES) {
+            if (unique_profiles != p) {
+                ui_state.config.audio_profiles[unique_profiles] = ui_state.config.audio_profiles[p];
+            }
+            unique_profiles++;
+        }
+    }
+    ui_state.config.num_audio_profiles = unique_profiles;
+
     int row_count = 0;
-    for (int p = 0; p < ui_state.config.num_audio_profiles && row_count < MAX_AUDIO_DEVICES; p++) {
+    for (int p = 0; p < ui_state.config.num_audio_profiles && row_count < QJ_MAX_AUDIO_DEVICES;
+         p++) {
         // Memory Safety (Low Risk): strncpy bound to 127 prevents overflow.
-        strncpy(sd->audio_rows[row_count].dev.display_name, ui_state.config.audio_profiles[p].device_name, 127);
-
-        // Strip accidental newlines from config file reads that cause massive grid row heights
-        sd->audio_rows[row_count].dev.display_name[strcspn(sd->audio_rows[row_count].dev.display_name, "\r\n")] = '\0';
-
+        strncpy(sd->audio_rows[row_count].dev.display_name,
+                ui_state.config.audio_profiles[p].device_name, 127);
         sd->audio_rows[row_count].dev.channel_count = 0;
         row_count++;
     }
 
-    for (int i = 0; i < a_count && row_count < MAX_AUDIO_DEVICES; i++) {
+    for (int i = 0; i < a_count && row_count < QJ_MAX_AUDIO_DEVICES; i++) {
         int found = 0;
         for (int j = 0; j < row_count; j++) {
             if (strcmp(sd->audio_rows[j].dev.display_name, sd->a_devs[i].display_name) == 0) {
@@ -358,23 +519,29 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     sd->a_count_online = a_count;
 
     // --- SORTING PIPELINE ---
-    int scores[MAX_AUDIO_DEVICES] = {0};
+    int scores[QJ_MAX_AUDIO_DEVICES] = {0};
     for (int i = 0; i < row_count; i++) {
         scores[i] = 5; // Default to unselected baseline
 
         for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
-            if (strcmp(ui_state.config.audio_profiles[p].device_name, sd->audio_rows[i].dev.display_name) == 0) {
-                scores[i] = 4; // Device is kept in preferences by virtue of existing in the config array
-                if (ui_state.config.audio_profiles[p].is_primary) scores[i] = 1;
-                else if (ui_state.config.audio_profiles[p].is_fallback) scores[i] = 2;
-                else if (ui_state.config.audio_profiles[p].in_pref) scores[i] = 3;
+            if (strcmp(ui_state.config.audio_profiles[p].device_name,
+                       sd->audio_rows[i].dev.display_name) == 0) {
+                scores[i] =
+                    4; // Device is kept in preferences by virtue of existing in the config array
+                if (ui_state.config.audio_profiles[p].is_primary)
+                    scores[i] = 1;
+                else if (ui_state.config.audio_profiles[p].is_fallback)
+                    scores[i] = 2;
+                else if (ui_state.config.audio_profiles[p].in_pref)
+                    scores[i] = 3;
                 break;
             }
         }
     }
 
-    // Memory Safety (Low Risk): O(N^2) selection sort strictly bounded by MAX_AUDIO_DEVICES.
-    // Byte-level memcpy swap guarantees ABI structural integrity without requiring a localized typedef cast.
+    // Memory Safety (Low Risk): O(N^2) selection sort strictly bounded by QJ_MAX_AUDIO_DEVICES.
+    // Byte-level memcpy swap guarantees ABI structural integrity without requiring a localized
+    // typedef cast.
     for (int i = 0; i < row_count - 1; i++) {
         for (int j = i + 1; j < row_count; j++) {
             if (scores[j] < scores[i]) {
@@ -396,7 +563,8 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     for (int i = 0; i < row_count; i++) {
         char label[256];
         if (sd->audio_rows[i].dev.channel_count > 0) {
-            snprintf(label, sizeof(label), "%s [%d ch]", sd->audio_rows[i].dev.display_name, sd->audio_rows[i].dev.channel_count);
+            snprintf(label, sizeof(label), "%s [%d ch]", sd->audio_rows[i].dev.display_name,
+                     sd->audio_rows[i].dev.channel_count);
         } else {
             snprintf(label, sizeof(label), "%s [Offline]", sd->audio_rows[i].dev.display_name);
         }
@@ -408,12 +576,16 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
         gtk_grid_attach(GTK_GRID(audio_grid), lbl, 0, i + 1, 1, 1);
 
         GtkWidget *rb_pri = gtk_check_button_new();
-        if (pri_group) gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_pri), GTK_CHECK_BUTTON(pri_group));
-        else pri_group = rb_pri;
+        if (pri_group)
+            gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_pri), GTK_CHECK_BUTTON(pri_group));
+        else
+            pri_group = rb_pri;
 
         GtkWidget *rb_fall = gtk_check_button_new();
-        if (fall_group) gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_fall), GTK_CHECK_BUTTON(fall_group));
-        else fall_group = rb_fall;
+        if (fall_group)
+            gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_fall), GTK_CHECK_BUTTON(fall_group));
+        else
+            fall_group = rb_fall;
 
         gtk_widget_set_halign(rb_pri, GTK_ALIGN_CENTER);
         gtk_widget_set_halign(rb_fall, GTK_ALIGN_CENTER);
@@ -442,9 +614,11 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
 
         bool is_online = (sd->audio_rows[i].dev.channel_count > 0);
         gtk_widget_set_sensitive(btn_del, !is_online);
-        gtk_widget_set_tooltip_text(btn_del, is_online ? "Active devices cannot be deleted" : "Delete offline profile");
+        gtk_widget_set_tooltip_text(btn_del, is_online ? "Active devices cannot be deleted"
+                                                       : "Delete offline profile");
 
-        // Memory Safety (Low Risk): g_new0 guarantees zero-initialized memory for the UI callback struct, preventing dangling pointers.
+        // Memory Safety (Low Risk): g_new0 guarantees zero-initialized memory for the UI callback
+        // struct, preventing dangling pointers.
         AudioRowDeleteData *del_data = g_new0(AudioRowDeleteData, 1);
         strncpy(del_data->device_name, sd->audio_rows[i].dev.display_name, 127);
         del_data->w_lbl = lbl;
@@ -453,15 +627,20 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
         del_data->w_pref = cb_pref;
         del_data->w_del = btn_del;
 
-        g_signal_connect_data(click, "pressed", G_CALLBACK(on_delete_profile_clicked), del_data, (GClosureNotify)free_audio_row_delete_data, 0);
+        g_signal_connect_data(click, "pressed", G_CALLBACK(on_delete_profile_clicked), del_data,
+                              (GClosureNotify)free_audio_row_delete_data, 0);
 
         gtk_grid_attach(GTK_GRID(audio_grid), btn_del, 4, i + 1, 1, 1);
 
         for (int p = 0; p < ui_state.config.num_audio_profiles; p++) {
-            if (strcmp(ui_state.config.audio_profiles[p].device_name, sd->audio_rows[i].dev.display_name) == 0) {
-                if (ui_state.config.audio_profiles[p].is_primary) gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_pri), TRUE);
-                if (ui_state.config.audio_profiles[p].is_fallback) gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_fall), TRUE);
-                if (ui_state.config.audio_profiles[p].in_pref) gtk_check_button_set_active(GTK_CHECK_BUTTON(cb_pref), TRUE);
+            if (strcmp(ui_state.config.audio_profiles[p].device_name,
+                       sd->audio_rows[i].dev.display_name) == 0) {
+                if (ui_state.config.audio_profiles[p].is_primary)
+                    gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_pri), TRUE);
+                if (ui_state.config.audio_profiles[p].is_fallback)
+                    gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_fall), TRUE);
+                if (ui_state.config.audio_profiles[p].in_pref)
+                    gtk_check_button_set_active(GTK_CHECK_BUTTON(cb_pref), TRUE);
                 break;
             }
         }
@@ -476,11 +655,14 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     int p_active = 0;
     for (int i = 0; i < p_count; i++) {
         char label[256];
-        snprintf(label, sizeof(label), "%s [%d ch]", sd->p_devs[i].display_name, sd->p_devs[i].channel_count);
+        snprintf(label, sizeof(label), "%s [%d ch]", sd->p_devs[i].display_name,
+                 sd->p_devs[i].channel_count);
         gtk_string_list_append(p_list, label);
-        if (strcmp(sd->p_devs[i].display_name, ui_state.config.playback_target) == 0) p_active = i;
+        if (strcmp(sd->p_devs[i].display_name, ui_state.config.playback_target) == 0)
+            p_active = i;
     }
     GtkWidget *p_drop = gtk_drop_down_new(G_LIST_MODEL(p_list), NULL);
+    sd->p_list = p_list;
     gtk_drop_down_set_selected(GTK_DROP_DOWN(p_drop), p_active);
     gtk_box_append(GTK_BOX(vbox), p_drop);
 
@@ -503,7 +685,9 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
 
     GtkWidget *limit_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_box_append(GTK_BOX(limit_vbox), gtk_label_new("Default Canvas Limit (min):"));
-    GtkAdjustment *adj_limit = gtk_adjustment_new(ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5, 1, 120, 1, 5, 0);
+    GtkAdjustment *adj_limit = gtk_adjustment_new(
+        ui_state.config.default_canvas_limit_min > 0 ? ui_state.config.default_canvas_limit_min : 5,
+        1, 120, 1, 5, 0);
     GtkWidget *spin_canvas_limit = gtk_spin_button_new(adj_limit, 1, 0);
     gtk_box_append(GTK_BOX(limit_vbox), spin_canvas_limit);
     gtk_box_append(GTK_BOX(wf_hbox), limit_vbox);
@@ -515,26 +699,102 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     gtk_string_list_append(f_list, "WAV");
     gtk_string_list_append(f_list, "FLAC + WAV");
     GtkWidget *f_drop = gtk_drop_down_new(G_LIST_MODEL(f_list), NULL);
+    sd->f_list = f_list;
     gtk_drop_down_set_selected(GTK_DROP_DOWN(f_drop), ui_state.config.export_format);
     gtk_box_append(GTK_BOX(fmt_vbox), f_drop);
     gtk_box_append(GTK_BOX(wf_hbox), fmt_vbox);
 
     gtk_box_append(GTK_BOX(vbox), wf_hbox);
 
+    // --- Video Matrix ---
+    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    gtk_box_append(GTK_BOX(vbox), gtk_label_new("Video Preview Size. Shortcut 't' to toggle."));
+
+    GtkWidget *vid_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(vid_grid), 25);
+    gtk_grid_set_row_spacing(GTK_GRID(vid_grid), 8);
+    gtk_widget_set_margin_start(vid_grid, 10);
+    gtk_widget_set_margin_end(vid_grid, 10);
+    gtk_widget_set_margin_bottom(vid_grid, 15);
+
+    GtkWidget *vh_size = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(vh_size), "<b>Size</b>");
+    GtkWidget *vh_def = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(vh_def), "<b>Default</b>");
+    GtkWidget *vh_exp = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(vh_exp), "<b>Toggled</b>");
+    gtk_widget_set_halign(vh_size, GTK_ALIGN_START);
+
+    gtk_grid_attach(GTK_GRID(vid_grid), vh_size, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(vid_grid), vh_def, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(vid_grid), vh_exp, 2, 0, 1, 1);
+
+    int vid_widths[4] = {480, 640, 768, 1024};
+    const char *vid_labels[4] = {"Small (480x270)", "Medium (640x360)", "Large (768x432)",
+                                 "Extra Large (1024x576)"};
+
+    GtkWidget *def_group = NULL;
+    GtkWidget *exp_group = NULL;
+
+    for (int i = 0; i < 4; i++) {
+        GtkWidget *lbl = gtk_label_new(vid_labels[i]);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(vid_grid), lbl, 0, i + 1, 1, 1);
+
+        GtkWidget *rb_def = gtk_check_button_new();
+        if (def_group)
+            gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_def), GTK_CHECK_BUTTON(def_group));
+        else
+            def_group = rb_def;
+        gtk_widget_set_halign(rb_def, GTK_ALIGN_CENTER);
+        gtk_grid_attach(GTK_GRID(vid_grid), rb_def, 1, i + 1, 1, 1);
+        if (ui_state.config.video_width_default == vid_widths[i])
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_def), TRUE);
+        sd->rb_default[i] = rb_def;
+        g_signal_connect(rb_def, "toggled", G_CALLBACK(on_video_size_radio_toggled), sd);
+
+        GtkWidget *rb_exp = gtk_check_button_new();
+        if (exp_group)
+            gtk_check_button_set_group(GTK_CHECK_BUTTON(rb_exp), GTK_CHECK_BUTTON(exp_group));
+        else
+            exp_group = rb_exp;
+        gtk_widget_set_halign(rb_exp, GTK_ALIGN_CENTER);
+        gtk_grid_attach(GTK_GRID(vid_grid), rb_exp, 2, i + 1, 1, 1);
+        if (ui_state.config.video_width_expanded == vid_widths[i])
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(rb_exp), TRUE);
+        sd->rb_expanded[i] = rb_exp;
+        g_signal_connect(rb_exp, "toggled", G_CALLBACK(on_video_size_radio_toggled), sd);
+    }
+    gtk_box_append(GTK_BOX(vbox), vid_grid);
+
+    // Trigger the logic once manually to enforce the greyed-out states immediately on menu open
+    for (int i = 0; i < 4; i++) {
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->rb_default[i]))) {
+            on_video_size_radio_toggled(GTK_CHECK_BUTTON(sd->rb_default[i]), sd);
+        }
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(sd->rb_expanded[i]))) {
+            on_video_size_radio_toggled(GTK_CHECK_BUTTON(sd->rb_expanded[i]), sd);
+        }
+    }
+
     // --- Logging Toggle ---
     GtkWidget *log_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     gtk_widget_set_halign(log_hbox, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_top(log_hbox, 5);
-    GtkWidget *cb_logging = gtk_check_button_new_with_label("Enable Persistent Logging to QJams.log (Requires Restart)");
+    GtkWidget *cb_logging = gtk_check_button_new_with_label(
+        "Enable Persistent Logging to QJams.log (Requires Restart)");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(cb_logging), ui_state.config.enable_logging != 0);
     gtk_box_append(GTK_BOX(log_hbox), cb_logging);
     gtk_box_append(GTK_BOX(vbox), log_hbox);
 
     // --- Copyright & Footer ---
     GtkWidget *lbl_copyright = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(lbl_copyright),
-                         "<span size='small' foreground='#888888'>QJams (c) 2026 Rob Wijhenke. All rights reserved.\n"
-                         "Beta version for testing. <a href='https://sites.google.com/view/qjams'>sites.google.com/view/qjams</a></span>");
+    gtk_label_set_markup(
+        GTK_LABEL(lbl_copyright),
+        "<span size='small' foreground='#888888'>QJams (c) 2026 Rob Wijhenke. All rights "
+        "reserved.\n"
+        "<a "
+        "href='https://sites.google.com/view/qjams'>sites.google.com/view/qjams/home</a></span>");
     gtk_label_set_justify(GTK_LABEL(lbl_copyright), GTK_JUSTIFY_CENTER);
     gtk_widget_set_margin_top(lbl_copyright, 15);
     gtk_box_append(GTK_BOX(vbox), lbl_copyright);
@@ -551,7 +811,7 @@ void on_settings_clicked(GtkButton *button, gpointer user_data) {
     sd->spin_canvas_limit = spin_canvas_limit;
     sd->cb_logging = cb_logging;
 
-    g_object_set_data_full(G_OBJECT(settings_win), "settings_data", sd, g_free);
+    g_object_set_data_full(G_OBJECT(settings_win), "settings_data", sd, free_settings_data);
 
     g_signal_connect(btn_save, "clicked", G_CALLBACK(on_settings_save), sd);
     gtk_window_present(GTK_WINDOW(settings_win));

@@ -1,19 +1,123 @@
+#include "config.h"
+#include "ui_globals.h"
+#include <glib.h>
+#include <gtk/gtk.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <time.h>
-#include <pthread.h>
-#include <gtk/gtk.h>
-#include <glib.h>
-#include "config.h"
-#include "ui_globals.h"
 
 static FILE *qj_log_file = NULL;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static void log_system_profile(FILE *out_file) {
+    if (!out_file)
+        return;
+
+    char distro[128] = "Unknown Linux";
+    FILE *f_os = fopen("/etc/os-release", "r");
+    if (f_os) {
+        char line[256];
+        while (fgets(line, sizeof(line), f_os)) {
+            if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                char *start = line + 12;
+                if (*start == '"')
+                    start++;
+                char *end = strchr(start, '"');
+                if (end)
+                    *end = '\0';
+                else {
+                    end = strchr(start, '\n');
+                    if (end)
+                        *end = '\0';
+                }
+                strncpy(distro, start, sizeof(distro) - 1);
+                break;
+            }
+        }
+        fclose(f_os);
+    }
+
+    char cpu[128] = "Unknown CPU";
+    FILE *f_cpu = fopen("/proc/cpuinfo", "r");
+    if (f_cpu) {
+        char line[256];
+        while (fgets(line, sizeof(line), f_cpu)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    char *start = colon + 1;
+                    while (*start == ' ' || *start == '\t')
+                        start++;
+                    char *nl = strchr(start, '\n');
+                    if (nl)
+                        *nl = '\0';
+                    strncpy(cpu, start, sizeof(cpu) - 1);
+                    break;
+                }
+            }
+        }
+        fclose(f_cpu);
+    }
+
+    double ram_gb = 0.0;
+    FILE *f_mem = fopen("/proc/meminfo", "r");
+    if (f_mem) {
+        char line[256];
+        while (fgets(line, sizeof(line), f_mem)) {
+            if (strncmp(line, "MemTotal:", 9) == 0) {
+                long long kb = 0;
+                if (sscanf(line, "MemTotal: %lld kB", &kb) == 1) {
+                    ram_gb = (double)kb / (1024.0 * 1024.0);
+                }
+                break;
+            }
+        }
+        fclose(f_mem);
+    }
+
+    char gpu[128] = "Unknown GPU";
+    FILE *f_gpu = popen("lspci | grep -i vga", "r");
+    if (f_gpu) {
+        char line[256];
+        if (fgets(line, sizeof(line), f_gpu)) {
+            char *colon = strchr(line, ':');
+            if (colon) {
+                char *start = strchr(colon + 1, ':');
+                if (start) {
+                    start++;
+                    while (*start == ' ')
+                        start++;
+                    char *nl = strchr(start, '\n');
+                    if (nl)
+                        *nl = '\0';
+                    strncpy(gpu, start, sizeof(gpu) - 1);
+                } else {
+                    char *st = colon + 1;
+                    while (*st == ' ')
+                        st++;
+                    char *nl = strchr(st, '\n');
+                    if (nl)
+                        *nl = '\0';
+                    strncpy(gpu, st, sizeof(gpu) - 1);
+                }
+            }
+        }
+        pclose(f_gpu);
+    }
+
+    fprintf(out_file, "OS:      %s\n", distro);
+    fprintf(out_file, "CPU:     %s\n", cpu);
+    fprintf(out_file, "RAM:     %.2f GB Total\n", ram_gb);
+    fprintf(out_file, "GPU:     %s\n", gpu);
+    fprintf(out_file, "=========================================================\n\n");
+}
+
 void init_qjams_logger(const char *qjams_dir, int enable_logging) {
-    if (!enable_logging) return;
+    if (!enable_logging)
+        return;
 
     char old_log[1024], new_log[1024];
     for (int i = 4; i >= 1; i--) {
@@ -30,11 +134,13 @@ void init_qjams_logger(const char *qjams_dir, int enable_logging) {
     if (qj_log_file) {
         setvbuf(qj_log_file, NULL, _IONBF, 0); // Strict unbuffered I/O
         time_t t = time(NULL);
-        struct tm tm = *localtime(&t);
+        struct tm tm;
+        localtime_r(&t, &tm);
         fprintf(qj_log_file, "=========================================================\n");
         fprintf(qj_log_file, "QJams Session Log - Boot: %04d-%02d-%02d %02d:%02d:%02d\n",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-        fprintf(qj_log_file, "=========================================================\n\n");
+        fprintf(qj_log_file, "=========================================================\n");
+        log_system_profile(qj_log_file);
     }
 }
 
@@ -47,7 +153,8 @@ void close_qjams_logger(void) {
 
 static gboolean deferred_notify_status(gpointer data) {
     char *msg = (char *)data;
-    if (lbl_status) gtk_label_set_markup(GTK_LABEL(lbl_status), msg);
+    if (lbl_status)
+        gtk_label_set_markup(GTK_LABEL(lbl_status), msg);
     g_free(msg);
     return G_SOURCE_REMOVE;
 }
@@ -64,7 +171,8 @@ static gboolean deferred_notify_toast(gpointer data) {
 
 /**
  * @brief Thread-safe logging and UI notification router.
- * @param notify_target 0 = Console/Log only, 1 = Console/Log + Main Status, 2 = Console/Log + Hardware Toast
+ * @param notify_target 0 = Console/Log only, 1 = Console/Log + Main Status, 2 = Console/Log +
+ * Hardware Toast
  * @param fmt Standard printf formatting string
  */
 void log_and_notify(int notify_target, const char *fmt, ...) {
@@ -95,15 +203,18 @@ void log_and_notify(int notify_target, const char *fmt, ...) {
     size_t len = strlen(clean_buffer);
 
     pthread_mutex_lock(&log_mutex);
-    printf("%s", clean_buffer);
-    if (len > 0 && clean_buffer[len-1] != '\n') printf("\n");
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+
+    printf("[%02d:%02d:%02d] %s", tm.tm_hour, tm.tm_min, tm.tm_sec, clean_buffer);
+    if (len > 0 && clean_buffer[len - 1] != '\n')
+        printf("\n");
 
     if (qj_log_file) {
-        time_t t = time(NULL);
-        struct tm tm;
-        localtime_r(&t, &tm);
         fprintf(qj_log_file, "[%02d:%02d:%02d] %s", tm.tm_hour, tm.tm_min, tm.tm_sec, clean_buffer);
-        if (len > 0 && clean_buffer[len-1] != '\n') fprintf(qj_log_file, "\n");
+        if (len > 0 && clean_buffer[len - 1] != '\n')
+            fprintf(qj_log_file, "\n");
     }
     pthread_mutex_unlock(&log_mutex);
 
@@ -116,43 +227,50 @@ void log_and_notify(int notify_target, const char *fmt, ...) {
 
 /**
  * @brief Loads the QJams configuration from the specified file, returning defaults if not found.
- * Utilizes thread-safe string tokenization and strictly bounded string copies to prevent memory bleeds.
+ * Utilizes thread-safe string tokenization and strictly bounded string copies to prevent memory
+ * bleeds.
  * @param filepath The path to the configuration file.
  * @return A populated QJamsConfig structure.
  */
-QJamsConfig load_qjams_config(const char* filepath) {
+QJamsConfig load_qjams_config(const char *filepath) {
     // Dynamically fetch OS-standard Music directory, fallback to Home
     const char *target_dir = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
-    if (!target_dir) target_dir = g_get_home_dir();
+    if (!target_dir)
+        target_dir = g_get_home_dir();
 
     char default_dir[512];
     snprintf(default_dir, sizeof(default_dir), "%s/QJams", target_dir);
 
-    QJamsConfig config = {
-        .input_gain_multiplier = 1.0f,
-        .bt_gain_multiplier = 1.0f,
-        .playback_target = "system:playback",
-        .last_track_dir = "", // Initialized dynamically below
-        .recordings_dir = "", // Initialized dynamically below
-        .last_playlist_path = "",
-        .window_width = 1400,
-        .window_height = 1024,
-        .video_device = "/dev/video0",
-        .audio_device = "",
-        .multitrack_blank_canvas = 0,
-        .multitrack_mode_active = 0,
-        .default_canvas_limit_min = 5,
-        .export_format = 0,
-        .enable_logging = 0,
-        .playlist_slots = {"", "", "", "", "", "", "", "", "", ""},
-        .num_audio_profiles = 0
-    };
+    QJamsConfig config = {.input_gain_multiplier = 1.0f,
+                          .bt_gain_multiplier = 1.0f,
+                          .playback_target = "system:playback",
+                          .last_track_dir = "", // Initialized dynamically below
+                          .recordings_dir = "", // Initialized dynamically below
+                          .last_playlist_path = "",
+                          .window_width = 1400,
+                          .window_height = 1024,
+                          .video_device = "/dev/video0",
+                          .audio_device = "",
+                          .multitrack_blank_canvas = 0,
+                          .multitrack_mode_active = 0,
+                          .default_canvas_limit_min = 5,
+                          .export_format = 0,
+                          .enable_logging = 0,
+                          .loop_countdown_active = 0,
+                          .overlay_soft_clip = 1, // Default to 1 (Safe Mode)
+                          // In load_qjams_config() initialization:
+                          .video_width_default = 480,
+                          .video_width_expanded = 768,
+                          .playlist_slots = {"", "", "", "", "", "", "", "", "", "", "",
+                                             "", "", "", "", "", "", "", "", "", "", ""},
+                          .num_audio_profiles = 0};
 
     strncpy(config.last_track_dir, default_dir, sizeof(config.last_track_dir) - 1);
     strncpy(config.recordings_dir, default_dir, sizeof(config.recordings_dir) - 1);
 
     FILE *file = fopen(filepath, "r");
-    if (!file) return config;
+    if (!file)
+        return config;
 
     char line[1024]; // Increased buffer to absorb long path names
     while (fgets(line, sizeof(line), file)) {
@@ -161,7 +279,8 @@ QJamsConfig load_qjams_config(const char* filepath) {
 
         // Split safely at the first '=' to prevent swallowing empty variables
         char *eq = strchr(line, '=');
-        if (!eq) continue;
+        if (!eq)
+            continue;
 
         *eq = '\0';
         char *key = line;
@@ -169,7 +288,8 @@ QJamsConfig load_qjams_config(const char* filepath) {
 
         if (strcmp(key, "BT_GAIN_MULTIPLIER") == 0) {
             char *comma = strchr(value, ',');
-            if (comma) *comma = '.';
+            if (comma)
+                *comma = '.';
             config.bt_gain_multiplier = (float)g_ascii_strtod(value, NULL);
         } else if (strcmp(key, "PLAYBACK_TARGET") == 0) {
             strncpy(config.playback_target, value, sizeof(config.playback_target) - 1);
@@ -203,40 +323,55 @@ QJamsConfig load_qjams_config(const char* filepath) {
             config.export_format = atoi(value);
         } else if (strcmp(key, "ENABLE_LOGGING") == 0) {
             config.enable_logging = atoi(value);
+        } else if (strcmp(key, "LOOP_COUNTDOWN_ACTIVE") == 0) {
+            config.loop_countdown_active = atoi(value);
+        } else if (strcmp(key, "VIDEO_WIDTH_DEFAULT") == 0) {
+            config.video_width_default = atoi(value);
+        } else if (strcmp(key, "VIDEO_WIDTH_EXPANDED") == 0) {
+            config.video_width_expanded = atoi(value);
         } else if (strncmp(key, "PLAYLIST_SLOT_", 14) == 0) {
             int slot = atoi(key + 14) - 1;
-            if (slot >= 0 && slot < 10) {
+            if (slot >= 0 && slot < 22) {
                 strncpy(config.playlist_slots[slot], value, sizeof(config.playlist_slots[0]) - 1);
                 config.playlist_slots[slot][sizeof(config.playlist_slots[0]) - 1] = '\0';
             }
         } else if (strncmp(key, "AUDIO_PROFILE_", 14) == 0) {
-            if (config.num_audio_profiles < MAX_SAVED_DEVICES) {
-                strncpy(config.audio_profiles[config.num_audio_profiles].device_name, key + 14, 127);
+            if (config.num_audio_profiles < QJ_MAX_SAVED_DEVICES) {
+                strncpy(config.audio_profiles[config.num_audio_profiles].device_name, key + 14,
+                        127);
                 config.audio_profiles[config.num_audio_profiles].device_name[127] = '\0';
 
                 char **parts = g_strsplit(value, ",", -1);
                 int num_parts = g_strv_length(parts);
 
                 if (num_parts >= 4) {
-                    config.audio_profiles[config.num_audio_profiles].in_pref = atoi(parts[num_parts - 1]);
-                    config.audio_profiles[config.num_audio_profiles].is_fallback = atoi(parts[num_parts - 2]);
-                    config.audio_profiles[config.num_audio_profiles].is_primary = atoi(parts[num_parts - 3]);
+                    config.audio_profiles[config.num_audio_profiles].in_pref =
+                        atoi(parts[num_parts - 1]);
+                    config.audio_profiles[config.num_audio_profiles].is_fallback =
+                        atoi(parts[num_parts - 2]);
+                    config.audio_profiles[config.num_audio_profiles].is_primary =
+                        atoi(parts[num_parts - 3]);
 
                     if (num_parts == 4) {
-                        config.audio_profiles[config.num_audio_profiles].gain_multiplier = (float)g_ascii_strtod(parts[0], NULL);
+                        config.audio_profiles[config.num_audio_profiles].gain_multiplier =
+                            (float)g_ascii_strtod(parts[0], NULL);
                     } else {
                         char float_str[32];
                         snprintf(float_str, sizeof(float_str), "%s.%s", parts[0], parts[1]);
-                        config.audio_profiles[config.num_audio_profiles].gain_multiplier = (float)g_ascii_strtod(float_str, NULL);
+                        config.audio_profiles[config.num_audio_profiles].gain_multiplier =
+                            (float)g_ascii_strtod(float_str, NULL);
                     }
                 } else if (num_parts > 0) {
-                    // Legacy migration: If only 2 parts exist, it's a comma-separated float with missing flags
+                    // Legacy migration: If only 2 parts exist, it's a comma-separated float with
+                    // missing flags
                     if (num_parts == 2 && strlen(parts[1]) > 0 && g_ascii_isdigit(parts[1][0])) {
                         char float_str[32];
                         snprintf(float_str, sizeof(float_str), "%s.%s", parts[0], parts[1]);
-                        config.audio_profiles[config.num_audio_profiles].gain_multiplier = (float)g_ascii_strtod(float_str, NULL);
+                        config.audio_profiles[config.num_audio_profiles].gain_multiplier =
+                            (float)g_ascii_strtod(float_str, NULL);
                     } else {
-                        config.audio_profiles[config.num_audio_profiles].gain_multiplier = (float)g_ascii_strtod(parts[0], NULL);
+                        config.audio_profiles[config.num_audio_profiles].gain_multiplier =
+                            (float)g_ascii_strtod(parts[0], NULL);
                     }
                     config.audio_profiles[config.num_audio_profiles].is_primary = 0;
                     config.audio_profiles[config.num_audio_profiles].is_fallback = 0;
@@ -248,15 +383,19 @@ QJamsConfig load_qjams_config(const char* filepath) {
             }
         } else if (strncmp(key, "INPUT_GAIN_", 11) == 0) {
             // Legacy configuration migration
-            if (strcmp(key, "INPUT_GAIN_MULTIPLIER") == 0) continue;
+            if (strcmp(key, "INPUT_GAIN_MULTIPLIER") == 0)
+                continue;
 
-            if (config.num_audio_profiles < MAX_SAVED_DEVICES) {
-                strncpy(config.audio_profiles[config.num_audio_profiles].device_name, key + 11, 127);
+            if (config.num_audio_profiles < QJ_MAX_SAVED_DEVICES) {
+                strncpy(config.audio_profiles[config.num_audio_profiles].device_name, key + 11,
+                        127);
                 config.audio_profiles[config.num_audio_profiles].device_name[127] = '\0';
 
                 char *comma = strchr(value, ',');
-                if (comma) *comma = '.';
-                config.audio_profiles[config.num_audio_profiles].gain_multiplier = (float)g_ascii_strtod(value, NULL);
+                if (comma)
+                    *comma = '.';
+                config.audio_profiles[config.num_audio_profiles].gain_multiplier =
+                    (float)g_ascii_strtod(value, NULL);
                 config.audio_profiles[config.num_audio_profiles].is_primary = 0;
                 config.audio_profiles[config.num_audio_profiles].is_fallback = 0;
                 config.audio_profiles[config.num_audio_profiles].in_pref = 0;
@@ -280,8 +419,16 @@ QJamsConfig load_qjams_config(const char* filepath) {
     if (config.window_width < 800 || config.window_width > 8192) {
         config.window_width = 1400;
     }
-    if (config.window_height < 600 || config.window_height > 8192) {
+    if (config.window_height < 600 || config.window_height > 4320) {
         config.window_height = 1024;
+    }
+
+    // VIDEO UI BOUNDARIES: Snap to the S/M/L/XL matrix limits
+    if (config.video_width_default < 320 || config.video_width_default > 1024) {
+        config.video_width_default = 480;
+    }
+    if (config.video_width_expanded < 320 || config.video_width_expanded > 1024) {
+        config.video_width_expanded = 1024;
     }
 
     // DSP GAIN BOUNDARIES: Protects against massive floats (GTK limit is +24dB / ~15.8x)
@@ -289,7 +436,8 @@ QJamsConfig load_qjams_config(const char* filepath) {
         config.bt_gain_multiplier = 1.0f;
     }
     for (int i = 0; i < config.num_audio_profiles; i++) {
-        if (config.audio_profiles[i].gain_multiplier < 0.0f || config.audio_profiles[i].gain_multiplier > 16.0f) {
+        if (config.audio_profiles[i].gain_multiplier < 0.0f ||
+            config.audio_profiles[i].gain_multiplier > 16.0f) {
             config.audio_profiles[i].gain_multiplier = 1.0f;
         }
     }
@@ -312,7 +460,7 @@ QJamsConfig load_qjams_config(const char* filepath) {
  * @param config Pointer to the QJamsConfig structure to save.
  * @return void
  */
-void save_qjams_config(const char* filepath, const QJamsConfig* config) {
+void save_qjams_config(const char *filepath, const QJamsConfig *config) {
     char tmp_filepath[1024];
     snprintf(tmp_filepath, sizeof(tmp_filepath), "%s.tmp", filepath);
 
@@ -339,8 +487,13 @@ void save_qjams_config(const char* filepath, const QJamsConfig* config) {
     fprintf(file, "DEFAULT_CANVAS_LIMIT_MIN=%d\n", config->default_canvas_limit_min);
     fprintf(file, "EXPORT_FORMAT=%d\n", config->export_format);
     fprintf(file, "ENABLE_LOGGING=%d\n", config->enable_logging);
+    fprintf(file, "LOOP_COUNTDOWN_ACTIVE=%d\n", config->loop_countdown_active);
+    fprintf(file, "OVERLAY_SOFT_CLIP=%d\n", config->overlay_soft_clip);
+    fprintf(file, "VIDEO_WIDTH_DEFAULT=%d\n", config->video_width_default);
+    fprintf(file, "VIDEO_WIDTH_EXPANDED=%d\n", config->video_width_expanded);
 
-    for (int i = 0; i < 10; i++) {
+    // In save_qjams_config() loop:
+    for (int i = 0; i < 22; i++) {
         if (strlen(config->playlist_slots[i]) > 0) {
             fprintf(file, "PLAYLIST_SLOT_%d=%s\n", i + 1, config->playlist_slots[i]);
         }
@@ -350,12 +503,9 @@ void save_qjams_config(const char* filepath, const QJamsConfig* config) {
         char gain_buf[G_ASCII_DTOSTR_BUF_SIZE];
         g_ascii_dtostr(gain_buf, sizeof(gain_buf), config->audio_profiles[i].gain_multiplier);
 
-        fprintf(file, "AUDIO_PROFILE_%s=%s,%d,%d,%d\n",
-                config->audio_profiles[i].device_name,
-                gain_buf,
-                config->audio_profiles[i].is_primary,
-                config->audio_profiles[i].is_fallback,
-                config->audio_profiles[i].in_pref);
+        fprintf(file, "AUDIO_PROFILE_%s=%s,%d,%d,%d\n", config->audio_profiles[i].device_name,
+                gain_buf, config->audio_profiles[i].is_primary,
+                config->audio_profiles[i].is_fallback, config->audio_profiles[i].in_pref);
     }
 
     // Force data to disk before closing
