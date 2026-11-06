@@ -11,4 +11,5 @@
  */
 void on_settings_clicked(GtkButton *button, gpointer user_data);
 
-#endif // UI_SETTINGS_H
+#endif
+
