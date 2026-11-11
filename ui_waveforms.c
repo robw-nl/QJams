@@ -619,8 +619,9 @@ typedef struct {
 } BTRenderJob;
 
 /**
- * @brief Callback invoked on the GTK main loop when the background waveform surface render finishes.
- *        Always queues a redraw if the cache was invalidated while the render task was in flight.
+ * @brief Callback invoked on the GTK main loop when the background waveform surface render
+ * finishes. Always queues a redraw if the cache was invalidated while the render task was in
+ * flight.
  */
 static void on_bt_surface_ready(GObject *source, GAsyncResult *res, gpointer data) {
     (void)source;
@@ -1427,36 +1428,44 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
     }
 
     if (atomic_exchange_explicit(&loop_wrap_pending, false, memory_order_acquire)) {
-        // Signal on_stop_clicked to retain loop points and bypass track auto-advance
-        atomic_store_explicit(&is_loop_wrapping, true, memory_order_release);
-
-        // 1. Cache loop points before the "Stop" command accesses them
+        bool was_rec = atomic_load_explicit(&loop_wrap_was_recording, memory_order_acquire);
         size_t l_start = atomic_load_explicit(&loop_start_frame, memory_order_acquire);
         size_t l_end = atomic_load_explicit(&loop_end_frame, memory_order_acquire);
         size_t frames = atomic_load_explicit(&get_transport_state()->backing_track_frames,
                                              memory_order_acquire);
 
-        // 2. Simulate Stop (Commits the take to the Undo ledger but stays on current track)
-        if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
-            g_signal_emit_by_name(btn_stop, "clicked");
-        }
+        if (was_rec) {
+            // Signal on_stop_clicked to retain loop points and bypass track auto-advance
+            atomic_store_explicit(&is_loop_wrapping, true, memory_order_release);
 
-        // 3. Rewind the playhead back to the start of the loop safely
-        if (frames > 0 && l_end > l_start) {
-            atomic_store_explicit(&get_transport_state()->playback_pos, l_start,
-                                  memory_order_release);
-            double start_frac = (double)l_start / (double)frames;
-            seek_backing_track(start_frac);
-        }
+            // 1. Simulate Stop (Commits the take to the Undo ledger)
+            if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+                g_signal_emit_by_name(btn_stop, "clicked");
+            }
 
-        // 4. Suppress the video overwrite nag dialogue for automatic passes
-        atomic_store_explicit(&suppress_video_overwrite, true, memory_order_release);
+            // 2. Rewind the playhead back to the start of the loop safely
+            if (frames > 0 && l_end > l_start) {
+                atomic_store_explicit(&seek_flag, false, memory_order_release);
+                atomic_store_explicit(&get_transport_state()->playback_pos, l_start,
+                                      memory_order_release);
+                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+            }
 
-        // 5. Restart recording to trigger the 3-second countdown
-        // For overdubs on loop wrap, always fall back to audio-only to preserve the base video
-        // take.
-        if (btn_record) {
-            g_signal_emit_by_name(btn_record, "clicked");
+            // 3. Suppress the video overwrite nag dialogue for automatic passes
+            atomic_store_explicit(&suppress_video_overwrite, true, memory_order_release);
+
+            // 4. Restart recording to trigger the 3-second countdown
+            if (btn_record) {
+                g_signal_emit_by_name(btn_record, "clicked");
+            }
+        } else {
+            if (frames > 0 && l_end > l_start) {
+                atomic_store_explicit(&seek_flag, false, memory_order_release);
+                atomic_store_explicit(&get_transport_state()->playback_pos, l_start,
+                                      memory_order_release);
+                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+            }
+            start_playback_loop_countdown();
         }
     }
 
@@ -1526,23 +1535,36 @@ gboolean on_waveform_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointe
         if (is_active || is_dragging || current_pos != last_pos_bt || layers_swapped ||
             bt_frames != last_frames_bt) {
             gtk_widget_queue_draw(widget);
-        last_pos_bt = current_pos;
-        last_frames_bt = bt_frames;
+            last_pos_bt = current_pos;
+            last_frames_bt = bt_frames;
 
-        // Auto-stop logic
-        if (is_active && bt_frames > 0 && current_pos >= bt_frames) {
-            if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
-                g_signal_emit_by_name(btn_stop, "clicked");
-                atomic_store_explicit(&seek_flag, false, memory_order_release);
-                atomic_store_explicit(&get_transport_state()->playback_pos, 0,
-                                      memory_order_release);
-                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
-                if (waveform_adj)
-                    gtk_adjustment_set_value(waveform_adj, 0.0);
-                refresh_track_time_display();
+            // Auto-stop logic
+            if (is_active && !is_countdown_active() && bt_frames > 0 && current_pos >= bt_frames) {
+                if (!atomic_load_explicit(&get_transport_state()->is_recording,
+                                          memory_order_acquire) &&
+                    ui_state.config.loop_countdown_active != 0) {
+                    atomic_store_explicit(&get_transport_state()->is_paused, true,
+                                          memory_order_release);
+                    atomic_store_explicit(&seek_flag, false, memory_order_release);
+                    atomic_store_explicit(&get_transport_state()->playback_pos, 0,
+                                          memory_order_release);
+                    atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+                    if (waveform_adj)
+                        gtk_adjustment_set_value(waveform_adj, 0.0);
+                    refresh_track_time_display();
+                    start_playback_loop_countdown();
+                } else if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+                    g_signal_emit_by_name(btn_stop, "clicked");
+                    atomic_store_explicit(&seek_flag, false, memory_order_release);
+                    atomic_store_explicit(&get_transport_state()->playback_pos, 0,
+                                          memory_order_release);
+                    atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+                    if (waveform_adj)
+                        gtk_adjustment_set_value(waveform_adj, 0.0);
+                    refresh_track_time_display();
+                }
             }
         }
-            }
     } else if (widget == waveform_area_input) {
         if (is_active || is_dragging || current_pos != last_pos_input || layers_swapped ||
             bt_frames != last_frames_input) {
@@ -1827,8 +1849,8 @@ static bool is_deletable_video_take(void) {
     if (has_active_live_video() || strlen(stashed_raw_path) > 0)
         return true;
     if (strlen(ui_state.selected_track_path) > 0 && is_video_file(ui_state.selected_track_path)) {
-        size_t t_frames =
-        atomic_load_explicit(&get_transport_state()->backing_track_frames, memory_order_acquire);
+        size_t t_frames = atomic_load_explicit(&get_transport_state()->backing_track_frames,
+                                               memory_order_acquire);
         if (video_start_frame == 0 && video_end_frame >= t_frames)
             return false;
     }
@@ -1851,87 +1873,87 @@ gboolean on_waveform_query_tooltip(GtkWidget *widget, gint x, gint y, gboolean k
                 gtk_tooltip_set_text(tooltip, "Right-click dot to remove video");
             }
             return TRUE;
-            }
+        }
     }
     return FALSE;
-                                   }
+}
 
-                                   static void on_video_delete_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
-                                       (void)user_data;
-                                       GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
-                                       if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
-                                           on_stop_clicked(NULL, NULL);
+static void on_video_delete_confirm(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)user_data;
+    GtkAlertDialog *alert = GTK_ALERT_DIALOG(source_object);
+    if (gtk_alert_dialog_choose_finish(alert, res, NULL) == 0) {
+        on_stop_clicked(NULL, NULL);
 
-                                           if (!await_rt_thread_detach())
-                                               return;
+        if (!await_rt_thread_detach())
+            return;
 
-                                           int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
+        int rec_track = atomic_load_explicit(&current_recording_track, memory_order_acquire);
 
-                                           // Safe 0-RAM math state backup specifically to preserve video bounds metadata
-                                           current_transaction_id++;
-                                           push_math_undo_state(rec_track, current_transaction_id, 1.0f, 0, 0);
+        // Safe 0-RAM math state backup specifically to preserve video bounds metadata
+        current_transaction_id++;
+        push_math_undo_state(rec_track, current_transaction_id, 1.0f, 0, 0);
 
-                                           mark_current_transaction_as_video_deletion();
+        mark_current_transaction_as_video_deletion();
 
-                                           abort_active_video_preview(true);
-                                           force_clear_mkv_video_preview();
+        abort_active_video_preview(true);
+        force_clear_mkv_video_preview();
 
-                                           video_start_frame = 0;
-                                           video_end_frame = 0;
-                                           video_track_index = -1;
+        video_start_frame = 0;
+        video_end_frame = 0;
+        video_track_index = -1;
 
-                                           mark_session_dirty();
-                                           resume_rt_thread();
+        mark_session_dirty();
+        resume_rt_thread();
 
-                                           invalidate_waveform_caches();
-                                           if (waveform_area_bt)
-                                               gtk_widget_queue_draw(waveform_area_bt);
-                                           if (waveform_area_input)
-                                               gtk_widget_queue_draw(waveform_area_input);
+        invalidate_waveform_caches();
+        if (waveform_area_bt)
+            gtk_widget_queue_draw(waveform_area_bt);
+        if (waveform_area_input)
+            gtk_widget_queue_draw(waveform_area_input);
 
-                                           log_and_notify(1, "Status: Video removed from session");
-                                       }
-                                   }
+        log_and_notify(1, "Status: Video removed from session");
+    }
+}
 
-                                   void on_waveform_right_click(GtkGestureClick *gesture, int n_press, double x, double y,
-                                                                gpointer user_data) {
-                                       (void)n_press;
-                                       (void)user_data;
-                                       GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
-                                       double dot_start_x, dot_end_x, dot_y;
+void on_waveform_right_click(GtkGestureClick *gesture, int n_press, double x, double y,
+                             gpointer user_data) {
+    (void)n_press;
+    (void)user_data;
+    GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    double dot_start_x, dot_end_x, dot_y;
 
-                                       if (get_video_dot_positions(widget, &dot_start_x, &dot_end_x, &dot_y)) {
-                                           if ((fabs(x - dot_start_x) <= 15.0 && fabs(y - dot_y) <= 15.0) ||
-                                               (fabs(x - dot_end_x) <= 15.0 && fabs(y - dot_y) <= 15.0)) {
+    if (get_video_dot_positions(widget, &dot_start_x, &dot_end_x, &dot_y)) {
+        if ((fabs(x - dot_start_x) <= 15.0 && fabs(y - dot_y) <= 15.0) ||
+            (fabs(x - dot_end_x) <= 15.0 && fabs(y - dot_y) <= 15.0)) {
 
-                                               gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+            gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
-                                           if (!is_deletable_video_take()) {
-                                               GtkAlertDialog *alert = gtk_alert_dialog_new("Unsupported Action");
-                                               gtk_alert_dialog_set_detail(
-                                                   alert, "Deleting the video track from external files is not supported.");
-                                               GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
-                                               gtk_alert_dialog_show(alert, parent);
-                                               g_object_unref(alert);
-                                           } else {
-                                               GtkAlertDialog *alert = gtk_alert_dialog_new("Remove Video Take?");
-                                               gtk_alert_dialog_set_detail(
-                                                   alert,
-                                                   "You are about to delete this video take from the session. Are you sure?");
-                                               const char *buttons[] = {"Delete Video", "Cancel", NULL};
-                                               gtk_alert_dialog_set_buttons(alert, buttons);
-                                               gtk_alert_dialog_set_cancel_button(alert, 1);
-                                               gtk_alert_dialog_set_default_button(alert, 0);
+            if (!is_deletable_video_take()) {
+                GtkAlertDialog *alert = gtk_alert_dialog_new("Unsupported Action");
+                gtk_alert_dialog_set_detail(
+                    alert, "Deleting the video track from external files is not supported.");
+                GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
+                gtk_alert_dialog_show(alert, parent);
+                g_object_unref(alert);
+            } else {
+                GtkAlertDialog *alert = gtk_alert_dialog_new("Remove Video Take?");
+                gtk_alert_dialog_set_detail(
+                    alert,
+                    "You are about to delete this video take from the session. Are you sure?");
+                const char *buttons[] = {"Delete Video", "Cancel", NULL};
+                gtk_alert_dialog_set_buttons(alert, buttons);
+                gtk_alert_dialog_set_cancel_button(alert, 1);
+                gtk_alert_dialog_set_default_button(alert, 0);
 
-                                               GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
-                                               gtk_alert_dialog_choose(alert, parent, NULL, on_video_delete_confirm, NULL);
-                                               g_object_unref(alert);
-                                           }
-                                           return;
-                                               }
-                                       }
-                                       gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
-                                                                }
+                GtkWindow *parent = GTK_WINDOW(gtk_widget_get_root(widget));
+                gtk_alert_dialog_choose(alert, parent, NULL, on_video_delete_confirm, NULL);
+                g_object_unref(alert);
+            }
+            return;
+        }
+    }
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
+}
 
 static float pending_gain_multiplier = 1.0f;
 static guint gain_debounce_id = 0;

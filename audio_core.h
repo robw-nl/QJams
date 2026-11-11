@@ -46,12 +46,12 @@ extern _Atomic int timebase_track;
 
 extern _Atomic uint32_t rt_dropped_audio_frames;
 
-
 extern _Atomic bool seek_flag;
 extern _Atomic double seek_target;
 extern _Atomic bool loop_wrap_pending;
+extern _Atomic bool loop_wrap_was_recording;
+extern _Atomic bool rt_loop_countdown_enabled;
 extern _Atomic bool engine_is_shutting_down;
-
 
 void seek_backing_track(double fraction);
 void set_playback_speed(float speed);

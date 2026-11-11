@@ -131,7 +131,7 @@ static gboolean delayed_routing_cb(gpointer user_data) {
                     sizeof(ui_state.config.video_device) - 1);
             ui_state.config.video_device[sizeof(ui_state.config.video_device) - 1] = '\0';
 
-            stop_video_engine();
+            stop_v4l2_capture();
             init_and_start_video_engine(ui_state.config.video_device, &video_queue);
             save_qjams_config(ui_state.config_path, &ui_state.config);
         } else if (!is_video_engine_running()) {
@@ -141,12 +141,12 @@ static gboolean delayed_routing_cb(gpointer user_data) {
         if (video_preview_frame)
             gtk_widget_set_visible(video_preview_frame, TRUE);
         if (btn_record_video)
-            gtk_widget_set_sensitive(btn_record_video, TRUE);
+            gtk_widget_set_sensitive(btn_record_video, is_camera_detected());
     } else {
-        log_and_notify(0, "[HW-HEAL] All video devices lost. Shutting down video engine.\n");
-        stop_video_engine();
+        log_and_notify(0, "[HW-HEAL] All video devices lost. Entering playback-only mode.\n");
+        stop_v4l2_capture();
         if (video_preview_frame)
-            gtk_widget_set_visible(video_preview_frame, FALSE);
+            gtk_widget_set_visible(video_preview_frame, TRUE);
         if (btn_record_video)
             gtk_widget_set_sensitive(btn_record_video, FALSE);
         atomic_store_explicit(&video_is_armed, false, memory_order_release);

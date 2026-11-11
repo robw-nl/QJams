@@ -1089,7 +1089,7 @@ static void load_session_ready(GObject *source_object, GAsyncResult *res, gpoint
         gtk_widget_set_sensitive(btn_play, TRUE);
         gtk_widget_set_sensitive(btn_record, TRUE);
         if (btn_record_video)
-            gtk_widget_set_sensitive(btn_record_video, TRUE);
+            gtk_widget_set_sensitive(btn_record_video, is_camera_detected());
 
         if (has_active_live_video()) {
             launch_mkv_video_preview(current_raw_path);

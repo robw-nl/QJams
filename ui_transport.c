@@ -84,7 +84,7 @@ void update_global_ui_locks(bool is_playing, bool is_recording) {
     if (btn_record)
         gtk_widget_set_sensitive(btn_record, !is_playing);
     if (btn_record_video)
-        gtk_widget_set_sensitive(btn_record_video, !is_playing);
+        gtk_widget_set_sensitive(btn_record_video, !is_playing && is_camera_detected());
 
     // Stop: Only enabled when actively running
     if (btn_stop)
@@ -136,6 +136,8 @@ static gboolean apply_speed_deferred(gpointer user_data) {
 void on_loop_countdown_toggled(GtkToggleButton *btn, gpointer user_data) {
     (void)user_data;
     ui_state.config.loop_countdown_active = gtk_toggle_button_get_active(btn) ? 1 : 0;
+    atomic_store_explicit(&rt_loop_countdown_enabled, ui_state.config.loop_countdown_active != 0,
+                          memory_order_release);
     save_qjams_config(ui_state.config_path, &ui_state.config);
 
     if (ui_state.config.loop_countdown_active) {
@@ -486,7 +488,22 @@ gboolean transport_monitor_tick(gpointer user_data) {
         }
 
         if (bt_frames > 0 && current_pos >= stop_frame) {
-            if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
+            if (!is_recording && ui_state.config.loop_countdown_active != 0) {
+                atomic_store_explicit(&get_transport_state()->is_paused, true,
+                                      memory_order_release);
+                atomic_store_explicit(&seek_flag, false, memory_order_release);
+                atomic_store_explicit(&get_transport_state()->playback_pos, 0,
+                                      memory_order_release);
+                atomic_store_explicit(&stretcher_flush_request, true, memory_order_release);
+                if (waveform_adj)
+                    gtk_adjustment_set_value(waveform_adj, 0.0);
+                refresh_track_time_display();
+                if (waveform_area_bt)
+                    gtk_widget_queue_draw(waveform_area_bt);
+                if (waveform_area_input)
+                    gtk_widget_queue_draw(waveform_area_input);
+                start_playback_loop_countdown();
+            } else if (btn_stop && gtk_widget_is_sensitive(btn_stop)) {
                 g_signal_emit_by_name(btn_stop, "clicked");
                 atomic_store_explicit(&seek_flag, false, memory_order_release);
                 atomic_store_explicit(&get_transport_state()->playback_pos, 0,
@@ -594,10 +611,8 @@ static void start_recording_execution(void) {
         }
 
         clear_video_stash_async();
-
-        if (!is_ext_video) {
-            launch_mkv_video_preview("");
-        }
+        launch_mkv_video_preview("");
+        is_ext_video = false;
 
         snprintf(current_raw_path, sizeof(current_raw_path),
                  "/tmp/qjams_raw_%04d%02d%02d_%02d%02d%02d.mkv", tm.tm_year + 1900, tm.tm_mon + 1,
@@ -756,6 +771,8 @@ bool is_countdown_active(void) {
     return countdown_timer_id != 0;
 }
 
+static bool countdown_is_playback_only = false;
+
 static gboolean countdown_tick(gpointer user_data) {
     (void)user_data;
     EngineCommand cmd = {.type = CMD_PLAY_CLICK, .target_track = 0};
@@ -778,12 +795,26 @@ static gboolean countdown_tick(gpointer user_data) {
         countdown_val--;
         return G_SOURCE_CONTINUE;
     } else {
-        start_recording_execution();
         countdown_timer_id = 0;
 
         if (countdown_window) {
             gtk_window_destroy(GTK_WINDOW(countdown_window));
             countdown_window = NULL;
+        }
+
+        if (countdown_is_playback_only) {
+            countdown_is_playback_only = false;
+            atomic_store_explicit(&get_transport_state()->is_paused, false, memory_order_release);
+            atomic_store_explicit(&get_transport_state()->is_playing, true, memory_order_release);
+            log_and_notify(1, "Status: PLAYING");
+            if (btn_play) {
+                gtk_button_set_icon_name(GTK_BUTTON(btn_play), "");
+                gtk_button_set_label(GTK_BUTTON(btn_play), "⏸");
+                gtk_widget_set_tooltip_text(btn_play, "Pause (Space)");
+            }
+            update_global_ui_locks(true, false);
+        } else {
+            start_recording_execution();
         }
 
         return G_SOURCE_REMOVE;
@@ -793,9 +824,22 @@ static gboolean countdown_tick(gpointer user_data) {
 static void on_countdown_destroyed(GtkWidget *widget, gpointer user_data) {
     (void)widget;
     (void)user_data;
+    atomic_store_explicit(&is_loop_wrapping, false, memory_order_release);
     if (countdown_timer_id != 0) {
         g_source_remove(countdown_timer_id);
         countdown_timer_id = 0;
+        if (countdown_is_playback_only) {
+            countdown_is_playback_only = false;
+            atomic_store_explicit(&get_transport_state()->is_playing, false, memory_order_release);
+            atomic_store_explicit(&get_transport_state()->is_paused, false, memory_order_release);
+            if (btn_play) {
+                gtk_button_set_icon_name(GTK_BUTTON(btn_play), "");
+                gtk_button_set_label(GTK_BUTTON(btn_play), "▶");
+                gtk_widget_set_tooltip_text(btn_play, "Play (Space)");
+            }
+            log_and_notify(1, "Status: Ready");
+            update_global_ui_locks(false, false);
+        }
     }
     countdown_window = NULL;
     countdown_label = NULL;
@@ -813,7 +857,8 @@ static gboolean on_countdown_key_pressed(GtkEventControllerKey *controller, guin
     (void)keycode;
     (void)state;
     (void)user_data;
-    if (keyval == GDK_KEY_Escape) {
+    if (keyval == GDK_KEY_Escape || keyval == GDK_KEY_space || keyval == GDK_KEY_s ||
+        keyval == GDK_KEY_S) {
         if (countdown_window) {
             gtk_window_destroy(GTK_WINDOW(countdown_window));
             countdown_window = NULL;
@@ -821,6 +866,56 @@ static gboolean on_countdown_key_pressed(GtkEventControllerKey *controller, guin
         return TRUE;
     }
     return FALSE;
+}
+
+/**
+ * @brief Launches the 3-second countdown modal for a playback loop wrap and resumes playback on
+ * completion.
+ */
+void start_playback_loop_countdown(void) {
+    if (countdown_timer_id != 0)
+        return;
+
+    countdown_is_playback_only = true;
+    gtk_widget_set_sensitive(btn_record, FALSE);
+    if (btn_record_video)
+        gtk_widget_set_sensitive(btn_record_video, FALSE);
+    gtk_widget_set_sensitive(btn_play, FALSE);
+    gtk_widget_set_sensitive(btn_prev, FALSE);
+    gtk_widget_set_sensitive(btn_next, FALSE);
+    gtk_widget_set_sensitive(btn_stop, TRUE);
+    log_and_notify(1, "Status: Get Ready...");
+
+    countdown_window = gtk_window_new();
+    gtk_window_set_transient_for(GTK_WINDOW(countdown_window),
+                                 GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(btn_play))));
+    gtk_window_set_decorated(GTK_WINDOW(countdown_window), FALSE);
+    gtk_window_set_modal(GTK_WINDOW(countdown_window), TRUE);
+
+    GtkEventController *countdown_key_ctrl = gtk_event_controller_key_new();
+    g_signal_connect(countdown_key_ctrl, "key-pressed", G_CALLBACK(on_countdown_key_pressed), NULL);
+    gtk_widget_add_controller(countdown_window, countdown_key_ctrl);
+
+    g_signal_connect(countdown_window, "destroy", G_CALLBACK(on_countdown_destroyed), NULL);
+
+    countdown_label = gtk_label_new(NULL);
+    gtk_widget_set_margin_start(countdown_label, 80);
+    gtk_widget_set_margin_end(countdown_label, 80);
+    gtk_widget_set_margin_top(countdown_label, 50);
+    gtk_widget_set_margin_bottom(countdown_label, 50);
+    gtk_window_set_child(GTK_WINDOW(countdown_window), countdown_label);
+
+    countdown_val = 3;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "<span size='48000' weight='heavy'>%d</span>", countdown_val);
+    gtk_label_set_markup(GTK_LABEL(countdown_label), buf);
+    countdown_val--;
+
+    EngineCommand cmd = {.type = CMD_PLAY_CLICK, .target_track = 0};
+    push_command(&cmd_queue, cmd);
+
+    gtk_window_present(GTK_WINDOW(countdown_window));
+    countdown_timer_id = g_timeout_add(1000, countdown_tick, NULL);
 }
 
 /**
@@ -832,6 +927,7 @@ void on_start_clicked(GtkButton *button, gpointer user_data) {
     if (countdown_timer_id != 0)
         return;
 
+    countdown_is_playback_only = false;
     bool is_playing =
         atomic_load_explicit(&get_transport_state()->is_playing, memory_order_acquire);
     bool is_wrapping = atomic_load_explicit(&is_loop_wrapping, memory_order_acquire);
@@ -898,7 +994,6 @@ void on_stop_clicked(GtkButton *button, gpointer user_data) {
         atomic_store_explicit(&get_transport_state()->is_playing, false, memory_order_release);
         atomic_store_explicit(&get_transport_state()->is_recording, false, memory_order_release);
 
-        clear_loop_points();
         if (waveform_area_bt)
             gtk_widget_queue_draw(waveform_area_bt);
         if (waveform_area_input)
@@ -1341,7 +1436,10 @@ void on_record_video_clicked(GtkButton *button, gpointer user_data) {
     }
 
     if (!atomic_load_explicit(&suppress_video_overwrite, memory_order_acquire)) {
-        if (has_active_live_video()) {
+        bool has_existing_video = has_active_live_video() ||
+                                  (atomic_load_explicit(&video_end_frame, memory_order_acquire) >
+                                   atomic_load_explicit(&video_start_frame, memory_order_acquire));
+        if (has_existing_video) {
             GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Existing Video Take?");
             gtk_alert_dialog_set_detail(
                 alert, "A video take already exists in this session. Recording video again will "

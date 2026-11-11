@@ -703,7 +703,7 @@ static void import_stem_ready(GObject *source_object, GAsyncResult *res, gpointe
             gtk_widget_set_sensitive(btn_record, TRUE);
         extern GtkWidget *btn_record_video;
         if (btn_record_video)
-            gtk_widget_set_sensitive(btn_record_video, TRUE);
+            gtk_widget_set_sensitive(btn_record_video, is_camera_detected());
 
         extern GtkAdjustment *waveform_adj;
         extern double zoom_multiplier;

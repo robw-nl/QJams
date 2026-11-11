@@ -18,6 +18,14 @@ int init_and_start_video_engine(const char *device_path, SPSC_Video_Queue *queue
  * @return true if the video thread is active, false otherwise.
  */
 bool is_video_engine_running(void);
+bool is_camera_detected(void);
+bool is_mkv_preview_active(void);
+
+/**
+ * @brief Stops only the V4L2 capture thread and releases camera hardware resources,
+ *        keeping the MKV video preview decoder thread alive for playback-only mode.
+ */
+void stop_v4l2_capture(void);
 
 /**
  * @brief Shuts down the video capture thread and releases V4L2 hardware resources.

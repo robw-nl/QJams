@@ -325,6 +325,8 @@ QJamsConfig load_qjams_config(const char *filepath) {
             config.enable_logging = atoi(value);
         } else if (strcmp(key, "LOOP_COUNTDOWN_ACTIVE") == 0) {
             config.loop_countdown_active = atoi(value);
+        } else if (strcmp(key, "OVERLAY_SOFT_CLIP") == 0) {
+            config.overlay_soft_clip = atoi(value);
         } else if (strcmp(key, "VIDEO_WIDTH_DEFAULT") == 0) {
             config.video_width_default = atoi(value);
         } else if (strcmp(key, "VIDEO_WIDTH_EXPANDED") == 0) {

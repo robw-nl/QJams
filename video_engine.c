@@ -33,9 +33,15 @@ static unsigned int actual_v4l2_buffers = 0;
 static pthread_t video_thread;
 
 /**
+ * @brief Flag indicating if the V4L2 hardware was successfully initialized.
+ */
+static _Atomic bool camera_detected = false;
+
+/**
  * @brief Flag indicating if the video thread is active. Must be accessed atomically.
  */
 static _Atomic bool video_thread_active = false;
+
 /**
  * @brief Loop condition for the video thread. Must be accessed atomically.
  */
@@ -73,11 +79,37 @@ static bool mkv_path_changed = false;
 static void *mkv_video_loop(void *arg);
 
 /**
+ * @brief Checks if a V4L2 camera was detected during initialization.
+ * @return true if camera is present, false otherwise.
+ */
+bool is_camera_detected(void) {
+    return atomic_load_explicit(&camera_detected, memory_order_acquire);
+}
+
+/**
  * @brief Checks if the V4L2 capture thread is actively running.
  * @return true if the video thread is active, false otherwise.
  */
 bool is_video_engine_running(void) {
     return atomic_load_explicit(&video_thread_active, memory_order_acquire);
+}
+
+/**
+ * @brief Checks if an MKV video file is actively occupying the preview window at the current
+ * playhead.
+ * @return true if an MKV target path is active and playback_pos is within [v_start, v_end), false
+ * otherwise.
+ */
+bool is_mkv_preview_active(void) {
+    pthread_mutex_lock(&mkv_mutex);
+    bool has_target = (mkv_target_path[0] != '\0');
+    pthread_mutex_unlock(&mkv_mutex);
+    if (!has_target)
+        return false;
+    size_t v_start = atomic_load_explicit(&video_start_frame, memory_order_acquire);
+    size_t v_end = atomic_load_explicit(&video_end_frame, memory_order_acquire);
+    size_t pos = atomic_load_explicit(&get_transport_state()->playback_pos, memory_order_acquire);
+    return (v_end > v_start && pos >= v_start && pos < v_end);
 }
 
 static void *video_capture_loop(void *arg) {
@@ -386,9 +418,12 @@ int init_and_start_video_engine(const char *device_path, SPSC_Video_Queue *queue
     }
 
     if (fd == -1) {
-        log_and_notify(0, "[Video Engine] Cannot open V4L2 device: %s\n", strerror(errno));
-        goto v4l2_init_fail;
+        atomic_store_explicit(&camera_detected, false, memory_order_release);
+        log_and_notify(0, "[Video Engine] No camera detected. Initializing playback-only mode.\n");
+        return 0;
     }
+
+    atomic_store_explicit(&camera_detected, true, memory_order_release);
 
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
@@ -464,6 +499,7 @@ int init_and_start_video_engine(const char *device_path, SPSC_Video_Queue *queue
     return 0;
 
 v4l2_init_fail:
+    atomic_store_explicit(&camera_detected, false, memory_order_release);
     if (buffers) {
         for (unsigned int i = 0; i < actual_v4l2_buffers; i++) {
             if (buffers[i].start && buffers[i].start != MAP_FAILED) {
@@ -498,18 +534,12 @@ v4l2_init_fail:
 }
 
 /**
- * @brief Shuts down both the V4L2 capture thread and MKV preview decoder thread, releasing all
- * memory pools.
+ * @brief Stops only the V4L2 capture thread and releases camera hardware resources,
+ *        keeping the MKV video preview decoder thread alive for playback-only mode.
  */
-void stop_video_engine(void) {
+void stop_v4l2_capture(void) {
     atomic_store_explicit(&keep_running, 0, memory_order_release);
-
-    if (atomic_exchange_explicit(&mkv_video_keep_running, false, memory_order_release)) {
-        pthread_mutex_lock(&mkv_mutex);
-        pthread_cond_signal(&mkv_cond);
-        pthread_mutex_unlock(&mkv_mutex);
-        pthread_join(mkv_video_thread, NULL);
-    }
+    atomic_store_explicit(&camera_detected, false, memory_order_release);
 
     if (fd != -1) {
         if (atomic_load_explicit(&video_thread_active, memory_order_acquire)) {
@@ -547,10 +577,6 @@ void stop_video_engine(void) {
         encode_sws_ctx = NULL;
     }
 
-    PreviewPayload p_payload;
-    while (pop_preview_frame(&preview_queue, &p_payload)) {
-    }
-
     for (int i = 0; i < 64; i++) {
         free(nv12_pool[i]);
         nv12_pool[i] = NULL;
@@ -559,6 +585,26 @@ void stop_video_engine(void) {
         free(yuyv_cpu_cache);
         yuyv_cpu_cache = NULL;
     }
+}
+
+/**
+ * @brief Shuts down both the V4L2 capture thread and MKV preview decoder thread, releasing all
+ * memory pools.
+ */
+void stop_video_engine(void) {
+    stop_v4l2_capture();
+
+    if (atomic_exchange_explicit(&mkv_video_keep_running, false, memory_order_release)) {
+        pthread_mutex_lock(&mkv_mutex);
+        pthread_cond_signal(&mkv_cond);
+        pthread_mutex_unlock(&mkv_mutex);
+        pthread_join(mkv_video_thread, NULL);
+    }
+
+    PreviewPayload p_payload;
+    while (pop_preview_frame(&preview_queue, &p_payload)) {
+    }
+
     if (atomic_load_explicit(&engine_is_shutting_down, memory_order_acquire)) {
         for (int i = 0; i < 32; i++) {
             free(rgba_pool[i]);
@@ -758,7 +804,6 @@ static void *mkv_video_loop(void *arg) {
                                                  memory_order_acquire) &&
                             atomic_load_explicit(&video_is_armed, memory_order_acquire);
 
-                        // Fast-forward intercept: bypass the heavy H264 CPU decoder entirely
                         if (!skip_decode) {
                             double raw_pkt_time = 0.0;
                             if (pkt->pts != AV_NOPTS_VALUE) {
@@ -771,27 +816,51 @@ static void *mkv_video_loop(void *arg) {
                                                              memory_order_relaxed);
                             double check_time = raw_pkt_time / (spd > 0.0f ? spd : 1.0f);
 
-                            if (check_time < last_audio_time - 0.15) {
-                                skip_decode = true;
+                            // Use decoder-level non-ref discard during catch-up to preserve P/IDR
+                            // references
+                            if (check_time < last_audio_time - 0.05) {
+                                v_ctx->skip_frame = AVDISCARD_NONREF;
+                            } else {
+                                v_ctx->skip_frame = AVDISCARD_DEFAULT;
                             }
-                        }
 
-                        if (!skip_decode && avcodec_send_packet(v_ctx, pkt) == 0) {
-                            should_decode = true;
+                            if (avcodec_send_packet(v_ctx, pkt) == 0) {
+                                should_decode = true;
+                            }
                         }
                     }
                 } else {
                     eof_flushed = true;
+                    v_ctx->skip_frame = AVDISCARD_DEFAULT;
                     if (avcodec_send_packet(v_ctx, NULL) == 0) {
                         should_decode = true;
                     }
                 }
 
                 if (should_decode) {
-                    while (avcodec_receive_frame(v_ctx, frame) == 0) {
-                        double raw_frame_time = frame->pts * av_q2d(time_base);
+                    bool seek_interrupted = false;
+                    while (!seek_interrupted && avcodec_receive_frame(v_ctx, frame) == 0) {
+                        int64_t best_ts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                              ? frame->best_effort_timestamp
+                                              : frame->pts;
+                        double raw_frame_time =
+                            (best_ts != AV_NOPTS_VALUE) ? (best_ts * av_q2d(time_base)) : 0.0;
                         double frame_time = 0.0;
                         double sync_last_audio = local_audio_time;
+                        float init_spd = atomic_load_explicit(
+                            &get_transport_state()->playback_speed, memory_order_relaxed);
+                        frame_time = raw_frame_time / (init_spd > 0.0f ? init_spd : 1.0f);
+
+                        // Immediately drop pre-seek catch-up frames before sleep/SWS scaling
+                        if (is_actively_moving && frame_time < local_audio_time - 0.04) {
+                            av_frame_unref(frame);
+                            continue;
+                        }
+                        if (!is_actively_moving && pending_parked_frame &&
+                            frame_time < local_audio_time - 0.04) {
+                            av_frame_unref(frame);
+                            continue;
+                        }
 
                         while (
                             is_actively_moving && !abort_file &&
@@ -816,19 +885,22 @@ static void *mkv_video_loop(void *arg) {
                                 &get_transport_state()->playback_speed, memory_order_relaxed);
                             frame_time =
                                 raw_frame_time / (current_speed > 0.0f ? current_speed : 1.0f);
-                            size_t pos = atomic_load_explicit(&get_transport_state()->playback_pos,
-                                                              memory_order_acquire);
-                            double inner_audio_time = (double)pos / current_rate;
+                            size_t cur_pos = atomic_load_explicit(
+                                &get_transport_state()->playback_pos, memory_order_acquire);
+                            double inner_audio_time = (double)cur_pos / current_rate;
                             double inner_local_time = inner_audio_time - offset_sec;
 
-                            if (inner_local_time < sync_last_audio - 0.2)
+                            // Detect both backward AND forward timeline jumps immediately
+                            if (fabs(inner_local_time - sync_last_audio) > 0.20) {
+                                seek_interrupted = true;
                                 break;
+                            }
                             sync_last_audio = inner_local_time;
                             last_audio_time = inner_local_time;
                             double time_diff = frame_time - inner_local_time;
-                            if (time_diff <= 0.05)
+                            if (time_diff <= 0.02)
                                 break;
-                            long long delay_ns = (long long)((time_diff - 0.05) * 1000000000LL);
+                            long long delay_ns = (long long)((time_diff - 0.02) * 1000000000LL);
                             if (delay_ns < 1000000LL)
                                 delay_ns = 1000000LL;
                             if (delay_ns > 10000000LL)
@@ -845,6 +917,11 @@ static void *mkv_video_loop(void *arg) {
                             pthread_mutex_lock(&mkv_mutex);
                             pthread_cond_timedwait(&mkv_cond, &mkv_mutex, &target);
                             pthread_mutex_unlock(&mkv_mutex);
+                        }
+
+                        if (seek_interrupted) {
+                            av_frame_unref(frame);
+                            break;
                         }
 
                         if (!is_actively_moving) {

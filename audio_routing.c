@@ -140,8 +140,10 @@ void qjams_drop_connections(void) {
 
 /**
  * @brief Checks if a port's base name ends with or exactly matches a specific channel token,
- *        preventing prefix collisions (e.g., "AUX1" matching "AUX10" or "capture_1" matching "capture_10").
- * @param base_name Port name with client prefix and optional PipeWire "-N" instance suffix stripped.
+ *        preventing prefix collisions (e.g., "AUX1" matching "AUX10" or "capture_1" matching
+ * "capture_10").
+ * @param base_name Port name with client prefix and optional PipeWire "-N" instance suffix
+ * stripped.
  * @param token The target channel identifier (e.g., "AUX0", "AUX1", "capture_1", "FL").
  * @return true if the token matches on a non-digit boundary, false otherwise.
  */
@@ -171,8 +173,10 @@ int patch_audio_ports(const char *target_audio_device) {
     log_and_notify(0, "Attempting to patch capture device: %s\n", target_audio_device);
 
     atomic_store_explicit(&audio_available, false, memory_order_release);
-    jack_port_disconnect(client, input_port_1);
-    jack_port_disconnect(client, input_port_2);
+    if (input_port_1)
+        jack_port_disconnect(client, input_port_1);
+    if (input_port_2)
+        jack_port_disconnect(client, input_port_2);
 
     const char **ports = wait_for_jack_ports(client, target_audio_device, JackPortIsOutput);
     int connected = 0;
@@ -200,13 +204,13 @@ int patch_audio_ports(const char *target_audio_device) {
                 }
 
                 bool is_l = (match_channel_token(base_name, "AUX0") ||
-                match_channel_token(base_name, "FL") ||
-                match_channel_token(base_name, "capture_1") ||
-                match_channel_token(base_name, "left"));
+                             match_channel_token(base_name, "FL") ||
+                             match_channel_token(base_name, "capture_1") ||
+                             match_channel_token(base_name, "left"));
                 bool is_r = (match_channel_token(base_name, "AUX1") ||
-                match_channel_token(base_name, "FR") ||
-                match_channel_token(base_name, "capture_2") ||
-                match_channel_token(base_name, "right"));
+                             match_channel_token(base_name, "FR") ||
+                             match_channel_token(base_name, "capture_2") ||
+                             match_channel_token(base_name, "right"));
 
                 if (!is_l && !is_r) {
                     if (!best_l)
@@ -259,11 +263,13 @@ int patch_playback_ports(const char *target_playback_device) {
 
     log_and_notify(0, "Attempting to patch playback device: %s\n", target_playback_device);
 
-    jack_port_disconnect(client, output_port_1);
-    jack_port_disconnect(client, output_port_2);
+    if (output_port_1)
+        jack_port_disconnect(client, output_port_1);
+    if (output_port_2)
+        jack_port_disconnect(client, output_port_2);
 
     const char **ports =
-    wait_for_jack_ports(client, target_playback_device, JackPortIsPhysical | JackPortIsInput);
+        wait_for_jack_ports(client, target_playback_device, JackPortIsPhysical | JackPortIsInput);
     int connected = 0;
 
     if (ports) {
@@ -289,13 +295,13 @@ int patch_playback_ports(const char *target_playback_device) {
                 }
 
                 bool is_l = (match_channel_token(base_name, "AUX0") ||
-                match_channel_token(base_name, "FL") ||
-                match_channel_token(base_name, "playback_1") ||
-                match_channel_token(base_name, "left"));
+                             match_channel_token(base_name, "FL") ||
+                             match_channel_token(base_name, "playback_1") ||
+                             match_channel_token(base_name, "left"));
                 bool is_r = (match_channel_token(base_name, "AUX1") ||
-                match_channel_token(base_name, "FR") ||
-                match_channel_token(base_name, "playback_2") ||
-                match_channel_token(base_name, "right"));
+                             match_channel_token(base_name, "FR") ||
+                             match_channel_token(base_name, "playback_2") ||
+                             match_channel_token(base_name, "right"));
 
                 if (!is_l && !is_r) {
                     if (!best_l)

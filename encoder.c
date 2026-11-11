@@ -75,7 +75,7 @@ static int set_hwframe_ctx(AVCodecContext *ctx, AVBufferRef *hw_device_ctx, int 
 
     ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
     av_buffer_unref(&hw_frames_ref);
-    return 0;
+    return ctx->hw_frames_ctx ? 0 : -1;
 }
 
 /**
@@ -93,6 +93,9 @@ int init_and_start_encoder(const char *output_filename, int width, int height, i
     video_queue_ptr = queue;
     atomic_store_explicit(&video_queue_ptr->read_index,
                           atomic_load_explicit(&video_queue_ptr->write_index, memory_order_relaxed),
+                          memory_order_release);
+    atomic_store_explicit(&audio_queue.read_index,
+                          atomic_load_explicit(&audio_queue.write_index, memory_order_relaxed),
                           memory_order_release);
     if (avformat_alloc_output_context2(&fmt_ctx, NULL, NULL, output_filename) < 0 || !fmt_ctx) {
         log_and_notify(0, "[Encoder] Error: Could not allocate output format context.\n");
@@ -155,7 +158,9 @@ int init_and_start_encoder(const char *output_filename, int width, int height, i
         av_opt_set(video_enc_ctx->priv_data, "qp", "20", 0);
 
         video_enc_ctx->compression_level = 20;
-        set_hwframe_ctx(video_enc_ctx, hw_device_ctx, width, height);
+        if (set_hwframe_ctx(video_enc_ctx, hw_device_ctx, width, height) < 0) {
+            log_and_notify(0, "[Encoder] Warning: Failed to allocate VAAPI frame pool.\n");
+        }
     } else if (hw_accel_type == 2) { // NVENC
         video_enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
         av_opt_set(video_enc_ctx->priv_data, "preset", "p4", 0);
@@ -291,10 +296,14 @@ int init_and_start_encoder(const char *output_filename, int width, int height, i
             cond_monotonic_init = true;
         }
     }
-
     keep_running = 1;
     thread_is_active = 1;
-    pthread_create(&encoder_thread, NULL, encoder_loop, NULL);
+    if (pthread_create(&encoder_thread, NULL, encoder_loop, NULL) != 0) {
+        keep_running = 0;
+        thread_is_active = 0;
+        log_and_notify(0, "[Encoder] Error: Failed to spawn encoder thread.\n");
+        goto encoder_cleanup;
+    }
 
     log_and_notify(0, "[Encoder] Pipeline Initialized and Running at %d Hz.\n", sample_rate);
     return 0;
@@ -335,15 +344,6 @@ static void safe_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt) {
 
 /**
  * @brief Drains available audio frames from the lock-free queue and encodes them to the MKV
- * container. Utilizes the hardware PTS injected by the JACK thread to prevent audio/video
- * desynchronization.
- * @param a_frame_mix The reusable AVFrame for the master mix stream.
- * @param pkt The reusable AVPacket used for writing.
- * @param first_a_pts Pointer to the baseline presentation timestamp.
- * @return 1 if frames were encoded, 0 if the queue lacked sufficient frames.
- */
-/**
- * @brief Drains available audio frames from the lock-free queue and encodes them to the MKV
  * container.
  * @param a_frames Array of reusable AVFrames for the master mix and track streams.
  * @param pkt The reusable AVPacket used for writing.
@@ -368,7 +368,8 @@ static int process_audio_batch(AVFrame **a_frames, AVPacket *pkt, int64_t *curre
 
     int total_streams = active_encoder_tracks + 1;
     for (int t = 0; t < total_streams; t++) {
-        av_frame_make_writable(a_frames[t]);
+        if (av_frame_make_writable(a_frames[t]) < 0)
+            return 0;
         a_frames[t]->nb_samples = nb_samples;
     }
 
@@ -378,8 +379,8 @@ static int process_audio_batch(AVFrame **a_frames, AVPacket *pkt, int64_t *curre
 
         // Stream 0: Master Mix
         int16_t *out_mix = (int16_t *)a_frames[0]->data[0];
-        out_mix[i * 2] = (int16_t)(f.mix_l * 32767.0f);
-        out_mix[i * 2 + 1] = (int16_t)(f.mix_r * 32767.0f);
+        out_mix[i * 2] = (int16_t)(soft_clip(f.mix_l) * 32767.0f);
+        out_mix[i * 2 + 1] = (int16_t)(soft_clip(f.mix_r) * 32767.0f);
 
         // Streams 1 to N: Isolated Tracks
         for (int t = 0; t < active_encoder_tracks; t++) {

@@ -23,6 +23,7 @@ void on_prev_track_clicked(GtkButton *button, gpointer user_data);
 void on_next_track_clicked(GtkButton *button, gpointer user_data);
 void on_record_audio_clicked(GtkButton *button, gpointer user_data);
 void on_record_video_clicked(GtkButton *button, gpointer user_data);
+void start_playback_loop_countdown(void);
 
 gboolean transport_monitor_tick(gpointer user_data);
 

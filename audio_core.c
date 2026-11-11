@@ -80,6 +80,8 @@ static int output_fade_remaining = 0;
 static int fade_down_remaining = 0;
 static size_t pending_seek_pos = 0;
 _Atomic bool loop_wrap_pending = false;
+_Atomic bool loop_wrap_was_recording = false;
+_Atomic bool rt_loop_countdown_enabled = false;
 
 _Atomic bool speed_change_flag = false;
 _Atomic float speed_target = 1.0f;
@@ -442,9 +444,11 @@ int process_audio(jack_nframes_t nframes, void *arg) {
     size_t active_pos = current_pos;
     size_t bt_frames =
         atomic_load_explicit(&get_transport_state()->backing_track_frames, memory_order_acquire);
+    bool countdown_on_wrap = atomic_load_explicit(&rt_loop_countdown_enabled, memory_order_relaxed);
     for (jack_nframes_t i = 0; i < nframes; i++) {
         if (active && !paused && is_looping && active_pos >= l_end) {
-            if (recording) {
+            if (recording || countdown_on_wrap) {
+                atomic_store_explicit(&loop_wrap_was_recording, recording, memory_order_relaxed);
                 atomic_store_explicit(&loop_wrap_pending, true, memory_order_release);
                 atomic_store_explicit(&get_transport_state()->is_paused, true,
                                       memory_order_release);

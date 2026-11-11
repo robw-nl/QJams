@@ -18,9 +18,12 @@
 #include <jack/jack.h>
 #include <libavutil/log.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+extern _Atomic bool mkv_video_keep_running;
 
 SPSC_Preview_Queue preview_queue;
 
@@ -118,6 +121,8 @@ static gboolean update_video_preview(GtkWidget *widget, GdkFrameClock *frame_clo
     (void)widget;
     (void)frame_clock;
     (void)user_data;
+    static int rendered_placeholder_w = 0;
+    static int rendered_placeholder_h = 0;
     PreviewPayload payload;
     PreviewPayload last_payload;
     int frames_popped = 0;
@@ -128,6 +133,8 @@ static gboolean update_video_preview(GtkWidget *widget, GdkFrameClock *frame_clo
     }
 
     if (frames_popped > 0) {
+        rendered_placeholder_w = 0;
+        rendered_placeholder_h = 0;
         uint8_t *pixel_copy =
             g_memdup2(last_payload.rgba_data, last_payload.width * last_payload.height * 4);
         GBytes *bytes = g_bytes_new_take(pixel_copy, last_payload.width * last_payload.height * 4);
@@ -137,6 +144,48 @@ static gboolean update_video_preview(GtkWidget *widget, GdkFrameClock *frame_clo
         gtk_picture_set_paintable(GTK_PICTURE(widget), GDK_PAINTABLE(texture));
         g_object_unref(texture);
         g_bytes_unref(bytes);
+    } else if (!is_camera_detected() && !is_mkv_preview_active()) {
+        int w = atomic_load_explicit(&is_video_expanded, memory_order_acquire)
+                    ? ui_state.config.video_width_expanded
+                    : ui_state.config.video_width_default;
+        if (w < 16)
+            w = 480;
+        int h = (int)(w * (9.0 / 16.0));
+        if (w != rendered_placeholder_w || h != rendered_placeholder_h) {
+            cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+            cairo_t *cr = cairo_create(surface);
+
+            cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 1.0);
+            cairo_paint(cr);
+
+            cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, 1.0);
+            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 14.0);
+
+            const char *text = "Camera not detected";
+            cairo_text_extents_t extents;
+            cairo_text_extents(cr, text, &extents);
+            cairo_move_to(cr, (w - extents.width) / 2.0, (h + extents.height) / 2.0);
+            cairo_show_text(cr, text);
+
+            cairo_destroy(cr);
+
+            int stride = cairo_image_surface_get_stride(surface);
+            unsigned char *data = cairo_image_surface_get_data(surface);
+            uint8_t *pixel_copy = g_memdup2(data, stride * h);
+            GBytes *bytes = g_bytes_new_take(pixel_copy, stride * h);
+
+            GdkTexture *texture =
+                gdk_memory_texture_new(w, h, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes, stride);
+            gtk_picture_set_paintable(GTK_PICTURE(widget), GDK_PAINTABLE(texture));
+
+            g_object_unref(texture);
+            g_bytes_unref(bytes);
+            cairo_surface_destroy(surface);
+
+            rendered_placeholder_w = w;
+            rendered_placeholder_h = h;
+        }
     }
     return G_SOURCE_CONTINUE;
 }
@@ -580,11 +629,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     init_video_queue(&video_queue, 64);
     int video_status = init_and_start_video_engine(ui_state.config.video_device, &video_queue);
+    atomic_store_explicit(&rt_loop_countdown_enabled, ui_state.config.loop_countdown_active != 0,
+                          memory_order_release);
 
-    if (v_count == 0) {
-        // ... existing code ...
-        if (video_preview_frame)
-            gtk_widget_set_visible(video_preview_frame, FALSE);
+    if (!is_camera_detected()) {
         if (btn_record_video)
             gtk_widget_set_sensitive(btn_record_video, FALSE);
         atomic_store_explicit(&video_is_armed, false, memory_order_release);
