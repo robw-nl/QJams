@@ -480,20 +480,20 @@ static gboolean on_track_drop(GtkDropTarget *target, const GValue *value, double
         } else if (src_idx < dest_idx && global_undo_ledger.states[k].track_idx > src_idx &&
                    global_undo_ledger.states[k].track_idx <= dest_idx) {
             global_undo_ledger.states[k].track_idx--;
-                   } else if (src_idx > dest_idx && global_undo_ledger.states[k].track_idx >= dest_idx &&
-                       global_undo_ledger.states[k].track_idx < src_idx) {
-                       global_undo_ledger.states[k].track_idx++;
-                       }
+        } else if (src_idx > dest_idx && global_undo_ledger.states[k].track_idx >= dest_idx &&
+                   global_undo_ledger.states[k].track_idx < src_idx) {
+            global_undo_ledger.states[k].track_idx++;
+        }
 
-                       if (global_undo_ledger.states[k].v_track_idx == src_idx) {
-                           global_undo_ledger.states[k].v_track_idx = dest_idx;
-                       } else if (src_idx < dest_idx && global_undo_ledger.states[k].v_track_idx > src_idx &&
-                           global_undo_ledger.states[k].v_track_idx <= dest_idx) {
-                           global_undo_ledger.states[k].v_track_idx--;
-                           } else if (src_idx > dest_idx && global_undo_ledger.states[k].v_track_idx >= dest_idx &&
-                               global_undo_ledger.states[k].v_track_idx < src_idx) {
-                               global_undo_ledger.states[k].v_track_idx++;
-                               }
+        if (global_undo_ledger.states[k].v_track_idx == src_idx) {
+            global_undo_ledger.states[k].v_track_idx = dest_idx;
+        } else if (src_idx < dest_idx && global_undo_ledger.states[k].v_track_idx > src_idx &&
+                   global_undo_ledger.states[k].v_track_idx <= dest_idx) {
+            global_undo_ledger.states[k].v_track_idx--;
+        } else if (src_idx > dest_idx && global_undo_ledger.states[k].v_track_idx >= dest_idx &&
+                   global_undo_ledger.states[k].v_track_idx < src_idx) {
+            global_undo_ledger.states[k].v_track_idx++;
+        }
     }
 
     atomic_store_explicit(&current_recording_track, current_rec, memory_order_release);
@@ -743,23 +743,27 @@ static void import_stem_ready(GObject *source_object, GAsyncResult *res, gpointe
 
         if (result == 1) {
             log_and_notify(1, "<span foreground='#ff4444' weight='heavy'>WARNING: Dropped track "
-            "was truncated to match canvas length!</span>");
+                              "was truncated to match canvas length!</span>");
             g_timeout_add(3000, reset_status_label_deferred, NULL);
         } else {
             log_and_notify(1, "<span>Status: Stem Imported Successfully</span>");
         }
     } else if (result == -2) {
-        log_and_notify(1, "<span foreground='#ff4444'><b>Status: Insufficient RAM for Stem</b></span>");
-        GtkWindow *win = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+        log_and_notify(
+            1, "<span foreground='#ff4444'><b>Status: Insufficient RAM for Stem</b></span>");
+        GtkWindow *win =
+            gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
         if (win) {
             GtkAlertDialog *alert = gtk_alert_dialog_new("Insufficient Memory");
-            gtk_alert_dialog_set_detail(alert, "Your system does not have enough free RAM to uncompress and load this media file into the real-time audio canvas.");
+            gtk_alert_dialog_set_detail(
+                alert, "Your system does not have enough free RAM to uncompress and load this "
+                       "media file into the real-time audio canvas.");
             gtk_alert_dialog_show(alert, win);
             g_object_unref(alert);
         }
     } else if (result == -3) {
         log_and_notify(1, "<span foreground='#ff4444'><b>Status: Stem Import Failed (Corrupt or "
-        "Empty Media)</b></span>");
+                          "Empty Media)</b></span>");
     } else {
         log_and_notify(1, "<span foreground='#ff4444'><b>Status: Stem Import Failed</b></span>");
     }
@@ -944,7 +948,8 @@ static void on_drop_session_overwrite_response(GObject *source_object, GAsyncRes
 static void execute_import_router(const char *filepath, int track_idx, size_t start_frame,
                                   bool auto_advance) {
     if (!g_file_test(filepath, G_FILE_TEST_EXISTS)) {
-        log_and_notify(1, "<span foreground='#ff4444'><b>Status: Import Failed (File not found)</b></span>");
+        log_and_notify(
+            1, "<span foreground='#ff4444'><b>Status: Import Failed (File not found)</b></span>");
         return;
     }
     if (g_str_has_suffix(filepath, ".qjams") || g_str_has_suffix(filepath, ".QJAMS")) {
@@ -959,7 +964,7 @@ static void execute_import_router(const char *filepath, int track_idx, size_t st
         if (has_any_audio && is_session_dirty() && pristine_frames > 0) {
             GtkAlertDialog *alert = gtk_alert_dialog_new("Overwrite Active Session?");
             gtk_alert_dialog_set_detail(alert, "Loading this session will discard your currently "
-            "recorded, unsaved audio. Continue?");
+                                               "recorded, unsaved audio. Continue?");
             const char *buttons[] = {"Discard & Load", "Cancel", NULL};
             gtk_alert_dialog_set_buttons(alert, buttons);
             gtk_alert_dialog_set_cancel_button(alert, 1);

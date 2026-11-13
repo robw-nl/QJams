@@ -10,10 +10,6 @@
 #include <gtk/gtk.h>
 #include <pthread.h>
 #include <rubberband/rubberband-c.h>
-
-#ifndef RubberBandOptionEngineFiner
-#define RubberBandOptionEngineFiner 0
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -431,8 +427,7 @@ int init_exact_loop_canvas(size_t exact_frames) {
     RubberBandState new_rb_state = rt_rb_state;
     if (!new_rb_state) {
         int rb_options = RubberBandOptionProcessRealTime | RubberBandOptionEngineFiner |
-                         RubberBandOptionPitchHighQuality | RubberBandOptionPhaseIndependent |
-                         RubberBandOptionWindowLong | RubberBandOptionPitchHighConsistency;
+        RubberBandOptionPitchHighConsistency | RubberBandOptionChannelsTogether;
         new_rb_state = rubberband_new(jack_rate, 2, rb_options, 1.0, 1.0);
     }
 

@@ -238,10 +238,21 @@ static void *stretcher_loop(void *arg) {
             }
 
             const float *in_ptrs[2] = {in_l, in_r};
+            if (atomic_load_explicit(&stretcher_flush_request, memory_order_acquire) ||
+                atomic_load_explicit(&stretcher_ratio_update, memory_order_acquire) ||
+                atomic_load_explicit(&request_track_free, memory_order_acquire)) {
+                continue;
+            }
             rubberband_process(rt_rb_state, in_ptrs, push_chunk, 0);
 
             atomic_store_explicit(&pristine_read_pos, current_read_pos + push_chunk,
                                   memory_order_release);
+        }
+
+        if (atomic_load_explicit(&stretcher_flush_request, memory_order_acquire) ||
+            atomic_load_explicit(&stretcher_ratio_update, memory_order_acquire) ||
+            atomic_load_explicit(&request_track_free, memory_order_acquire)) {
+            continue;
         }
 
         int available = rubberband_available(rt_rb_state);

@@ -837,6 +837,24 @@ void ui_dashboard_init(GtkBuilder *b_dash, GtkBuilder *b_wave) {
         g_signal_connect(btn_video_size, "clicked", G_CALLBACK(on_video_size_clicked), NULL);
     }
 
+    if (ui_state.config.video_width_default <= 0) {
+        ui_state.config.video_width_default = 320;
+    }
+    if (ui_state.config.video_width_expanded <= 0) {
+        ui_state.config.video_width_expanded = 480;
+    }
+
+    video_preview_frame = GTK_WIDGET(gtk_builder_get_object(b_dash, "video_preview_frame"));
+    if (video_preview_frame) {
+        int init_w = ui_state.config.video_width_default;
+        int init_h = (int)(init_w * (9.0 / 16.0));
+        gtk_widget_set_size_request(video_preview_frame, init_w, init_h);
+        GtkWidget *picture = gtk_widget_get_first_child(video_preview_frame);
+        if (picture) {
+            gtk_widget_set_size_request(picture, init_w, init_h);
+        }
+    }
+
     btn_reset = GTK_WIDGET(gtk_builder_get_object(b_dash, "btn_reset"));
     g_signal_connect(btn_reset, "clicked", G_CALLBACK(on_global_reset_clicked), NULL);
 

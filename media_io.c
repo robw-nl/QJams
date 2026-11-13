@@ -1047,23 +1047,34 @@ int import_to_layer(const char *filepath, int track_idx, size_t start_frame, boo
         return -2;
     }
 
-    SwrContext *swr_ctx = swr_alloc();
-    AVChannelLayout in_ch_layout, out_ch_layout;
-    av_channel_layout_default(&in_ch_layout, sfinfo.channels);
-    av_channel_layout_default(&out_ch_layout, 2);
+    if ((int)jack_rate == sfinfo.samplerate && (sfinfo.channels == 2 || sfinfo.channels == 1)) {
+        if (sfinfo.channels == 2) {
+            memcpy(src_out, raw_data, resampled_frames * 2 * sizeof(float));
+        } else {
+            for (size_t f = 0; f < resampled_frames; f++) {
+                src_out[f * 2] = raw_data[f];
+                src_out[f * 2 + 1] = raw_data[f];
+            }
+        }
+    } else {
+        SwrContext *swr_ctx = swr_alloc();
+        AVChannelLayout in_ch_layout, out_ch_layout;
+        av_channel_layout_default(&in_ch_layout, sfinfo.channels);
+        av_channel_layout_default(&out_ch_layout, 2);
 
-    av_opt_set_chlayout(swr_ctx, "in_chlayout", &in_ch_layout, 0);
-    av_opt_set_int(swr_ctx, "in_sample_rate", sfinfo.samplerate, 0);
-    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+        av_opt_set_chlayout(swr_ctx, "in_chlayout", &in_ch_layout, 0);
+        av_opt_set_int(swr_ctx, "in_sample_rate", sfinfo.samplerate, 0);
+        av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
-    av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
-    av_opt_set_int(swr_ctx, "out_sample_rate", jack_rate, 0);
-    av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+        av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
+        av_opt_set_int(swr_ctx, "out_sample_rate", jack_rate, 0);
+        av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
-    swr_init(swr_ctx);
-    resample_stream(swr_ctx, raw_data, sfinfo.frames, sfinfo.channels, src_out, resampled_frames,
-                    ratio);
-    swr_free(&swr_ctx);
+        swr_init(swr_ctx);
+        resample_stream(swr_ctx, raw_data, sfinfo.frames, sfinfo.channels, src_out,
+                        resampled_frames, ratio);
+        swr_free(&swr_ctx);
+    }
 
     free(raw_data);
 
@@ -1123,8 +1134,8 @@ int import_to_layer(const char *filepath, int track_idx, size_t start_frame, boo
 
     for (size_t i = 0; i < actual_frames_to_copy * 2; i++) {
         if (use_soft_clip) {
-            master_tracks[track_idx].active_buffer[(start_frame * 2) + i] =
-            soft_clip(master_tracks[track_idx].active_buffer[(start_frame * 2) + i] + src_out[i]);
+            master_tracks[track_idx].active_buffer[(start_frame * 2) + i] = soft_clip(
+                master_tracks[track_idx].active_buffer[(start_frame * 2) + i] + src_out[i]);
         } else {
             master_tracks[track_idx].active_buffer[(start_frame * 2) + i] += src_out[i];
         }

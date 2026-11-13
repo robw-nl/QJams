@@ -508,8 +508,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     video_preview = GTK_WIDGET(gtk_builder_get_object(b_dash, "video_preview"));
     gtk_widget_add_tick_callback(video_preview, update_video_preview, NULL, NULL);
 
-    gtk_widget_set_size_request(video_preview_frame, ui_state.config.video_width_default,
-                                (int)(ui_state.config.video_width_default * (9.0 / 16.0)));
+    int init_video_w = ui_state.config.video_width_default;
+    int init_video_h = (int)(init_video_w * (9.0 / 16.0));
+    gtk_widget_set_size_request(video_preview_frame, init_video_w, init_video_h);
+    gtk_widget_set_size_request(video_preview, init_video_w, init_video_h);
 
     ui_dashboard_init(b_dash, b_wave);
 
