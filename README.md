@@ -1,4 +1,4 @@
-QJams Version 1.0 — Your music. Your practice. Your results.
+QJams — Your music. Your practice. Your results.
 
 Bring backing tracks, multi-track recording, synchronized video, editing, 
 playlists and practice sessions together in one focused Linux application.
